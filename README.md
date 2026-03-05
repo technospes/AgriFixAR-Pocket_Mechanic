@@ -1,348 +1,482 @@
-# AgriFix AI: Intelligent Agricultural Repair Assistant 🚜🤖
+# 🚜 AgriFix AI  
+### Intelligent AI Repair Assistant for Agricultural Machinery
 
-Empowering farmers with AI-driven diagnostics and real-time repair verification.
+AgriFix AI is a multimodal AI system that helps farmers diagnose and repair agricultural machinery using **voice, video, and images**.
 
-AgriFix AI is a robust, multimodal backend system designed to democratize technical support for agricultural machinery. By combining Retrieval-Augmented Generation (RAG) with computer vision, it transforms static technical manuals into an interactive troubleshooting assistant that can diagnose issues via voice, text, or video and visually verify completed repair steps in real time.
+The system combines **computer vision, speech recognition, Retrieval-Augmented Generation (RAG), and large language models** to transform traditional repair manuals into an interactive troubleshooting assistant.
 
----
-
-## Table of Contents
-
-- [Demo](#demo)
-- [Key Features](#key-features)
-- [Tech Stack](#tech-stack)
-- [System Architecture](#system-architecture)
-- [Installation & Setup](#installation--setup)
-  - [Clone & Environment](#clone--environment)
-  - [Local Installation (No Docker)](#local-installation-no-docker)
-  - [Build Knowledge Base](#build-knowledge-base)
-- [How to Run](#how-to-run)
-  - [Option A: Docker](#option-a-using-docker-recommended)
-  - [Option B: Local](#option-b-local-execution)
-- [Usage Guide](#usage-guide)
-  - [Diagnose an Issue](#1-diagnose-an-issue)
-  - [Verify a Repair Step](#2-verify-a-repair-step)
-- [Project Folder Structure](#project-folder-structure)
-- [Configuration Details](#configuration-details)
-- [Performance & Optimization](#performance--optimization)
-- [Known Limitations](#known-limitations)
-- [Roadmap](#roadmap)
-- [Contribution Guidelines](#contribution-guidelines)
-- [License](#license)
-- [Author](#author)
+Instead of searching through hundreds of pages of manuals, farmers can simply **record a short video or describe the problem in voice**, and AgriFix provides **step-by-step repair guidance with visual verification**.
 
 ---
 
-## Demo
+# 🌍 Problem
 
-> [![Watch the demo](Demo_Images/Home_Image.png)](https://drive.google.com/file/d/1d7G0g6LWDQnx2_7jCyogZK3x_DQ-_Exu/view?usp=sharing)
+Agricultural machinery failures often occur in remote areas where:
 
-### Screenshots
+• mechanics are unavailable  
+• repair manuals are complex  
+• technical knowledge is limited  
+• diagnosis is slow and expensive  
 
-![Home_Scene](Demo_Images/Home_Image.png)
-![Upload_Files_Images](Demo_Images/Gallery_Option_Image.png)
-![Analyzing_Images](Demo_Images/Loading_image.png)
-![Solution_Images](Demo_Images/Solution_Image2.png)
+Farmers often lose **hours or days of productivity** waiting for help.
 
-Examples:
-- High-level overview of the multimodal ingestion and inference pipeline.
-- Visual verification of a completed repair step (e.g., correctly installed oil filter).
+AgriFix aims to **democratize technical repair knowledge using AI**.
 
 ---
 
-## Key Features
+# 💡 Solution
 
-- **RAG-Powered Diagnostics**  
-  Retrieves precise repair instructions from large libraries of technical manuals using semantic search over vector embeddings.
+AgriFix AI converts static service manuals into an **interactive repair assistant**.
 
-- **Multimodal Interaction**  
-  Supports input via text, voice (speech-to-text), and video so farmers can describe problems naturally in the format that suits them.
+Farmers can:
 
-- **Visual Repair Verification**  
-  Vision models analyze photos of completed repairs to check whether a step was executed correctly (for example, “Is the oil filter installed securely?”).
+1️⃣ Describe the problem in **voice or text**  
+2️⃣ Record a **short video of the machine**  
+3️⃣ Receive **AI-generated repair steps**  
+4️⃣ Verify each repair step using **computer vision**
 
-- **Automated Knowledge Ingestion**  
-  Ingestion pipeline parses PDFs, extracts figures and diagrams, and builds a structured vector database with minimal manual effort.
-
-- **Intelligent Metadata Extraction**  
-  Automatically discovers machine brands, models, and error codes during ingestion to organize and filter results effectively.
-
-- **Contextual Assistance**  
-  When steps are complex or ambiguous, the system can surface relevant YouTube search links to high-quality explainer videos.
+This creates a **guided repair workflow**, similar to having an expert mechanic present.
 
 ---
 
-## Tech Stack
+# 🚀 Key Features
 
-**Core Backend**
+## 🔎 AI-Powered Machine Diagnosis
 
-- Framework: FastAPI (Python)  
-- ASGI Server: Uvicorn  
-- Orchestration: Docker & Docker Compose  
+AgriFix analyzes:
 
-**AI & Machine Learning**
+• machine video frames  
+• user voice description  
+• technical manuals  
 
-- LLM & Vision: Google Gemini 1.5 Flash / Pro  
-- Embeddings: Google Generative AI embeddings (`models/text-embedding-004`)  
-- Vector Store: ChromaDB  
-- Orchestration: LangChain  
-- Audio Processing: OpenAI Whisper  
-- Computer Vision: Ultralytics YOLO (object detection), OpenCV  
+to determine the most likely issue.
 
-**Data Processing**
-
-- PDF Parsing: PyMuPDF (`fitz`), PyPDF  
-- Image Processing: Pillow (`PIL`)  
+It retrieves relevant instructions using **semantic search over technical manuals**.
 
 ---
 
-## System Architecture
+## 🎤 Voice-First Interaction
 
-AgriFix AI is organized into a decoupled, microservices-ready architecture that separates ingestion, inference, and API exposure.
+Farmers can simply say things like:
 
-### Ingestion Service (`build_knowledge.py`)
+> "My tractor is not starting and making a clicking sound."
 
-- Parses raw PDF manuals placed in the `knowledge_base/` directory.  
-- Splits text into semantic chunks and extracts relevant images.  
-- Generates embeddings using Google models and stores them in ChromaDB.  
-- Attaches metadata such as brand, model, and error codes for targeted retrieval.
+The system automatically:
 
-### API Gateway (`main.py`)
-
-- Exposes REST endpoints for the client (web / mobile / kiosk).  
-- Handles file uploads (images, audio, video) and standard JSON requests.  
-
-### Inference Engine
-
-- **Diagnosis Workflow**  
-  - Converts audio to text using Whisper.  
-  - Queries the vector store for relevant manual sections.  
-  - Synthesizes a natural-language diagnosis and step-by-step plan using Gemini.  
-
-- **Verification Workflow**  
-  - Accepts a “current state” image and a textual description of the target step.  
-  - Uses the vision model to compare expected vs observed state.  
-  - Returns a pass/fail decision with confidence and human-readable feedback.
+1. Converts speech → text  
+2. Detects the machine type  
+3. Retrieves relevant repair steps  
+4. Generates step-by-step guidance
 
 ---
 
-## Installation & Setup
+## 🎥 Multimodal Machine Detection
 
-### Prerequisites
+AgriFix uses **computer vision models** to identify the machine from video frames.
 
-- Python 3.10+  
-- Docker (optional but recommended for deployment)  
-- Google AI Studio API key (Gemini)
+Supported machine categories include:
 
-### Clone & Environment
+• tractors  
+• irrigation pumps  
+• threshers  
+• power tillers  
+• agricultural motors  
 
-Clone the repository
-```
-git clone https://github.com/technospes/agrifix-ai.git
-cd agrifix-ai
-```
-Environment configuration
-```
-cp .env.example .env # If you have an example file, otherwise create .env manually
-```
-Update `.env` with your Gemini API key:
+---
 
-GOOGLE_API_KEY=your_gemini_api_key_here
+## 🧠 RAG-Powered Knowledge System
 
+AgriFix uses **Retrieval-Augmented Generation (RAG)**.
 
-### Local Installation (No Docker)
+Manuals are:
 
-Create virtual environment
-```
+• parsed from PDFs  
+• split into semantic chunks  
+• embedded into vectors  
+• stored inside **ChromaDB**
+
+During diagnosis:
+
+User Problem
+↓
+Semantic Search
+↓
+Relevant Manual Sections
+↓
+Gemini LLM
+↓
+Repair Instructions
+
+text
+
+---
+
+## 👁️ Visual Repair Verification
+
+After a repair step is performed, the user can upload a photo.
+
+AgriFix checks if the repair was done correctly.
+
+Example:
+
+Step: Tighten the oil filter
+
+text
+
+User uploads image →
+
+AI Result:
+✓ Correct installation detected
+Confidence: 94%
+
+text
+
+---
+
+## ⚡ AI Cost Optimization
+
+To prevent excessive LLM usage and reduce API cost:
+
+AgriFix implements:
+
+• **semantic response caching**  
+• **Gemini fallback only when needed**  
+• **per-IP rate limiting**  
+• **LLM call timeouts**
+
+This reduces Gemini usage by **60–70%**.
+
+---
+
+## 🔒 Production-Grade Security
+
+AgriFix includes multiple backend protection layers.
+
+Security features include:
+
+### Rate Limiting
+Limits requests per IP to prevent abuse.
+
+### Gemini Credit Guard
+Prevents attackers from draining API credits.
+
+### Upload Validation
+Server-side validation checks:
+
+• file size  
+• file type  
+• file duration  
+
+before processing.
+
+### Prompt Injection Protection
+User prompts are scanned for malicious patterns before reaching the LLM.
+
+### API Key Protection
+All secrets are stored using environment variables.
+
+---
+
+# 🧠 AI Architecture
+
+Flutter Mobile App
+│
+▼
+FastAPI Backend
+│
+▼
+Speech → Text (Whisper)
+│
+▼
+Machine Detection (MobileCLIP)
+│
+▼
+RAG Knowledge Retrieval (ChromaDB)
+│
+▼
+Gemini LLM Diagnosis
+│
+▼
+Step-by-Step Repair Instructions
+
+text
+
+---
+
+# 🧰 Tech Stack
+
+## Frontend
+
+Flutter (Android)
+
+Features:
+
+• video capture  
+• audio recording  
+• multilingual UI  
+• real-time progress feedback  
+
+---
+
+## Backend
+
+FastAPI (Python)
+
+Server responsibilities:
+
+• media processing  
+• AI inference orchestration  
+• security enforcement  
+• RAG pipeline management
+
+---
+
+## AI Models
+
+### LLM
+Google Gemini
+
+Used for:
+
+• diagnosis reasoning  
+• repair instruction generation  
+
+---
+
+### Speech Recognition
+
+Whisper
+
+Used for:
+
+• farmer voice input  
+• machine problem description
+
+---
+
+### Vision Model
+
+MobileCLIP
+
+Used for:
+
+• machine type detection  
+• frame classification
+
+---
+
+### Vector Database
+
+ChromaDB
+
+Stores:
+
+• manual embeddings  
+• semantic search index
+
+---
+
+# 📂 Project Structure
+
+AgriFix_Workspace
+│
+├── agrifix_app # Flutter mobile application
+│
+├── AgriFixAR_Python_Client # FastAPI backend
+│ │
+│ ├── agent
+│ │ ├── repair_agent.py
+│ │ ├── session_manager.py
+│ │ └── safety_rules.py
+│ │
+│ ├── services
+│ │ ├── diagnosis_service.py
+│ │ ├── machine_detection_service.py
+│ │ ├── transcription_service.py
+│ │ └── verification_service.py
+│ │
+│ ├── utils
+│ │ ├── helpers.py
+│ │ └── machine_registry.py
+│ │
+│ ├── security.py # security & rate limiting
+│ ├── main.py # API server
+│ └── requirements.txt
+│
+├── Demo_Images
+│
+└── README.md
+
+text
+
+---
+
+# ⚙️ Installation
+
+## Clone the Repository
+
+git clone https://github.com/YOUR_USERNAME/AgriFix.git
+cd AgriFix
+
+text
+
+---
+
+## Create Python Environment
+
 python -m venv venv
-source venv/bin/activate # On Windows: venv\Scripts\activate
-```
-Install dependencies
-```
+venv\Scripts\activate
+
+text
+
+---
+
+## Install Dependencies
+
 pip install -r requirements.txt
-```
 
-### Build Knowledge Base
-
-Place your technical manuals (PDFs) into the `knowledge_base/` directory and run:
-```
-python build_knowledge.py
-```
-
-This script ingests the manuals, generates embeddings, and populates `chroma_db/`.
+text
 
 ---
 
-## How to Run
+# 🔑 Environment Variables
 
-### Option A: Using Docker (Recommended)
+Create a `.env` file.
 
-**Build the container:**
+GEMINI_API_KEY=your_key_here
 
-docker build -t agrifix-backend .
+VIDEO_MAX_MB=20
+AUDIO_MAX_MB=5
 
+VIDEO_MAX_SECONDS=20
+AUDIO_MAX_SECONDS=20
 
-**Run the container:**
-```
-docker run -p 7860:7860 --env-file .env agrifix-backend
-```
+GEMINI_TIMEOUT_SECONDS=60
+GEMINI_HOURLY_LIMIT=10
 
-### Option B: Local Execution
+APP_SECRET_KEY=your_generated_secret
 
-From the project root:
-```
-uvicorn main:app --host 0.0.0.0 --port 7860 --reload
-```
-
-Then open:
-
-- Swagger UI: `http://localhost:7860/docs`  
-- Base health check (if implemented): `http://localhost:7860/diagnose`
+text
 
 ---
 
-## Usage Guide
+# ▶️ Running the Backend
 
-### 1. Diagnose an Issue
+uvicorn main:app --host 0.0.0.0 --port 7680 --reload
 
-**Endpoint:** `POST /diagnose`  
+text
 
-Send either an audio file (engine noise, explanation in voice) or a text description.
+API documentation available at:
 
-**Example JSON response:**
+http://localhost:7680/docs
 
-{
-"diagnosis": "The clicking sound suggests a starter motor failure.",
-"steps": [
-"Check battery voltage.",
-"Inspect starter solenoid connections."
-],
-"relevant_manual_sections": [
-{
-"manual": "Tractor_XYZ_Service_Manual.pdf",
-"section": "Starter Motor Troubleshooting",
-"page": 42
-}
-]
-}
-
-
-### 2. Verify a Repair Step
-
-**Endpoint:** `POST /verify_step`  
-
-Upload an image of the completed repair and provide the step description.
-
-curl -X POST "http://localhost:7860/verify_step"
--F "image=@battery_photo.jpg"
--F "step_description=Reconnect the negative battery terminal"
-
-
-**Example JSON response:**
-
-{
-"status": "pass",
-"feedback": "The negative terminal appears securely fastened and clean.",
-"confidence": 0.95
-}
-
+text
 
 ---
 
-## Project Folder Structure
-```
-AgriFix_AI/
-├── chroma_db/ # Persistent vector database storage
-├── knowledge_base/ # Raw PDF manuals for ingestion
-├── temp_uploads/ # Temporary storage for uploaded files
-├── build_knowledge.py # Knowledge ingestion pipeline
-├── extract_images.py # PDF image extraction utility
-├── main.py # FastAPI application entry point
-├── test_knowledge_base.py # RAG retrieval testing / evaluation script
-├── Dockerfile # Container configuration
-├── requirements.txt # Python dependencies
-└── README.md # Documentation
-```
+# 📱 Running the Flutter App
+
+cd agrifix_app
+flutter pub get
+flutter run
+
+text
 
 ---
 
-## Configuration Details
+# 📊 Performance Optimizations
 
-Key configuration points (see `main.py` and `build_knowledge.py`):
+AgriFix includes several optimizations:
 
-- `MAX_FILE_SIZE` – Maximum upload size in bytes (default: 100 MB).  
-- `CHROMA_DB_PATH` – Path to the vector store (default: `./chroma_db`).  
-- `LLM_MODEL` – Defaults to `gemini-1.5-flash` for speed; switch to `gemini-1.5-pro` for more complex reasoning.  
-- `EMBEDDING_MODEL` – Uses `models/text-embedding-004`.  
+• semantic caching of LLM responses  
+• selective Gemini fallback  
+• frame sampling for video analysis  
+• asynchronous API execution  
+• persistent vector database  
 
-Environment variables are centralized in `.env` for easier deployment and secrets management.
+These optimizations significantly reduce:
 
----
-
-## Performance & Optimization
-
-- **Asynchronous I/O**  
-  FastAPI endpoints are implemented as async handlers to support concurrent uploads and inference workloads efficiently.
-
-- **Persistent Vector Store**  
-  ChromaDB persists embeddings locally so PDFs are ingested once and reused across restarts.
-
-- **Optimized Docker Image**  
-  Uses `--no-cache-dir` for `pip` installs and pre-installs tools like `ffmpeg` for audio/video handling while keeping image size reasonable.
+• API cost  
+• latency  
+• compute load  
 
 ---
 
-## Known Limitations
+# ⚠️ Known Limitations
 
-- **PDF Complexity**  
-  Highly complex, multi-column, or scanned manuals may yield imperfect text segmentation and require manual cleanup for best results.
+Current limitations include:
 
-- **External API Dependencies**  
-  Throughput and latency depend on Google Gemini API quotas and network conditions.
-
-- **Online-Only Inference (Current)**  
-  The production pipeline assumes internet connectivity to reach Gemini endpoints; fully offline operation is part of the roadmap.
+• dependent on internet connectivity  
+• limited machine categories  
+• vision verification accuracy depends on image quality  
 
 ---
 
-## Roadmap
+# 🗺️ Roadmap
 
-- [ ] **Offline Mode**: Integrate local LLMs (Llama 3 / Mistral) and local embedding models for fully offline farm deployments.  
-- [ ] **AR Overlay**: Mobile or headset-based AR experience to project repair diagrams directly onto the machine.  
-- [ ] **Predictive Maintenance**: Use historical logs and sensor data to predict failures and suggest preventive actions.  
-- [ ] **Multi-language Support**: On-the-fly translation of manuals and responses for non‑English-speaking farmers.
+Planned future features:
+
+### AR Repair Guidance
+Using Unity to overlay repair instructions on real machines.
+
+### Offline Mode
+Local LLM inference for rural areas without internet.
+
+### Predictive Maintenance
+Detect machine issues before failure.
+
+### Sensor Integration
+Integrate IoT data from tractors and pumps.
 
 ---
 
-## Contribution Guidelines
+# 🤝 Contributing
 
 Contributions are welcome.
 
-1. Fork the repository.  
-2. Create a feature branch:
-```
-git checkout -b feature/NewFeature
-```
+1️⃣ Fork the repository  
+2️⃣ Create a feature branch  
 
-3. Commit your changes with a clear message.  
-4. Push the branch:
-```
-git push origin feature/NewFeature
-```
+git checkout -b feature/new-feature
 
-5. Open a Pull Request describing the motivation, changes, and any breaking impacts.
+text
+
+3️⃣ Commit your changes  
+
+git commit -m "Add new feature"
+
+text
+
+4️⃣ Push the branch  
+
+git push origin feature/new-feature
+
+text
+
+5️⃣ Open a Pull Request.
 
 ---
 
-## License
+# 📜 License
 
-Distributed under the MIT License. See `LICENSE` for details.
+MIT License.
 
 ---
 
-## Author
+# 👨‍💻 Author
 
-**Technospes**
+**Ayush Shukla**
 
-- GitHub (Technospes): https://github.com/technospes
-- LinkedIn (Ayush Shukla): https://www.linkedin.com/in/ayushshukla-ar/
+B.Tech Computer Science  
+AI / Computer Vision / Systems Development
+
+GitHub  
+[https://github.com/technospes](https://github.com/technospes)  
+LinkedIn  
+[https://www.linkedin.com/in/ayushshukla-ar/](https://www.linkedin.com/in/ayushshukla-ar/)
+
+---
+
+# ⭐ If you like this project
+
+Consider starring the repository to support development.

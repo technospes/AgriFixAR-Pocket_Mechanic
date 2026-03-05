@@ -1,248 +1,168 @@
-# 🚜 AgriFix AI
+````markdown
+# AgriFix AI — Intelligent Agricultural Machinery Repair Assistant
 
-### Intelligent AI Repair Assistant for Agricultural Machinery
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Backend](https://img.shields.io/badge/backend-FastAPI-green)
+![Frontend](https://img.shields.io/badge/frontend-Flutter-blue)
+![AI](https://img.shields.io/badge/AI-Gemini%20%7C%20RAG-orange)
 
-![License](https://img.shields.io/badge/license-MIT-green)
-![Python](https://img.shields.io/badge/python-3.10+-blue)
-![Flutter](https://img.shields.io/badge/flutter-3.x-blue)
-![Status](https://img.shields.io/badge/status-active-success)
-
-AgriFix AI is a **multimodal AI-powered repair assistant** that helps farmers diagnose and fix agricultural machinery using **voice, images, and video**.
-
-Instead of searching through hundreds of pages of repair manuals, farmers can simply **describe the problem or record a short video**, and AgriFix provides **step-by-step repair guidance with AI verification**.
-
----
+AgriFix AI is an intelligent multimodal repair assistant designed to help farmers diagnose and fix agricultural machinery using voice, video, and images. The system combines computer vision, speech recognition, and Retrieval-Augmented Generation (RAG) to convert static repair manuals into an interactive troubleshooting system.
 
 ![Demo](Demo_Images/Home_Image.png)
 
 ---
 
-# 📚 Table of Contents
+# Table of Contents
 
-* [About the Project](#about-the-project)
-* [Key Features](#key-features)
-* [Tech Stack & Architecture](#tech-stack--architecture)
-* [Getting Started (Local Installation)](#getting-started-local-installation)
-* [Usage / API Documentation](#usage--api-documentation)
-* [Folder Structure](#folder-structure)
-* [Roadmap](#roadmap)
-* [Contributing & License](#contributing--license)
-
----
-
-# 📖 About the Project
-
-Agricultural machinery failures often occur in **rural or remote areas** where access to expert mechanics is limited.
-
-Farmers typically face several challenges:
-
-* Repair manuals are **complex and difficult to interpret**
-* Troubleshooting requires **technical knowledge**
-* Professional mechanics may take **hours or days to arrive**
-* Equipment downtime leads to **lost productivity**
-
-AgriFix AI solves this problem by converting **static machine manuals into an interactive AI repair assistant**.
-
-The system uses:
-
-* **Speech recognition**
-* **Computer vision**
-* **Retrieval-Augmented Generation (RAG)**
-* **Large Language Models**
-
-to guide farmers through machine repair **step-by-step**, while also verifying the repair visually.
-
-The goal is to **democratize technical repair knowledge using AI**.
+- [About the Project](#about-the-project)
+- [Key Features](#key-features)
+- [Tech Stack & Architecture](#tech-stack--architecture)
+- [Getting Started](#getting-started-local-installation)
+- [Usage](#usage--api-documentation)
+- [Folder Structure](#folder-structure)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing--license)
 
 ---
 
-# ✨ Key Features
+# About the Project
 
-### 🎤 Voice-Based Problem Diagnosis
+Agricultural machinery breakdowns often occur in rural environments where technical support is difficult to access. Farmers frequently rely on complex service manuals or must wait for mechanics, resulting in lost productivity and downtime.
 
-Farmers can simply describe the issue:
+AgriFix AI addresses this challenge by transforming traditional repair documentation into an interactive AI system capable of diagnosing issues using real-world inputs such as voice recordings and machine videos.
 
-> "My tractor is not starting and making clicking sounds."
+The platform integrates computer vision models, speech recognition, vector search, and large language models to guide users through machine troubleshooting and repair procedures.
 
-The system automatically:
-
-1. Converts speech → text
-2. Detects the machine type
-3. Searches repair manuals
-4. Generates repair instructions
+Instead of manually searching through hundreds of pages of manuals, a user can simply describe the issue or record a short video of the machine. The system then retrieves relevant instructions from the knowledge base and generates step-by-step repair guidance.
 
 ---
 
-### 🎥 Multimodal Machine Detection
+# Key Features
 
-AgriFix analyzes **video frames and images** to identify machinery such as:
+### Multimodal Machine Diagnosis
 
-* tractors
-* irrigation pumps
-* threshers
-* motors
-* power tillers
+Users can describe problems using text, voice, or video. The system processes these inputs to determine the machine type and likely mechanical issue.
 
-using a lightweight **MobileCLIP vision model**.
+### Retrieval-Augmented Repair Knowledge
 
----
+Technical manuals are ingested into a vector database and indexed using embeddings. Relevant repair instructions are retrieved using semantic search.
 
-### 📚 RAG-Powered Knowledge System
+### Voice-to-Text Processing
 
-Technical manuals are converted into a searchable AI knowledge base.
+Voice inputs are automatically transcribed using speech recognition models, allowing farmers to describe problems naturally.
 
-Pipeline:
+### Computer Vision Machine Detection
 
-```
-PDF Manuals
-   ↓
-Text Chunking
-   ↓
-Embedding Generation
-   ↓
-ChromaDB Vector Store
-   ↓
-Semantic Retrieval
-   ↓
-Gemini LLM
-   ↓
-Repair Instructions
-```
+Video frames are analyzed using vision models to detect machine categories such as tractors, pumps, and threshers.
 
----
+### AI-Generated Repair Instructions
 
-### 👁️ Visual Repair Verification
+Large language models synthesize information from manuals and user inputs to generate step-by-step troubleshooting guidance.
 
-After performing a repair step, users can upload an image.
+### Visual Repair Verification
 
-AgriFix verifies whether the repair was done correctly.
+After performing a repair step, users can upload a photo to verify whether the repair was completed correctly.
 
-Example:
+### Security and Rate Limiting
 
-```
-Step: Reconnect the battery terminal
-```
+The backend includes protection layers such as:
 
-Result:
+- Request rate limiting
+- Gemini API usage guardrails
+- File upload validation
+- Prompt injection detection
+- API key protection
 
-```
-✓ Correct connection detected
-Confidence: 93%
-```
+### AI Cost Optimization
+
+The system includes semantic response caching to reduce LLM usage and API costs while maintaining fast response times.
 
 ---
 
-### ⚡ LLM Cost Optimization
+# Tech Stack & Architecture
 
-To reduce API cost and improve performance:
-
-* semantic response caching
-* Gemini fallback only when necessary
-* per-IP rate limiting
-* LLM timeout protection
-
-This reduces Gemini API usage by **~60-70%**.
-
----
-
-### 🔒 Production-Grade Security Layer
-
-The backend includes several protections:
-
-| Protection              | Purpose                 |
-| ----------------------- | ----------------------- |
-| Rate limiting           | Prevent API abuse       |
-| Gemini credit guard     | Prevent token draining  |
-| Upload validation       | Prevent malicious files |
-| Prompt injection filter | Protect the LLM         |
-| API key authentication  | Secure endpoints        |
-
----
-
-# 🧠 Tech Stack & Architecture
-
-## 📱 Frontend
+## Frontend
 
 **Flutter**
 
-Used for building the mobile application.
+Flutter is used to build the mobile user interface that allows farmers to:
 
-Capabilities:
+- Capture videos of machinery
+- Record voice descriptions
+- Upload repair images
+- View step-by-step AI guidance
 
-* camera video capture
-* audio recording
-* multilingual UI
-* real-time status updates
+Flutter was selected for its cross-platform capabilities and strong mobile performance.
 
 ---
 
-## ⚙️ Backend
+## Backend
 
 **Python FastAPI**
 
-Chosen for:
+FastAPI powers the backend API responsible for:
 
-* async high-throughput APIs
-* efficient file streaming
-* modern Python ecosystem
+- media upload handling
+- AI pipeline orchestration
+- RAG retrieval operations
+- security enforcement
 
-Responsibilities:
-
-* processing uploaded media
-* orchestrating AI inference
-* enforcing security rules
-* managing RAG pipeline
+FastAPI was chosen for its asynchronous architecture and high performance when handling media processing workloads.
 
 ---
 
-## 🧠 AI / ML
+## AI / Machine Learning
 
-| Technology | Purpose                     |
-| ---------- | --------------------------- |
-| Gemini LLM | Diagnosis reasoning         |
-| Whisper    | Speech → text transcription |
-| MobileCLIP | Machine detection           |
-| ChromaDB   | Vector database             |
-| LangChain  | RAG orchestration           |
+### Gemini
+
+Used for reasoning and generating repair instructions based on retrieved knowledge.
+
+### MobileCLIP
+
+Used for lightweight machine detection from video frames.
+
+### Whisper
+
+Used for converting farmer voice recordings into text for analysis.
+
+### Retrieval-Augmented Generation (RAG)
+
+The system retrieves relevant manual sections from a vector database before generating responses.
 
 ---
 
-## 🗄 Database
+## Database
 
 **ChromaDB**
 
-Stores vector embeddings for:
-
-* repair manuals
-* troubleshooting guides
-* semantic search queries
-
-This allows fast retrieval of relevant repair instructions.
+Stores vector embeddings generated from machine repair manuals. These embeddings enable semantic search across documentation.
 
 ---
 
-## 🔐 Security Layer
+## Security Layer
 
-Custom `security.py` module provides:
+The backend includes multiple security protections:
 
-* rate limiting
-* upload validation
-* duration checks
-* API key authentication
-* prompt injection detection
+- Per-IP rate limiting
+- Gemini usage quotas
+- File type and duration validation
+- API key verification
+- Prompt injection filtering
+
+These mechanisms protect the system from misuse and prevent uncontrolled API cost consumption.
 
 ---
 
-# 🛠 Getting Started (Local Installation)
+# Getting Started (Local Installation)
 
 ## Prerequisites
 
-Make sure the following are installed:
+The following tools must be installed before running the project:
 
-* Python **3.10+**
-* Flutter **3.x**
-* Git
-* FFmpeg (for audio/video processing)
+- Python 3.10+
+- Flutter SDK
+- Git
+- Google AI Studio API Key (Gemini)
 
 ---
 
@@ -251,20 +171,33 @@ Make sure the following are installed:
 ```bash
 git clone https://github.com/YOUR_USERNAME/AgriFix.git
 cd AgriFix
-```
+````
 
 ---
 
-## Backend Setup
+## Backend Installation
 
-Create virtual environment:
+Create a Python virtual environment.
 
 ```bash
 python -m venv venv
+```
+
+Activate the environment.
+
+Windows
+
+```bash
 venv\Scripts\activate
 ```
 
-Install dependencies:
+Linux / macOS
+
+```bash
+source venv/bin/activate
+```
+
+Install backend dependencies.
 
 ```bash
 pip install -r requirements.txt
@@ -272,57 +205,45 @@ pip install -r requirements.txt
 
 ---
 
-## Flutter Setup
+## Environment Variables
 
-```bash
-cd agrifix_app
-flutter pub get
-```
+Create a `.env` file in the backend directory.
 
----
+| Variable               | Description                         |
+| ---------------------- | ----------------------------------- |
+| GEMINI_API_KEY         | API key for Google Gemini           |
+| VIDEO_MAX_MB           | Maximum allowed video upload size   |
+| AUDIO_MAX_MB           | Maximum allowed audio upload size   |
+| VIDEO_MAX_SECONDS      | Maximum video duration              |
+| AUDIO_MAX_SECONDS      | Maximum audio duration              |
+| GEMINI_TIMEOUT_SECONDS | Timeout limit for Gemini API calls  |
+| GEMINI_HOURLY_LIMIT    | Maximum Gemini calls allowed per IP |
+| APP_SECRET_KEY         | Server authentication key           |
 
-# 🔑 Environment Variables
-
-Create a `.env` file in the backend root.
-
-| Variable               | Description                  |
-| ---------------------- | ---------------------------- |
-| GEMINI_API_KEY         | Google Gemini API key        |
-| APP_SECRET_KEY         | Server authentication key    |
-| VIDEO_MAX_MB           | Maximum allowed video upload |
-| AUDIO_MAX_MB           | Maximum allowed audio upload |
-| VIDEO_MAX_SECONDS      | Maximum video duration       |
-| AUDIO_MAX_SECONDS      | Maximum audio duration       |
-| GEMINI_TIMEOUT_SECONDS | Timeout for LLM calls        |
-| GEMINI_HOURLY_LIMIT    | Rate limit per IP            |
-
-Example:
+Example `.env` file:
 
 ```env
-GEMINI_API_KEY=your_api_key_here
-APP_SECRET_KEY=your_secret_here
-
+GEMINI_API_KEY=[Insert API Key Here]
 VIDEO_MAX_MB=20
 AUDIO_MAX_MB=5
-
 VIDEO_MAX_SECONDS=20
 AUDIO_MAX_SECONDS=20
-
 GEMINI_TIMEOUT_SECONDS=60
 GEMINI_HOURLY_LIMIT=10
+APP_SECRET_KEY=[Insert Generated Secret]
 ```
 
 ---
 
-# ▶️ Running the Project
+## Running the Backend
 
-## Run Backend
+Start the FastAPI server.
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 7680 --reload
 ```
 
-API docs available at:
+API documentation will be available at:
 
 ```
 http://localhost:7680/docs
@@ -330,18 +251,21 @@ http://localhost:7680/docs
 
 ---
 
-## Run Flutter App
+## Running the Flutter App
+
+Navigate to the Flutter application directory.
 
 ```bash
 cd agrifix_app
+flutter pub get
 flutter run
 ```
 
 ---
 
-# 📡 Usage / API Documentation
+# Usage / API Documentation
 
-## Diagnose a Machine Issue
+## Diagnose Machine Issue
 
 Endpoint:
 
@@ -349,28 +273,30 @@ Endpoint:
 POST /diagnose/stream
 ```
 
-Input:
+Example request:
 
-* audio description
-* video of machine
+User uploads:
+
+* machine video
+* voice description
 
 Example response:
 
 ```json
 {
   "machine": "tractor",
-  "diagnosis": "Starter motor failure",
+  "diagnosis": "Starter motor failure likely",
   "steps": [
     "Check battery voltage",
-    "Inspect starter connections",
-    "Clean corroded terminals"
+    "Inspect starter motor wiring",
+    "Replace faulty starter solenoid"
   ]
 }
 ```
 
 ---
 
-## Verify a Repair Step
+## Verify Repair Step
 
 Endpoint:
 
@@ -378,10 +304,12 @@ Endpoint:
 POST /verify_step
 ```
 
-Input:
+Example request:
 
-* image of repaired component
-* repair step description
+```
+image: uploaded repair photo
+step_description: "Reconnect the battery terminal"
+```
 
 Example response:
 
@@ -389,13 +317,13 @@ Example response:
 {
   "status": "pass",
   "confidence": 0.92,
-  "feedback": "Battery terminal appears properly secured."
+  "feedback": "Battery terminal appears correctly attached."
 }
 ```
 
 ---
 
-# 📁 Folder Structure
+# Folder Structure
 
 ```
 AgriFix_Workspace
@@ -403,12 +331,13 @@ AgriFix_Workspace
 ├── agrifix_app
 │   ├── lib
 │   ├── android
-│   └── ios
+│   └── pubspec.yaml
 │
 ├── AgriFixAR_Python_Client
 │   ├── agent
 │   │   ├── repair_agent.py
-│   │   └── session_manager.py
+│   │   ├── session_manager.py
+│   │   └── safety_rules.py
 │   │
 │   ├── services
 │   │   ├── diagnosis_service.py
@@ -417,81 +346,61 @@ AgriFix_Workspace
 │   │   └── verification_service.py
 │   │
 │   ├── utils
-│   │   └── helpers.py
+│   │   ├── helpers.py
+│   │   └── machine_registry.py
 │   │
 │   ├── security.py
 │   ├── main.py
 │   └── requirements.txt
 │
 ├── Demo_Images
-│
 └── README.md
 ```
 
 ---
 
-# 🗺 Roadmap
+# Roadmap
 
-Planned improvements:
+Planned improvements include:
 
-* AR repair guidance using **Unity**
-* offline AI inference
-* expanded machine categories
-* multilingual voice interaction
-* predictive maintenance alerts
+* Augmented Reality repair guidance using Unity
+* Offline AI inference for rural environments
+* Support for additional machine categories
+* Predictive maintenance using sensor data
+* Improved multilingual support for regional languages
 
 ---
 
-# 🤝 Contributing
+# Contributing & License
 
 Contributions are welcome.
 
-1️⃣ Fork the repository
-
-2️⃣ Create a branch
+1. Fork the repository
+2. Create a feature branch
 
 ```bash
-git checkout -b feature/my-feature
+git checkout -b feature/new-feature
 ```
 
-3️⃣ Commit changes
+3. Commit your changes
 
 ```bash
 git commit -m "Add new feature"
 ```
 
-4️⃣ Push to branch
+4. Push the branch
 
 ```bash
-git push origin feature/my-feature
+git push origin feature/new-feature
 ```
 
-5️⃣ Open a Pull Request.
+5. Open a Pull Request
 
 ---
 
-# 📜 License
+# License
 
-This project is licensed under the **MIT License**.
-
----
-
-# 👨‍💻 Author
-
-**Ayush Shukla**
-
-B.Tech Computer Science
-AI / Computer Vision / Full Stack Development
-
-GitHub
-[https://github.com/YOUR_USERNAME](https://github.com/YOUR_USERNAME)
-
-LinkedIn
-[https://www.linkedin.com/in/ayushshukla-ar/](https://www.linkedin.com/in/ayushshukla-ar/)
-
----
-
-⭐ If you find this project interesting, consider **starring the repository**!
+This project is distributed under the MIT License.
 
 ```
 

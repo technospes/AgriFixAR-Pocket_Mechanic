@@ -1,19 +1,3 @@
-"""
-agent/repair_agent.py
-Gemini-powered stateful repair agent.
-
-Token budget vs previous version:
-  Removed  : 9-bullet verbose role header             (~148 → ~20 tok)
-  Removed  : diagnostic_context (already in diagnosis) (~93 tok)
-  Removed  : machine label + farmer intro repeat       (~42 tok)
-  Compressed: 8-item logic rules → 1-line triage hint (~192 → ~15 tok)
-  Compressed: machine safety rules → compact keywords  (~59 → ~15 tok)
-  Kept intact: verified_parts JSON, last_verification JSON,
-               safety_context summary, area_hint list, output schema.
-  Net saving: ~509 tokens per agent call (~65% of agent prompt)
-  Zero accuracy loss: all reasoning data preserved; schema unchanged.
-"""
-
 from __future__ import annotations
 import asyncio
 import json

@@ -1,3 +1,4 @@
+```markdown
 # 🚜 AgriFix AI  
 ### Intelligent AI Repair Assistant for Agricultural Machinery
 
@@ -97,6 +98,8 @@ Manuals are:
 
 During diagnosis:
 
+```
+
 User Problem
 ↓
 Semantic Search
@@ -107,7 +110,7 @@ Gemini LLM
 ↓
 Repair Instructions
 
-text
+```
 
 ---
 
@@ -119,17 +122,21 @@ AgriFix checks if the repair was done correctly.
 
 Example:
 
+```
+
 Step: Tighten the oil filter
 
-text
+```
 
 User uploads image →
+
+```
 
 AI Result:
 ✓ Correct installation detected
 Confidence: 94%
 
-text
+```
 
 ---
 
@@ -179,6 +186,8 @@ All secrets are stored using environment variables.
 
 # 🧠 AI Architecture
 
+```
+
 Flutter Mobile App
 │
 ▼
@@ -199,7 +208,7 @@ Gemini LLM Diagnosis
 ▼
 Step-by-Step Repair Instructions
 
-text
+```
 
 ---
 
@@ -278,36 +287,38 @@ Stores:
 
 # 📂 Project Structure
 
+```
+
 AgriFix_Workspace
 │
-├── agrifix_app # Flutter mobile application
+├── agrifix_app                 # Flutter mobile application
 │
-├── AgriFixAR_Python_Client # FastAPI backend
-│ │
-│ ├── agent
-│ │ ├── repair_agent.py
-│ │ ├── session_manager.py
-│ │ └── safety_rules.py
-│ │
-│ ├── services
-│ │ ├── diagnosis_service.py
-│ │ ├── machine_detection_service.py
-│ │ ├── transcription_service.py
-│ │ └── verification_service.py
-│ │
-│ ├── utils
-│ │ ├── helpers.py
-│ │ └── machine_registry.py
-│ │
-│ ├── security.py # security & rate limiting
-│ ├── main.py # API server
-│ └── requirements.txt
+├── AgriFixAR_Python_Client     # FastAPI backend
+│   │
+│   ├── agent
+│   │   ├── repair_agent.py
+│   │   ├── session_manager.py
+│   │   └── safety_rules.py
+│   │
+│   ├── services
+│   │   ├── diagnosis_service.py
+│   │   ├── machine_detection_service.py
+│   │   ├── transcription_service.py
+│   │   └── verification_service.py
+│   │
+│   ├── utils
+│   │   ├── helpers.py
+│   │   └── machine_registry.py
+│   │
+│   ├── security.py              # security & rate limiting
+│   ├── main.py                  # API server
+│   └── requirements.txt
 │
 ├── Demo_Images
 │
 └── README.md
 
-text
+```
 
 ---
 
@@ -315,33 +326,41 @@ text
 
 ## Clone the Repository
 
-git clone https://github.com/YOUR_USERNAME/AgriFix.git
+```
+
+git clone [https://github.com/YOUR_USERNAME/AgriFix.git](https://github.com/YOUR_USERNAME/AgriFix.git)
 cd AgriFix
 
-text
+```
 
 ---
 
 ## Create Python Environment
 
+```
+
 python -m venv venv
 venv\Scripts\activate
 
-text
+```
 
 ---
 
 ## Install Dependencies
 
+```
+
 pip install -r requirements.txt
 
-text
+```
 
 ---
 
 # 🔑 Environment Variables
 
 Create a `.env` file.
+
+```
 
 GEMINI_API_KEY=your_key_here
 
@@ -356,31 +375,37 @@ GEMINI_HOURLY_LIMIT=10
 
 APP_SECRET_KEY=your_generated_secret
 
-text
+```
 
 ---
 
 # ▶️ Running the Backend
 
+```
+
 uvicorn main:app --host 0.0.0.0 --port 7680 --reload
 
-text
+```
 
 API documentation available at:
 
-http://localhost:7680/docs
+```
 
-text
+[http://localhost:7680/docs](http://localhost:7680/docs)
+
+```
 
 ---
 
 # 📱 Running the Flutter App
 
+```
+
 cd agrifix_app
 flutter pub get
 flutter run
 
-text
+```
 
 ---
 
@@ -437,21 +462,27 @@ Contributions are welcome.
 1️⃣ Fork the repository  
 2️⃣ Create a feature branch  
 
+```
+
 git checkout -b feature/new-feature
 
-text
+```
 
 3️⃣ Commit your changes  
 
+```
+
 git commit -m "Add new feature"
 
-text
+```
 
 4️⃣ Push the branch  
 
+```
+
 git push origin feature/new-feature
 
-text
+```
 
 5️⃣ Open a Pull Request.
 
@@ -471,12 +502,15 @@ B.Tech Computer Science
 AI / Computer Vision / Systems Development
 
 GitHub  
-[https://github.com/technospes](https://github.com/technospes)  
+https://github.com/technospes
 LinkedIn  
-[https://www.linkedin.com/in/ayushshukla-ar/](https://www.linkedin.com/in/ayushshukla-ar/)
+https://www.linkedin.com/in/ayushshukla-ar/
 
 ---
 
 # ⭐ If you like this project
 
 Consider starring the repository to support development.
+```
+
+---

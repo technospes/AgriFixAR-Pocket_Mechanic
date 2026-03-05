@@ -11,8 +11,7 @@ The platform enables users to describe machine problems in natural language, rec
 
 | Home Dashboard | Recording & Upload | AI Analysis |
 | :---: | :---: | :---: |
-| <img src="Demo_Images/Home_Screen.png" width="250"> | <img src="Demo_Images/Recording_Uploading_Screen_Image.png" width="250"> | <img src="Demo_Images/Analysis_ScreenShot.png" width="250"> |
-
+| <img src="Demo_Images/Home_Screen.png" height="300"> | <img src="Demo_Images/Recording_Uploading_Screen_Image.png" height="300"> | <img src="Demo_Images/Analysis_ScreenShot.png" height="300"> |
 ---
 
 # Table of Contents

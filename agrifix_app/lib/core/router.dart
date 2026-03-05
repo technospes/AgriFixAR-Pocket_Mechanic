@@ -1,0 +1,65 @@
+import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
+import '../screens/home/home_screen.dart';
+import '../screens/upload/upload_screen.dart';
+import '../../screens/solution/solution_screen.dart';
+import '../../screens/ar_guide/ar_guide_screen.dart'; // ← ADDED
+// Replace the placeholders below as you build each screen:
+// import '../screens/solution/solution_screen.dart';
+// import '../screens/ar_guide/ar_guide_screen.dart';
+
+class AppRoutes {
+  static const home     = '/';
+  static const upload   = '/upload';
+  static const solution = '/solution';
+  static const arGuide  = '/ar-guide';
+}
+
+final appRouter = GoRouter(
+  initialLocation: AppRoutes.home,
+  routes: [
+    GoRoute(
+      path: AppRoutes.home,
+      builder: (context, state) => const HomeScreen(),
+    ),
+    GoRoute(
+      path: AppRoutes.upload,
+      builder: (context, state) => const UploadScreen(),
+    ),
+    GoRoute(
+      path: AppRoutes.solution,
+      builder: (context, state) => const SolutionScreen(),
+    ),
+    GoRoute(
+      path: AppRoutes.arGuide,
+      builder: (context, state) {
+        final step = (state.extra as int?) ?? 0;
+        return ARGuideScreen(initialStep: step);
+      },
+    ),
+  ],
+);
+
+class _PlaceholderScreen extends StatelessWidget {
+  final String title;
+  const _PlaceholderScreen(this.title);
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF1A1A1A),
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        foregroundColor: Colors.white,
+        title: Text(title),
+      ),
+      body: Center(
+        child: Text(
+          '$title\n(Coming soon)',
+          style: const TextStyle(color: Colors.white54, fontSize: 18),
+          textAlign: TextAlign.center,
+        ),
+      ),
+    );
+  }
+}

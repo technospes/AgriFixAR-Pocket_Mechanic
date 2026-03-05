@@ -1,0 +1,78 @@
+# =========================
+# UNITY (ignore for now)
+# =========================
+unity_client/
+*.unity
+*.prefab
+
+# =========================
+# PYTHON BACKEND
+# =========================
+
+# environments
+**/venv/
+**/env/
+
+# python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# secrets
+.env
+
+# runtime data & datasets
+**/chroma_db/
+**/temp_uploads/
+**/extracted_images
+**/extracted_images_ai_categorized
+*.sqlite3
+*.log
+
+# =========================
+# FLUTTER
+# =========================
+
+**/build/
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.pub-cache/
+**/.packages
+
+# =========================
+# IDE
+# =========================
+
+.vscode/
+.idea/
+*.iml
+
+# =========================
+# OS
+# =========================
+
+.DS_Store
+Thumbs.db
+
+# =========================
+# MEDIA FILES
+# =========================
+
+*.mp4
+*.wav
+*.m4a
+*.avi
+*.mov
+
+# =========================
+# ML MODELS
+# =========================
+
+*.pt
+*.pth
+*.onnx
+*.safetensors

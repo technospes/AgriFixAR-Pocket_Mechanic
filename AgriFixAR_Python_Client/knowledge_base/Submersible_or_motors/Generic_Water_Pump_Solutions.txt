@@ -1,0 +1,527 @@
+🟦 PROBLEM 1 — PUMP DOES NOT START
+
+Chunk 1 — No Power Supply
+What’s Happening: The pump isn’t getting any electricity.
+What to Do:
+
+    First, go to your main electricity panel in the house or shed.
+
+    Check if the main switch for the pump is turned ON. It should be in the UP position.
+
+    If you have neighbors nearby, ask if they have electricity. Sometimes the whole area’s power is off.
+
+    If other appliances are working but the pump isn’t, the problem might be in the pump’s own switch or fuse.
+    Tools Needed: None—just your eyes and hands.
+    What to Look At: The switchboard or control box near the borewell.
+
+Chunk 2 — Blown Fuse or Tripped Safety Switch
+What’s Happening: A small safety device has stopped the electricity to protect the pump.
+What to Do:
+
+    Open the pump’s control box carefully.
+
+    Look for a small glass fuse—if the metal inside is broken, it’s blown. Replace it with an identical one.
+
+    Look for a switch that says “ELCB” or “Trip Switch.” If it’s in the middle or down, push it up to reset.
+
+    If it trips again immediately, don’t force it—call an electrician.
+    Tools Needed: A new fuse (same rating), a screwdriver.
+    What to Look At: Inside the control box—fuse and safety switch.
+
+Chunk 3 — Motor Starter Has Tripped
+What’s Happening: The motor’s protector thinks the pump is overloaded.
+What to Do:
+
+    In the control box, find a black or gray box with a red or yellow button sticking out.
+
+    Push that button back IN until it clicks.
+
+    Try starting the pump again.
+
+    If it trips again quickly, wait 10 minutes and check if the voltage is too low (ask an electrician to measure).
+    Tools Needed: None.
+    What to Look At: The motor starter box with a reset button.
+
+Chunk 4 — Low Water in Borewell
+What’s Happening: The pump has a safety device that stops it if the water level is too low—this prevents burning the motor.
+What to Do:
+
+    Check the borewell water level manually if possible—lower a small stone tied to a rope and listen for splash.
+
+    If the water is very low, wait for it to refill naturally or reduce usage.
+
+    If there’s a float switch or sensor, make sure it’s not stuck.
+    Tools Needed: A rope and small weight.
+    What to Look At: The borewell opening and any float switch inside the tank.
+
+Chunk 5 — Cable or Motor Is Damaged
+What’s Happening: The wire going down to the pump or the pump itself is broken.
+What to Do:
+
+    First, check the cable where it goes into the borewell—look for cuts, burns, or animal bites.
+
+    If the cable looks fine, the motor might be burnt—this needs an electrician to test with a meter.
+
+    Do NOT try to open the motor yourself.
+    Tools Needed: An electrician with a testing meter.
+    What to Look At: The cable from the control box to the borewell.
+
+🟦 PROBLEM 2 — PUMP RUNS BUT NO WATER
+
+Chunk 1 — Outlet Valve Closed
+What’s Happening: Water can’t come out because the tap is closed.
+What to Do:
+
+    Follow the pipe from the borewell to the tank or tap.
+
+    Make sure all valves on that pipe are fully open (turn anticlockwise).
+
+    Sometimes valves get accidentally closed—check every one.
+    Tools Needed: Your hands.
+    What to Look At: Valves on the delivery pipe.
+
+Chunk 2 — Borewell Water Too Low
+What’s Happening: The pump is running but sucking air instead of water.
+What to Do:
+
+    Stop the pump immediately.
+
+    Check water level in the borewell with a rope and weight.
+
+    If water is more than 1 meter below the pump, you need to lower the pump deeper (call a mechanic).
+    Tools Needed: Rope, weight.
+    What to Look At: Water level in borewell.
+
+Chunk 3 — One-Way Valve Stuck
+What’s Happening: There’s a valve inside the pump that stops water from flowing back down—it’s stuck closed.
+What to Do:
+
+    This requires pulling up the pump.
+
+    Once out, locate the non-return valve (usually near the pump outlet).
+
+    Tap it gently or soak in vinegar to loosen debris. If broken, replace it.
+    Tools Needed: Pipe wrench, new valve.
+    What to Look At: The valve at the top of the pump.
+
+Chunk 4 — Pump Filter Blocked
+What’s Happening: Sand or dirt has blocked the pump’s intake filter.
+What to Do:
+
+    Pull up the pump.
+
+    At the bottom of the pump, you’ll see a sieve-like filter.
+
+    Clean it thoroughly with water and a brush.
+
+    Reinstall and test.
+    Tools Needed: Brush, clean water.
+    What to Look At: The pump’s bottom filter.
+
+Chunk 5 — Pump Internals Damaged
+What’s Happening: The inside parts of the pump are worn out or broken.
+What to Do:
+
+    If cleaning doesn’t help, the impeller (water-throwing part) might be damaged.
+
+    This needs a mechanic to open the pump and replace internal parts.
+
+    Don’t try to open the sealed pump yourself.
+    Tools Needed: Mechanic with tools.
+    What to Look At: The pump body—if it’s very old, consider replacing it.
+
+🟦 PROBLEM 3 — LESS WATER THAN USUAL
+
+Chunk 1 — Water Level Dropped Too Much
+What’s Happening: As water is pumped, the level in the borewell falls too low.
+What to Do:
+
+    Reduce usage—don’t run the pump continuously for too long.
+
+    Lower the pump deeper into the well if possible.
+
+    Or reduce the flow by partly closing the outlet valve.
+    Tools Needed: None.
+    What to Look At: Pump running time and water output.
+
+Chunk 2 — Pump Running Backwards
+What’s Happening: The motor is spinning the wrong way, so it pushes very little water.
+What to Do:
+
+    If you recently had electrical work done, this might happen.
+
+    Call an electrician—he will swap any two wires in the three-phase connection.
+
+    Do NOT touch electrical connections if you’re not trained.
+    Tools Needed: Electrician.
+    What to Look At: Electrical connection box.
+
+Chunk 3 — Pipe or Valve Partly Blocked
+What’s Happening: Something is blocking the pipe after the pump.
+What to Do:
+
+    Check all valves—make sure they are fully open.
+
+    Look for kinks or dents in the pipe.
+
+    If you have a water filter in the line, clean or replace it.
+    Tools Needed: Your hands, maybe a pipe wrench.
+    What to Look At: The entire pipeline from pump to tap.
+
+Chunk 4 — Scaling or Mud Inside Pipe
+What’s Happening: Mud or mineral deposits have built up inside the pipe.
+What to Do:
+
+    Disconnect the pipe from the pump and tap.
+
+    Use a high-pressure water hose to flush it out.
+
+    If hard scaling, you may need to replace the pipe.
+    Tools Needed: Hose, water supply.
+    What to Look At: Inside of the pipe after disconnecting.
+
+Chunk 5 — Water Leaking from Pipe
+What’s Happening: Water is escaping through a hole or loose joint before reaching the tap.
+What to Do:
+
+    Walk along the pipeline and look for wet patches, dripping, or pooling water.
+
+    Tighten any loose joints with a wrench.
+
+    For holes, use a pipe clamp or replace that section.
+    Tools Needed: Wrench, pipe clamp.
+    What to Look At: Entire pipeline, especially joints.
+
+🟦 PROBLEM 4 — PUMP STARTS AND STOPS TOO OFTEN
+
+Chunk 1 — Pressure Switch Needs Adjustment
+What’s Happening: The switch that turns the pump on/off is too sensitive.
+What to Do:
+
+    Locate the pressure switch near the pressure tank.
+
+    There’s a screw or nut labeled “Differential”—turn it slightly to increase the gap between start and stop pressures.
+
+    Don’t adjust too much—just a little and test.
+    Tools Needed: Screwdriver.
+    What to Look At: Pressure switch on the tank.
+
+Chunk 2 — Water Level Sensor Misadjusted
+What’s Happening: The sensor in the tank is telling the pump to start/stop at wrong levels.
+What to Do:
+
+    If you have a float switch in the tank, adjust its position so it allows more water to fill before stopping.
+
+    Make sure the float moves freely and isn’t stuck.
+    Tools Needed: Your hands.
+    What to Look At: Float switch in the overhead tank.
+
+Chunk 3 — One-Way Valve Leaking
+What’s Happening: Water flows back into the borewell when the pump stops, so pressure drops quickly.
+What to Do:
+
+    Pull up the pump and replace the non-return valve.
+
+    It’s a small part and inexpensive.
+    Tools Needed: Pipe wrench, new valve.
+    What to Look At: Valve at pump outlet.
+
+Chunk 4 — Pressure Tank Problem
+What’s Happening: The tank that stores pressurized water has lost air or is damaged.
+What to Do:
+
+    Tap the tank—if it sounds full of water, the air bladder is damaged.
+
+    There’s an air valve on the tank—like a bicycle tube valve—check and refill air with a pump.
+
+    If the tank is waterlogged, it may need replacement.
+    Tools Needed: Bicycle pump, pressure gauge.
+    What to Look At: Pressure tank and its air valve.
+
+🟦 PROBLEM 5 — MOTOR GETS TOO HOT OR TRIPS
+
+Chunk 1 — Voltage Too Low
+What’s Happening: The electricity reaching the motor is weak, so it overheats.
+What to Do:
+
+    Check if lights in your house are dim when the pump runs.
+
+    Call an electrician to measure voltage at the pump’s connection.
+
+    If voltage is low, you may need a thicker cable or a voltage stabilizer.
+    Tools Needed: Electrician with voltmeter.
+    What to Look At: House lights when pump runs.
+
+Chunk 2 — Motor Not Cooling Properly
+What’s Happening: The pump is sitting in mud or sand, blocking water flow around the motor.
+What to Do:
+
+    Pull up the pump and clean the motor housing.
+
+    Make sure the pump is installed above the well screen (perforated pipe section).
+
+    If sand is entering, install a sand shield or flow sleeve.
+    Tools Needed: Pump puller, brush.
+    What to Look At: Motor covered in sand or mud.
+
+Chunk 3 — Overload Setting Wrong
+What’s Happening: The motor’s protection is set too low, so it trips unnecessarily.
+What to Do:
+
+    In the starter box, find the overload adjustment dial.
+
+    Turn it slightly toward a higher number (as per electrician’s advice).
+
+    Don’t set it too high, or the motor won’t be protected.
+    Tools Needed: Screwdriver.
+    What to Look At: Overload relay in starter.
+
+Chunk 4 — Water Too Hot
+What’s Happening: If pumping hot water (above 40°C), the motor can overheat.
+What to Do:
+
+    Check the water temperature—if it’s very hot, let it cool before pumping.
+
+    If pumping from a geothermal source, use a pump rated for high temperature.
+
+    Replace rubber seals every 3 years if pumping warm water.
+    Tools Needed: Thermometer.
+    What to Look At: Water temperature at the source.
+
+🟦 PROBLEM 6 — LOUD NOISE OR VIBRATION
+
+Chunk 1 — Cavitation (Water Boiling Inside Pump)
+What’s Happening: The pump is sucking too hard, creating bubbles that burst loudly.
+What to Do:
+
+    Increase water level above the pump—lower the pump deeper if possible.
+
+    Reduce pumping speed if you have a variable switch.
+
+    Make sure the foot valve is not blocked.
+    Tools Needed: None.
+    What to Look At: Noise like gravel rattling inside the pump.
+
+Chunk 2 — Vortex (Whirlpool) Forming
+What’s Happening: A whirlpool forms above the pump, sucking in air.
+What to Do:
+
+    Ensure the pump is at least 1 meter below the water surface.
+
+    If the borewell is wide, install a vortex baffle plate above the pump.
+    Tools Needed: Baffle plate (available in hardware stores).
+    What to Look At: Swirling water in the borewell.
+
+Chunk 3 — Loose Pipe or Cable
+What’s Happening: The pipe or cable is vibrating against the borewell casing.
+What to Do:
+
+    Tighten all pipe connections.
+
+    Use plastic cable clips to tie the cable to the pipe every 3 meters.
+
+    Make sure nothing is swinging freely inside the well.
+    Tools Needed: Wrench, cable clips.
+    What to Look At: Pipe and cable inside the borewell.
+
+Chunk 4 — Worn Bearings or Impeller
+What’s Happening: Internal parts are worn out, causing grinding noise.
+What to Do:
+
+    If noise is metallic and continuous, the bearings may be gone.
+
+    This needs a mechanic to open the pump and replace parts.
+
+    Don’t run the pump with such noise—it can damage further.
+    Tools Needed: Mechanic.
+    What to Look At: Pump making grinding sound.
+
+🟦 PROBLEM 7 — CABLE PROBLEMS
+
+Chunk 1 — Cable Not Waterproof
+What’s Happening: Normal wire is used, and water has entered, causing a short circuit.
+What to Do:
+
+    Always use “submersible pump cable” which is waterproof.
+
+    If damaged, replace the entire cable with the correct type.
+
+    Never join ordinary wire for underwater use.
+    Tools Needed: New submersible cable.
+    What to Look At: Cable labeled “submersible” or “waterproof.”
+
+Chunk 2 — Wire Too Thin
+What’s Happening: The wire gets hot and voltage drops, so motor runs weak.
+What to Do:
+
+    Check cable thickness—it should match the motor’s current rating (ask an electrician).
+
+    If the pump is deep, you may need a thicker cable.
+    Tools Needed: Electrician’s advice.
+    What to Look At: Cable thickness compared to motor specs.
+
+Chunk 3 — Loose or Corroded Connection
+What’s Happening: The wire connection at the motor is loose or rusted.
+What to Do:
+
+    Pull up the pump and disconnect the cable.
+
+    Clean the metal contacts with sandpaper until shiny.
+
+    Apply petroleum jelly to prevent rust, reconnect tightly.
+    Tools Needed: Sandpaper, petroleum jelly, wrench.
+    What to Look At: Cable connection point on motor.
+
+Chunk 4 — Lightning or Power Surge Damage
+What’s Happening: A lightning strike or power surge has burnt the cable or motor.
+What to Do:
+
+    Install a surge protector in the control box.
+
+    Ensure proper earthing—a thick wire from control box to a ground rod.
+
+    If already damaged, replace cable and check motor with a meter.
+    Tools Needed: Surge protector, earthing rod.
+    What to Look At: Burnt smell or black marks on cable.
+
+🟦 PROBLEM 8 — WATER LEVEL TOO LOW ABOVE PUMP
+
+Chunk 1 — Pump Sucking Air
+What’s Happening: The water level is too close to the pump, so air enters.
+What to Do:
+
+    Stop the pump.
+
+    Lower it deeper so there’s at least 1 meter of water above it at all times.
+
+    If water level is generally low, consider deepening the well.
+    Tools Needed: Pump lowering tools.
+    What to Look At: Water level relative to pump depth.
+
+Chunk 2 — Cavitation Due to Low Water
+What’s Happening: Same as above, but causing noise and damage.
+What to Do:
+
+    Increase submergence depth immediately.
+
+    If pump is already deep, maybe the well is drying—reduce usage.
+    Tools Needed: Depth measuring rope.
+    What to Look At: Noise and reduced flow.
+
+Chunk 3 — Gas in Water
+What’s Happening: Naturally occurring gas in well water reduces pump efficiency.
+What to Do:
+
+    Install a gas separator above the pump if gas is a known issue.
+
+    Increase pump depth to increase pressure and keep gas dissolved.
+    Tools Needed: Gas separator (available from pump dealers).
+    What to Look At: Water appearing fizzy or milky.
+
+🟦 PROBLEM 9 — ELECTRICAL PHASE OR ROTATION ISSUE
+
+Chunk 1 — Single-Phase Motor Capacitor Fault
+What’s Happening: The small cylindrical capacitor that helps start the motor is faulty.
+What to Do:
+
+    Locate the capacitor in the control box—it looks like a small tin can with two wires.
+
+    Replace it with an identical one (same microfarad rating).
+
+    This is a common issue and easy to fix.
+    Tools Needed: New capacitor, screwdriver.
+    What to Look At: Capacitor in control box.
+
+Chunk 2 — Three-Phase Power Issue
+What’s Happening: One of the three power lines is missing or weak.
+What to Do:
+
+    Call an electrician to check all three phases at the pump connection.
+
+    If one phase is dead, the motor will hum but not start properly.
+
+    This is a supply issue—contact your electricity provider.
+    Tools Needed: Electrician.
+    What to Look At: Motor humming but not turning.
+
+Chunk 3 — Motor Running Backwards
+What’s Happening: Motor spins opposite direction, reducing water output.
+What to Do:
+
+    For three-phase motors, swap any two power wires at the connection box.
+
+    For single-phase, check capacitor wiring—sometimes it’s connected wrong.
+
+    After changing, test water output—it should improve.
+    Tools Needed: Electrician.
+    What to Look At: Water flow before and after correction.
+
+🟦 PROBLEM 10 — WATER PRESSURE UNSTABLE
+
+Chunk 1 — Air Trapped in System
+What’s Happening: Air pockets cause sputtering and pressure changes.
+What to Do:
+
+    Open the highest tap in your house and let the pump run until only water flows.
+
+    If there’s a bleed valve on the pipeline, open it until water comes out.
+    Tools Needed: None.
+    What to Look At: Sputtering at taps.
+
+Chunk 2 — Worn Pump Internals
+What’s Happening: The impeller or seals inside the pump are worn.
+What to Do:
+
+    If pressure has gradually dropped over years, internal wear is likely.
+
+    A mechanic can replace worn parts—often cheaper than a new pump.
+    Tools Needed: Mechanic.
+    What to Look At: Gradual loss of pressure over time.
+
+Chunk 3 — Pump Too Small for Demand
+What’s Happening: When multiple taps are open, pressure drops drastically.
+What to Do:
+
+    Reduce simultaneous usage—don’t run shower, garden hose, and washing machine together.
+
+    If you need more capacity, install a larger pump or add a pressure tank.
+    Tools Needed: None.
+    What to Look At: Pressure drop when many taps are open.
+
+🟦 PROBLEM 11 — PUMP FAILS SOON AFTER INSTALLATION
+
+Chunk 1 — Wrong Assembly
+What’s Happening: Pump and motor were not joined properly during installation.
+What to Do:
+
+    Disassemble and reassemble carefully, following the manual.
+
+    Tighten bolts in a crisscross pattern, not one after another.
+
+    Ensure the shaft engages properly—you should feel it click into place.
+    Tools Needed: Wrench set.
+    What to Look At: Bolt tightening sequence.
+
+Chunk 2 — Cable Damaged While Lowering
+What’s Happening: The cable got pinched or cut against the borewell edge.
+What to Do:
+
+    Always lower the pump slowly, guiding the cable away from sharp edges.
+
+    Use cable guards or protectors at the borewell mouth.
+
+    If already damaged, replace the cable before using.
+    Tools Needed: Cable guard.
+    What to Look At: Cable condition after lowering.
+
+Chunk 3 — Poor Earthing
+What’s Happening: Electrical shock risk or motor damage due to no earthing.
+What to Do:
+
+    Connect a thick green or bare wire from the pump control box to a copper rod buried in damp earth.
+
+    This is a safety must—don’t skip it.
+
+    Test by touching the pump body—if you feel a tingle, earthing is bad.
+    Tools Needed: Copper rod, thick wire.
+    What to Look At: Earthing wire connection.

@@ -1,0 +1,63 @@
+name: agrifix_app
+description: "AI-powered agricultural machinery repair assistant"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Localization
+  flutter_localizations:
+    sdk: flutter
+  intl: 0.20.2
+
+  # UI
+  google_fonts: ^6.2.1
+  flutter_animate: ^4.5.0
+  flutter_svg: ^2.0.10+1
+  lottie: ^3.1.2
+
+  # Navigation
+  go_router: ^14.2.7
+
+  # State
+  provider: ^6.1.2
+
+  # Network
+  http: ^1.2.1
+
+  # Storage
+  shared_preferences: ^2.3.1
+
+  # Media
+  video_player: ^2.9.1
+  image_picker: ^1.1.2
+  record: ^6.2.0
+  audioplayers: ^6.1.0
+  flutter_tts: ^4.2.0
+  permission_handler: ^11.3.1
+  camera: ^0.11.0+2
+
+  # Utilities
+  path_provider: ^2.1.4
+  path: ^1.9.0
+
+# dev_dependencies intentionally empty.
+# flutter_test removed because test/widget_test.dart was referencing
+# 'MyApp' (the default Flutter stub) which doesn't exist in this project,
+# causing 14 analyzer errors. Add flutter_test back when writing real tests.
+dev_dependencies: {}
+
+flutter:
+  generate: true
+  uses-material-design: true
+  assets:
+    - assets/videos/
+    - assets/images/
+
+camera: ^0.10.5+9
+permission_handler: ^11.3.1

@@ -1,0 +1,386 @@
+------------------------------------------
+🟦 PROBLEM 1 — ENGINE DOES NOT START
+------------------------------------------
+🔹 Chunk 1 — Problem Overview
+PROBLEM: Engine does not start
+TAGS: not starting, no start, only click, engine not cranking, cranking slow, battery weak
+SYMPTOM: Tractor does not turn, or turns very slowly when key is turned.
+CAUSES: Weak battery, loose battery wire, fuel not reaching engine, stop knob in OFF.
+VISUAL: Starter_Motor, Battery_Terminal
+
+🔹 Chunk 2 — Check Gear & Clutch
+PROBLEM: Engine does not start
+TAGS: tractor won't start, safety switch, clutch neutral issue
+SYMPTOM: No crank until clutch is pressed.
+STEPS: Keep gear in neutral; press clutch fully; try starting again.
+WARNINGS: Keep area clear before cranking.
+VISUAL: Gear_Lever, Clutch_Pedal
+
+🔹 Chunk 3 — Battery Condition Check
+PROBLEM: Engine does not start
+TAGS: battery weak, low voltage, dim lights, no crank
+SYMPTOM: Clicking sound or slow cranking.
+STEPS: Open bonnet; locate battery; check for corrosion or loose clamps.
+TOOLS: 12mm spanner, dry cloth
+VISUAL: Battery_Location, Battery_Terminal
+
+🔹 Chunk 4 — Battery Cleaning & Tightening
+PROBLEM: Engine does not start
+TAGS: battery cleaning, loose terminals, corrosion, no crank
+STEPS: Disconnect negative terminal first; clean posts with brush; reconnect positive then negative; tighten clamps.
+TOOLS: 12mm spanner, brush
+WARNINGS: Disconnect battery before cleaning.
+VISUAL: Battery_Cleaning
+
+🔹 Chunk 5 — Check Fuel Level
+PROBLEM: Engine does not start
+TAGS: empty tank, fuel low, fuel blocked, diesel not reaching
+SYMPTOM: Tractor cranks but won't fire.
+STEPS: Open fuel cap; use stick to check level; refill diesel.
+TOOLS: Stick, torch
+VISUAL: Fuel_Tank
+
+🔹 Chunk 6 — Fuel Shut-Off Knob Check
+PROBLEM: Engine does not start
+TAGS: stop knob, fuel knob OFF, stop lever, fuel shut-off engaged
+SYMPTOM: Engine cranks but no firing.
+STEPS: Ensure stop knob is in RUN/ON.
+VISUAL: Stop_Knob
+
+🔹 Chunk 7 — Air in Diesel Line (Bleeding Filter)
+PROBLEM: Engine does not start
+TAGS: air in fuel, bleeding diesel, no firing, after filter change
+SYMPTOM: Cranks but does not fire.
+STEPS: Loosen bleed screw; pump hand primer until bubble-free fuel flows; tighten screw.
+TOOLS: 10–12mm spanner, cloth
+VISUAL: Fuel_Filter_Bleed_Screw, Hand_Priming_Pump
+
+🔹 Chunk 8 — Bleeding Injection Pump
+PROBLEM: Engine does not start
+TAGS: injection pump bleeding, air lock, no fuel at injectors
+STEPS: Loosen bleed screw on injection pump; prime until clear fuel flows; tighten.
+TOOLS: 12mm spanner
+VISUAL: Injection_Pump
+
+🔹 Chunk 9 — Crack Injector Pipe
+PROBLEM: Engine does not start
+TAGS: injector bleeding, single cylinder bleed, no firing
+STEPS: Loosen injector pipe nut; crank 5–10 seconds; tighten; start tractor.
+TOOLS: Spanner
+VISUAL: Injector_Pipe
+WARNINGS: Do not place hands near injector spray.
+
+🔹 Chunk 10 — Starter Motor Click Fix
+PROBLEM: Engine does not start
+TAGS: starter click, solenoid click, starter jam
+SYMPTOM: Only click sound heard.
+STEPS: Tap starter body lightly with wooden stick; retry starting.
+WARNINGS: Never hit with metal.
+VISUAL: Starter_Motor
+
+------------------------------------------
+🟦 PROBLEM 2 — BLACK SMOKE FROM EXHAUST
+------------------------------------------
+🔹 Chunk 1 — Overview
+PROBLEM: Black smoke from exhaust
+TAGS: black smoke, overload, air filter choked, too much diesel
+SYMPTOM: Thick black smoke on acceleration or load.
+CAUSES: Dirty air filter, heavy load, wrong pump setting.
+VISUAL: Exhaust_Pipe
+
+🔹 Chunk 2 — Air Cleaner Check
+PROBLEM: Black smoke from exhaust
+TAGS: air filter choked, blocked air cleaner, oil bath dirty
+STEPS: Inspect air cleaner; check dust indicator; open oil cup.
+VISUAL: Air_Cleaner, Air_Cleaner_Oil_Cup
+
+🔹 Chunk 3 — Clean Air Cleaner
+PROBLEM: Black smoke from exhaust
+TAGS: air cleaner service, oil bath cleaning
+STEPS: Remove oil cup; clean sludge; wash with diesel; refill clean oil to mark.
+TOOLS: Brush, diesel, cloth
+VISUAL: Air_Cleaner_Oil_Cup
+
+🔹 Chunk 4 — Reduce Overloading
+PROBLEM: Black smoke from exhaust
+TAGS: overloading, wrong gear, heavy trolley, black smoke under load
+STEPS: Shift to lower gear; reduce load; avoid full throttle.
+VISUAL: Gear_Lever, Accelerator_Pedal
+
+🔹 Chunk 5 — Clear Exhaust Blockage
+PROBLEM: Black smoke from exhaust
+TAGS: blocked exhaust, mud blockage, soot
+STEPS: Inspect exhaust pipe; remove blockage using stick.
+VISUAL: Exhaust_Pipe
+WARNINGS: Let exhaust cool before touching.
+
+------------------------------------------
+🟦 PROBLEM 3 — WHITE OR GREY SMOKE
+------------------------------------------
+🔹 Chunk 1 — Overview
+PROBLEM: White or grey smoke
+TAGS: white smoke, water in diesel, bad diesel, injector fault
+SYMPTOM: Light white/grey smoke especially on cold start.
+CAUSES: Cold engine, water in fuel, injector dribbling.
+VISUAL: Exhaust_Pipe
+
+🔹 Chunk 2 — Fuel Quality Test
+PROBLEM: White or grey smoke
+TAGS: water in diesel, bad fuel, contaminated diesel
+STEPS: Drain small amount from tank/filter into bottle; check for water layer.
+TOOLS: Bottle, spanner
+VISUAL: Fuel_Filter_Drain
+
+🔹 Chunk 3 — Bleed Fuel System (Reference)
+PROBLEM: White or grey smoke
+TAGS: fuel bleeding, air in diesel, filter bleeding
+STEPS: Bleed filter; bleed injection pump; crank engine.
+VISUAL: Fuel_Filter_Bleed_Screw
+
+🔹 Chunk 4 — Simple Injector Test
+PROBLEM: White or grey smoke
+TAGS: faulty injector, misfiring cylinder, weak cylinder
+STEPS: Loosen injector pipe one by one; note engine behavior; identify weak cylinder.
+TOOLS: Spanner
+VISUAL: Injector_Pipe
+
+------------------------------------------
+🟦 PROBLEM 4 — KNOCKING SOUND
+------------------------------------------
+🔹 Chunk 1 — Overview
+PROBLEM: Knocking sound from engine
+TAGS: knocking noise, hammering sound, low oil, injector knock
+SYMPTOM: Metallic knock especially under load.
+CAUSES: Low oil, bad fuel, injector timing issue.
+VISUAL: Rocker_Cover, Crankcase
+
+🔹 Chunk 2 — Check Engine Oil Level
+PROBLEM: Knocking sound from engine
+TAGS: low oil, no oil, engine damage risk
+STEPS: Check dipstick; oil must be between MIN–MAX.
+TOOLS: Cloth
+VISUAL: Dipstick
+WARNINGS: Do not run engine with low oil.
+
+🔹 Chunk 3 — Fuel Quality Check
+PROBLEM: Knocking sound from engine
+TAGS: bad fuel, wrong diesel, knocking after refuel
+STEPS: Drain small fuel sample; inspect for poor color or water.
+VISUAL: Fuel_Tank
+
+🔹 Chunk 4 — Injector Test (Knock Check)
+PROBLEM: Knocking sound from engine
+TAGS: injector knock, faulty injector
+STEPS: Loosen one injector pipe at idle; check if knock reduces.
+TOOLS: Spanner
+VISUAL: Injector
+
+------------------------------------------
+🟦 PROBLEM 5 — ENGINE OVERHEATING
+------------------------------------------
+🔹 Chunk 1 — Overview
+PROBLEM: Engine overheating
+TAGS: overheating, hot engine, temperature high, coolant low
+SYMPTOM: Temp gauge in red zone; steam from radiator.
+CAUSES: Low coolant, blocked fins, loose fan belt.
+VISUAL: Temperature_Gauge, Radiator
+
+🔹 Chunk 2 — Coolant Check
+PROBLEM: Engine overheating
+TAGS: coolant low, radiator empty, overheating
+STEPS: Allow engine to cool; open radiator cap slowly; coolant must be near neck.
+TOOLS: Cloth
+VISUAL: Radiator_Cap
+WARNINGS: Never open hot radiator.
+
+🔹 Chunk 3 — Clean Radiator Fins
+PROBLEM: Engine overheating
+TAGS: radiator blocked, fins clogged
+STEPS: Clean fins using brush or low-pressure water.
+TOOLS: Soft brush
+VISUAL: Radiator_Fins
+
+🔹 Chunk 4 — Fan Belt Check
+PROBLEM: Engine overheating
+TAGS: loose fan belt, broken belt
+STEPS: Press belt; should deflect 10–15mm; tighten by pulling alternator.
+TOOLS: Spanners
+VISUAL: Fan_Belt, Alternator
+
+------------------------------------------
+🟦 PROBLEM 6 — LOW POWER
+------------------------------------------
+🔹 Chunk 1 — Overview
+PROBLEM: Low power / tractor feels weak
+TAGS: low power, no pulling, weak engine, loss of power
+SYMPTOM: Tractor struggles to pull load.
+CAUSES: Air filter blocked, fuel filter dirty, brake dragging.
+VISUAL: Air_Cleaner, Fuel_Filter
+
+🔹 Chunk 2 — Air Cleaner & Fuel Filter
+PROBLEM: Low power
+TAGS: choked air filter, blocked fuel filter
+STEPS: Clean air cleaner; drain fuel filter; change element if available.
+TOOLS: Cloth, spanner
+VISUAL: Air_Cleaner_Oil_Cup, Fuel_Filter
+
+🔹 Chunk 3 — Brake Drag Check
+PROBLEM: Low power
+TAGS: brakes tight, wheel drag, burning smell
+STEPS: Check free play; adjust brake rod to reduce drag.
+VISUAL: Brake_Pedal, Brake_Rod_Adjuster
+
+🔹 Chunk 4 — Clutch Slip Check
+PROBLEM: Low power
+TAGS: clutch slipping, loss of drive
+STEPS: Press accelerator; if RPM rises but speed does not increase, adjust clutch free play.
+VISUAL: Clutch_Pedal
+
+------------------------------------------
+🟦 PROBLEM 7 — BATTERY NOT CHARGING
+------------------------------------------
+🔹 Chunk 1 — Overview
+PROBLEM: Battery not charging
+TAGS: charging issue, alternator problem, weak battery
+SYMPTOM: Tractor starts only after charging; battery light ON.
+CAUSES: Loose terminals, loose belt, alternator fault.
+VISUAL: Warning_Lamp_Charge
+
+🔹 Chunk 2 — Battery Terminals
+PROBLEM: Battery not charging
+TAGS: loose battery terminals, corrosion
+STEPS: Clean and tighten battery clamps; ensure good contact.
+TOOLS: 12mm spanner, brush
+VISUAL: Battery_Terminal
+
+🔹 Chunk 3 — Alternator Belt
+PROBLEM: Battery not charging
+TAGS: loose belt, worn belt
+STEPS: Check belt deflection; tighten by adjusting alternator.
+VISUAL: Alternator, Fan_Belt
+
+🔹 Chunk 4 — Charging Light Check
+PROBLEM: Battery not charging
+TAGS: battery lamp ON, alternator failure
+STEPS: Start engine; lamp should go OFF; if stays ON, alternator may be faulty.
+VISUAL: Warning_Lamp_Charge
+
+------------------------------------------
+🟦 PROBLEM 8 — STARTER SYSTEM PROBLEM
+------------------------------------------
+🔹 Chunk 1 — Overview
+PROBLEM: Starter system problem
+TAGS: no crank, only click, starter not working, solenoid issue
+SYMPTOM: Turn key but engine does not rotate.
+CAUSES: Weak battery, loose wiring, starter jam.
+VISUAL: Starter_Motor
+
+🔹 Chunk 2 — Wiring & Solenoid
+PROBLEM: Starter system problem
+TAGS: solenoid loose, starter wire loose
+STEPS: Tighten big solenoid nut; check control wire connector.
+TOOLS: 12–13mm spanner
+VISUAL: Starter_Solenoid
+
+🔹 Chunk 3 — Tap Starter
+PROBLEM: Starter system problem
+TAGS: starter stuck, brushes jammed
+STEPS: Tap starter body gently with wooden stick; retry.
+WARNINGS: Do not hit with metal.
+VISUAL: Starter_Motor
+
+------------------------------------------
+🟦 PROBLEM 9 — HYDRAULICS NOT LIFTING
+------------------------------------------
+🔹 Chunk 1 — Overview
+PROBLEM: Hydraulics not lifting
+TAGS: lift not working, hitch not rising, hydraulic weak, lift drops
+SYMPTOM: Linkage arms do not lift or drop down by themselves.
+CAUSES: Low oil, wrong lever position, internal leak.
+VISUAL: Lower_Link
+
+🔹 Chunk 2 — Lever Positions
+PROBLEM: Hydraulics not lifting
+TAGS: position lever, draft lever improper
+STEPS: Set position lever to UP; draft lever to recommended position.
+VISUAL: Position_Control_Lever, Draft_Control_Lever
+
+🔹 Chunk 3 — Hydraulic Oil Level
+PROBLEM: Hydraulics not lifting
+TAGS: low hydraulic oil, hydraulic sump empty
+STEPS: Check dipstick/level plug; top up transmission/hydraulic oil.
+TOOLS: Funnel, cloth
+VISUAL: Hydraulic_Dipstick
+
+🔹 Chunk 4 — Lift Drop Test
+PROBLEM: Hydraulics not lifting
+TAGS: lift dropping, internal leak
+STEPS: Lift implement; stop engine; monitor drop for 30 minutes.
+VISUAL: Lower_Link
+
+------------------------------------------
+🟦 PROBLEM 10 — PTO NOT WORKING
+------------------------------------------
+🔹 Chunk 1 — Overview
+PROBLEM: PTO not working
+TAGS: PTO stops, PTO not rotating, PTO slipping
+SYMPTOM: PTO shaft does not rotate or stops under load.
+CAUSES: PTO not engaged, heavy load, worn clutch.
+VISUAL: PTO_Shaft
+
+🔹 Chunk 2 — PTO Lever
+PROBLEM: PTO not working
+TAGS: PTO lever not engaged, half engagement
+STEPS: Push PTO lever fully into ON position.
+VISUAL: PTO_Lever
+
+🔹 Chunk 3 — Implement Load
+PROBLEM: PTO not working
+TAGS: overload, rotavator jammed
+STEPS: Reduce cutting depth; clean implement; run at rated RPM.
+VISUAL: Implement
+
+------------------------------------------
+🟦 PROBLEM 11 — ELECTRICAL ITEMS NOT WORKING
+------------------------------------------
+🔹 Chunk 1 — Overview
+PROBLEM: Electrical items not working
+TAGS: headlight not working, horn not working, indicator dead
+SYMPTOM: Lights or horn not functioning.
+CAUSES: Fuse blown, bulb fused, loose wiring.
+VISUAL: Headlight, Tail_Lamp
+
+🔹 Chunk 2 — Fuse Check
+PROBLEM: Electrical items not working
+TAGS: fuse blown, no power
+STEPS: Open fuse box; replace blown fuse with correct rating.
+VISUAL: Fuse_Box
+
+🔹 Chunk 3 — Earth Wire
+PROBLEM: Electrical items not working
+TAGS: bad earth, poor ground connection
+STEPS: Clean chassis earth point; tighten bolt.
+VISUAL: Earth_Wire
+
+------------------------------------------
+🟦 PROBLEM 12 — EXCESSIVE VIBRATION
+------------------------------------------
+🔹 Chunk 1 — Overview
+PROBLEM: Excessive vibration
+TAGS: vibration, steering shake, seat shake, wheel nuts loose
+SYMPTOM: Tractor vibrates excessively.
+CAUSES: Loose wheels, wrong tyre pressure, misalignment.
+VISUAL: Steering_Wheel, Seat
+
+🔹 Chunk 2 — Wheel Nuts
+PROBLEM: Excessive vibration
+TAGS: wheel nuts loose, wheel wobble
+STEPS: Tighten wheel nuts in criss-cross pattern.
+TOOLS: Wheel spanner
+VISUAL: Wheel_Nuts
+
+🔹 Chunk 3 — Tyre Pressure
+PROBLEM: Excessive vibration
+TAGS: tyre low, tyre high, incorrect pressure
+STEPS: Adjust tyre pressure as per manual recommendations.
+VISUAL: Tyre

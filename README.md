@@ -9,7 +9,11 @@ AgriFix AI is a multimodal agricultural repair assistant that helps farmers diag
 
 The platform enables users to describe machine problems in natural language, record short videos of malfunctioning equipment, and receive AI-generated step-by-step repair guidance based on real technical documentation.
 
-![Demo](Demo_Images/Home_Image.png)
+<p align="center">
+  <img src="Demo_Images/Home_Screen.png" width="30%" alt="Home Screen" />
+  <img src="Demo_Images/Recording_Uploading_Screen_Image.png" width="30%" alt="Recording Screen" /> 
+  <img src="Demo_Images/Analysis_ScreenShot.png" width="30%" alt="Analysis Screen" />
+</p>
 
 ---
 

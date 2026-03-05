@@ -1,4 +1,3 @@
-````markdown
 # AgriFix AI — Intelligent Agricultural Machinery Repair Assistant
 
 ![License](https://img.shields.io/badge/license-MIT-blue)

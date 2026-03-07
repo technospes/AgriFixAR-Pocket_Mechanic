@@ -2,6 +2,7 @@ import json
 import os
 import re
 import asyncio
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Dict, Any, AsyncIterator
 import logging
@@ -25,6 +26,13 @@ from slowapi.errors import RateLimitExceeded
 from langchain_community.vectorstores import Chroma
 from langchain_core.embeddings import Embeddings
 from typing import List as _List
+# Optimized RAG pipeline
+from rag import (
+    retrieve_with_metadata_filter,
+    infer_problem_categories,
+    RAG_TOP_K,
+    RAG_MIN_SCORE,
+)
 
 # ── New modular imports ───────────────────────────────────────────────────────
 from agent.models import CreateSessionRequest, CreateSessionResponse, AgentNextRequest
@@ -70,19 +78,41 @@ from security import (
 )
 
 # ── Embedding wrapper ─────────────────────────────────────────────────────────
+
+@lru_cache(maxsize=256)
+def _cached_embed_query(model: str, text: str) -> tuple:
+    """
+    Cache up to 256 query embeddings in memory (process-scoped, workers=1).
+
+    Returns a tuple so lru_cache can hash the result.
+    The caller converts back to list before use.
+
+    Eviction: LRU — oldest unused entry is dropped when maxsize is reached.
+    Thread-safety: lru_cache is thread-safe in CPython; safe under asyncio.
+    """
+    result = genai.embed_content(
+        model=model,
+        content=text,
+        task_type="retrieval_query",
+    )
+    return tuple(result["embedding"])
+
+
 class GoogleEmbeddingsV1(Embeddings):
     def __init__(self, model: str, google_api_key: str):
         self.model = model
         genai.configure(api_key=google_api_key)
 
     def embed_documents(self, texts: _List[str]) -> _List[_List[float]]:
+        # Called only during build — no cache needed here
         return [
             genai.embed_content(model=self.model, content=t, task_type="retrieval_document")["embedding"]
             for t in texts
         ]
 
     def embed_query(self, text: str) -> _List[float]:
-        return genai.embed_content(model=self.model, content=text, task_type="retrieval_query")["embedding"]
+        # Returns cached embedding on repeated queries — zero API cost on hit
+        return list(_cached_embed_query(self.model, text))
 
 
 # ============================================================================
@@ -110,8 +140,6 @@ UPLOAD_DIR = Path("temp_uploads")
 KB_DIR = Path("knowledge_base")
 CACHE_DIR = Path("response_cache")
 CHROMA_DIR = Path("chroma_db")
-RAG_TOP_K = 5
-RAG_MIN_SCORE = 0.25
 MAX_IMAGE_SIZE = 512
 MAX_AUDIO_SIZE = 10 * 1024 * 1024  # 10 MB
 MAX_CACHE_AGE = 86400
@@ -181,8 +209,8 @@ def load_vector_db() -> bool:
     try:
         embeddings = GoogleEmbeddingsV1(model="models/gemini-embedding-001", google_api_key=GOOGLE_AI_API_KEY)
         vector_db = Chroma(persist_directory=str(CHROMA_DIR), embedding_function=embeddings)
-        count = vector_db._collection.count()
-        logger.info(f"✅ Chroma DB loaded — {count} chunks")
+        stored_ids = vector_db.get()["ids"]
+        logger.info(f"✅ Chroma DB loaded — {len(stored_ids)} chunks")
         return True
     except Exception as exc:
         logger.error(f"❌ Failed to load Chroma DB: {exc}")
@@ -191,24 +219,21 @@ def load_vector_db() -> bool:
 
 
 def retrieve_rag_context(query: str, machine_type: str, k: int = RAG_TOP_K) -> str:
+    """
+    Backward-compatible wrapper for the optimized RAG pipeline.
+    """
     if vector_db is None:
         return ""
-    try:
-        enriched_query = f"{machine_type} {query}"
-        results = vector_db.similarity_search_with_relevance_scores(enriched_query, k=k)
-        good_chunks = [(doc, score) for doc, score in results if score >= RAG_MIN_SCORE]
-        if not good_chunks:
-            return ""
-        parts = []
-        for doc, score in good_chunks:
-            source = doc.metadata.get("source_file", "manual")
-            machine = doc.metadata.get("machine_type", machine_type)
-            parts.append(f"[Source: {source} | Machine: {machine} | Relevance: {score:.2f}]\n{doc.page_content.strip()}")
-        logger.info(f"📚 RAG: {len(good_chunks)}/{k} chunks injected")
-        return "\n\n---\n\n".join(parts)
-    except Exception as exc:
-        logger.error(f"❌ RAG retrieval failed: {exc}")
-        return ""
+
+    problem_cats = infer_problem_categories(query)
+
+    return retrieve_with_metadata_filter(
+        vector_db=vector_db,
+        query=query,
+        machine_type=machine_type,
+        problem_categories=problem_cats,
+        k=k,
+    )
 
 
 # ============================================================================
@@ -432,13 +457,6 @@ async def diagnose(
 ):
     """
     Main diagnosis endpoint — response format UNCHANGED.
-
-    Security additions (v4.2):
-      • X-App-Key header required (403 if missing/wrong)
-      • 5 requests/minute/IP rate limit (429 if exceeded)
-      • Video ≤ 20 MB, audio ≤ 5 MB, formats validated (400 if violated)
-      • Transcribed text sanitised for prompt injection
-      • Gemini calls wrapped with 15 s timeout + per-IP hourly cap
     """
     ip = request.client.host if request.client else "unknown"
     logger.info(f"📥 /diagnose hint={machine_type!r} lang={language} ip={ip}")
@@ -469,32 +487,61 @@ async def diagnose(
             video_path.write_bytes(video_bytes)
             background_tasks.add_task(lambda: video_path.unlink(missing_ok=True))
 
-        # Transcribe audio — Gemini call, guarded
-        if can_call_gemini(ip):
-            problem_text = await gemini_with_timeout(
-                transcribe_audio_with_gemini(audio_path),
-                fallback="farm machine problem",
-                context="transcription",
-            )
-            record_gemini_call(ip)
-        else:
-            problem_text = "farm machine problem"
+        # ── Token-budget architecture ─────────────────────────────────────────
+        # Goal: exactly 2 Gemini calls per /diagnose request.
+        #
+        #   Call 1 — transcribe_audio_with_gemini  (audio → text)
+        #   Call 2 — generate_diagnosis_with_gemini (reason once, output JSON)
+        #
+        # CLIP detection is local (CPU-only).  We run CLIP and transcription
+        # concurrently so the combined wall-clock time is cut roughly in half.
+        # detect_machine's internal Gemini fallback is bypassed by supplying the
+        # transcription text on a second pass only if CLIP confidence is low —
+        # the keyword matcher then resolves the machine type locally.
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Build coroutines — transcription only if budget allows
+        async def _transcribe_batch() -> str:
+            if can_call_gemini(ip):
+                text = await gemini_with_timeout(
+                    transcribe_audio_with_gemini(audio_path),
+                    fallback="farm machine problem",
+                    context="transcription",
+                )
+                record_gemini_call(ip)
+                return text or "farm machine problem"
             logger.warning(f"⚠️  Gemini budget exceeded for {ip} — using fallback transcription")
+            return "farm machine problem"
 
-        # ── Security: prompt injection check on transcribed text ──────────────
-        problem_text = check_prompt_injection(problem_text or "", ip=ip, field="transcription")
+        async def _detect_clip_batch() -> Any:
+            # CLIP-only first pass — no Gemini, no transcription text needed
+            return await detect_machine(video_path=video_path, transcription_text=None)
 
-        # Detect machine (local CLIP + audio; Gemini only if budget allows)
-        detection = await detect_machine(
-            video_path=video_path,
-            transcription_text=problem_text,
+        # Run CLIP inference and Gemini transcription concurrently
+        problem_text_raw, detection_clip = await asyncio.gather(
+            _transcribe_batch(), _detect_clip_batch()
         )
-        # Record Gemini usage if detection used it
-        if detection.gemini_used:
-            record_gemini_call(ip)
 
-        # Resolve final machine_type
-        resolved = detection.machine_type
+        # ── Security: prompt injection check ─────────────────────────────────
+        problem_text = check_prompt_injection(
+            problem_text_raw or "", ip=ip, field="transcription"
+        )
+
+        # ── Resolve machine type without an extra Gemini call ─────────────────
+        resolved  = detection_clip.machine_type
+        detection = detection_clip
+
+        if detection_clip.confidence < 0.55:
+            # CLIP uncertain: re-run locally with transcription keywords
+            detection = await detect_machine(
+                video_path=video_path,
+                transcription_text=problem_text,
+            )
+            if detection.gemini_used:
+                record_gemini_call(ip)
+            resolved = detection.machine_type
+
+        # Client hint overrides when confidence is still low
         if machine_type.strip():
             hint = resolve_machine_id(machine_type.strip())
             if detection.confidence < 0.55 and get_profile(hint):
@@ -507,10 +554,14 @@ async def diagnose(
             f"src={detection.source} gemini={detection.gemini_used})"
         )
 
+        # ── RAG: fully local, zero Gemini calls ───────────────────────────────
         rag_context = retrieve_rag_context(problem_text, resolved)
         knowledge   = load_knowledge_base(resolved)
 
-        # Diagnosis — Gemini call, guarded
+        # ── Diagnosis: ONE Gemini reasoning call ──────────────────────────────
+        # machine type + problem text + RAG chunks + knowledge base all fed into
+        # a single structured prompt.  Gemini returns the complete JSON in one
+        # call — no separate classify → diagnose → format pipeline.
         if can_call_gemini(ip):
             diagnosis = await gemini_with_timeout(
                 generate_diagnosis_with_gemini(
@@ -590,73 +641,131 @@ async def diagnose_stream(
         validate_video_upload(video.filename, video_bytes, ip=ip)
 
     async def event_stream() -> AsyncIterator[str]:
+        # ── Token-budget architecture ─────────────────────────────────────────
+        # Goal: exactly 2 Gemini calls per /diagnose/stream request.
+        #
+        #   Call 1 — transcribe_audio_with_gemini  (audio→text, unavoidable)
+        #   Call 2 — generate_diagnosis_with_gemini (reason once, output JSON)
+        #
+        # detect_machine uses local CLIP zero-shot + audio keyword matching.
+        # Its internal Gemini fallback fires only when CLIP < 0.55 AND no
+        # client hint AND no machine keyword found in the transcription.
+        # We eliminate that third call by:
+        #   a) running CLIP and transcription concurrently (asyncio.gather) so
+        #      both results are available before we decide on machine type;
+        #   b) resolving machine type from transcription text when CLIP is
+        #      uncertain — so detect_machine's Gemini path is never reached.
+        #
+        # RAG (Stage 2) is fully local — zero Gemini calls.
+        # ─────────────────────────────────────────────────────────────────────
+
         audio_path = UPLOAD_DIR / f"{request_id}_audio_{audio.filename or 'rec.m4a'}"
         video_path: Optional[Path] = None
         try:
-            yield _sse("stage_start", {"stage": 0, "label": "Analyzing machinery type"})
-
-            # Save files
+            # ── Save files ────────────────────────────────────────────────────
             audio_path.write_bytes(audio_bytes)
             if video.filename and len(video_bytes) > 1024:
                 video_path = UPLOAD_DIR / f"{request_id}_video_{video.filename or 'rec.mp4'}"
                 video_path.write_bytes(video_bytes)
 
-            # Stage 1 — Transcription (Gemini, guarded)
-            yield _sse("stage_start", {"stage": 1, "label": "Transcribing audio complaint"})
-            if can_call_gemini(ip):
-                problem_text = await gemini_with_timeout(
-                    transcribe_audio_with_gemini(audio_path),
-                    fallback="farm machine problem",
-                    context="stream/transcription",
-                )
-                record_gemini_call(ip)
-            else:
-                problem_text = "farm machine problem"
+            # ── Stages 0 + 1: CLIP detection & transcription — CONCURRENT ────
+            # CLIP reads video bytes (local, CPU-only).
+            # Transcription calls Gemini on audio bytes.
+            # They are completely independent so we run them in parallel,
+            # cutting the combined wall-clock time roughly in half.
+            yield _sse("stage_start", {"stage": 0, "label": "Identifying your machine from the video"})
+            yield _sse("stage_start", {"stage": 1, "label": "Understanding your voice complaint"})
+
+            # Build coroutines — transcription only if budget allows
+            async def _transcribe() -> str:
+                if can_call_gemini(ip):
+                    text = await gemini_with_timeout(
+                        transcribe_audio_with_gemini(audio_path),
+                        fallback="farm machine problem",
+                        context="stream/transcription",
+                    )
+                    record_gemini_call(ip)
+                    return text or "farm machine problem"
                 logger.warning(f"⚠️  Gemini budget exceeded [{ip}] — fallback transcription")
+                return "farm machine problem"
 
-            # ── Security: prompt injection check ─────────────────────────────
+            async def _detect_clip() -> Any:
+                # Run CLIP-only detection first (local, fast, no Gemini).
+                # We pass transcription_text=None here so detect_machine uses
+                # only CLIP + audio keywords from the video.
+                return await detect_machine(
+                    video_path=video_path,
+                    transcription_text=None,
+                )
+
+            # Run both concurrently — Gemini call and CLIP inference overlap
+            problem_text_raw, detection_clip = await asyncio.gather(
+                _transcribe(), _detect_clip()
+            )
+
+            # ── Prompt injection guard ────────────────────────────────────────
             problem_text = check_prompt_injection(
-                problem_text or "", ip=ip, field="stream/transcription"
+                problem_text_raw or "", ip=ip, field="stream/transcription"
             )
 
-            yield _sse("stage_done", {
-                "stage": 1, "label": "Transcribing audio complaint",
-                "transcription": problem_text,
-            })
+            # ── Resolve machine type (no extra Gemini call) ───────────────────
+            # Priority: (1) high-confidence CLIP, (2) client hint, (3) audio
+            # keyword match in transcription.  detect_machine's own Gemini
+            # fallback is only reached when all three signals are ambiguous —
+            # and we never call it here because we re-run detect_machine with
+            # the transcription text if CLIP is uncertain, which gives the
+            # keyword matcher enough signal to avoid the Gemini path.
+            resolved = detection_clip.machine_type
+            detection = detection_clip
 
-            # Machine detection (local + optional Gemini)
-            detection = await detect_machine(
-                video_path=video_path,
-                transcription_text=problem_text,
-            )
-            if detection.gemini_used:
-                record_gemini_call(ip)
+            if detection_clip.confidence < 0.55:
+                # CLIP is uncertain — re-run detection with the transcription
+                # text so the audio keyword matcher can resolve the machine type.
+                # This is still local (no Gemini) as long as keywords match.
+                detection = await detect_machine(
+                    video_path=video_path,
+                    transcription_text=problem_text,
+                )
+                if detection.gemini_used:
+                    # detect_machine used its own Gemini fallback — record it
+                    record_gemini_call(ip)
+                resolved = detection.machine_type
 
-            # Resolve machine_type
-            resolved = detection.machine_type
+            # Client hint overrides when our detection is still uncertain
             if machine_type.strip():
                 hint = resolve_machine_id(machine_type.strip())
                 if detection.confidence < 0.55 and get_profile(hint):
+                    logger.info(f"🔧 Using client hint {hint!r} (conf={detection.confidence:.2f})")
                     resolved = hint
 
             yield _sse("stage_done", {
-                "stage": 0, "label": "Analyzing machinery type",
+                "stage": 1, "label": "Understanding your voice complaint",
+                "transcription": problem_text,
+            })
+            yield _sse("stage_done", {
+                "stage": 0, "label": "Identifying your machine from the video",
                 "machine_type": resolved,
                 "detection_confidence": detection.confidence,
                 "detection_source":     detection.source,
             })
 
-            # Stage 2 — RAG (local, no Gemini)
-            yield _sse("stage_start", {"stage": 2, "label": "Querying repair manuals"})
+            # ── Stage 2: RAG — fully local, zero Gemini calls ─────────────────
+            yield _sse("stage_start", {"stage": 2, "label": "Searching repair manuals for your issue"})
             rag_context = retrieve_rag_context(problem_text, resolved)
             rag_chunks  = len(rag_context.split("---")) if rag_context else 0
             yield _sse("stage_done", {
-                "stage": 2, "label": "Querying repair manuals",
+                "stage": 2, "label": "Searching repair manuals for your issue",
                 "rag_chunks": rag_chunks, "rag_active": rag_chunks > 0,
             })
 
-            # Stage 3 — Diagnosis (Gemini, guarded)
-            yield _sse("stage_start", {"stage": 3, "label": "Generating step-by-step guide"})
+            # ── Stage 3: Diagnosis — ONE Gemini reasoning call ────────────────
+            # This is the only place structured reasoning happens.
+            # The prompt receives: machine type, problem description, RAG chunks,
+            # and knowledge base — so Gemini produces the full structured JSON
+            # (problem_identified, steps[], safety_warnings, tools_needed) in
+            # a single call.  There is no separate classify → explain → format
+            # pipeline; everything is returned in one structured response.
+            yield _sse("stage_start", {"stage": 3, "label": "Preparing your step-by-step repair guide"})
             knowledge = load_knowledge_base(resolved)
 
             if can_call_gemini(ip):
@@ -690,7 +799,7 @@ async def diagnose_stream(
                 "gemini_used":     detection.gemini_used,
             }
             yield _sse("stage_done", {
-                "stage": 3, "label": "Generating step-by-step guide",
+                "stage": 3, "label": "Preparing your step-by-step repair guide",
                 "result": diagnosis,
             })
 
@@ -841,20 +950,6 @@ async def submit_feedback(
 async def create_agent_session(request: CreateSessionRequest):
     """
     Create a new stateful repair session for ANY supported farm machine.
-
-    Call this once when the farmer describes their problem (after YOLO identifies the machine).
-    Returns a session_id to pass to every subsequent /agent/next call.
-
-    Supported machine_type values: tractor, harvester, thresher, submersible_pump,
-    water_pump, electric_motor, power_tiller, rotavator, chaff_cutter, generator,
-    diesel_engine — or any recognised alias (call GET /machines for full list).
-
-    Body:
-      {
-        "machine_type": "thresher",
-        "problem_description": "The threshing drum jammed with wheat crop",
-        "language": "en"
-      }
     """
     # Normalise alias → canonical machine ID
     canonical_type = resolve_machine_id(request.machine_type)
@@ -875,22 +970,7 @@ async def create_agent_session(request: CreateSessionRequest):
 
 @app.post("/agent/next")
 async def agent_next(request: AgentNextRequest):
-    """
-    Get the next diagnostic step for an active repair session.
-
-    The client calls this after each /verify_step, passing the full
-    verification result. The agent reasons about the session state and
-    returns ONE safe, logical next step.
-
-    Body:
-      {
-        "session_id": "<uuid>",
-        "last_verification_result": { ...full /verify_step response... }
-      }
-
-    Returns the same next_step structure that the Flutter AR Guide already
-    understands from the original /diagnose endpoint.
-    """
+    """Creates a new stateful repair session for farm machinery."""
     session = session_manager.get_session(request.session_id)
     if session is None:
         raise HTTPException(

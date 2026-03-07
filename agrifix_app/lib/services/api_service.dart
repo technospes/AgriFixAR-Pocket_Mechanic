@@ -41,7 +41,7 @@ class DiagnosisResult {
 // ─────────────────────────────────────────────────────────────────────────────
 class ApiService {
   static const String _baseUrl = 
-      'http://10.0.2.2:7680';
+      'https://technospes-agrifixar-backend-new.hf.space';
   static const String _appKey = '020b082f133f403abf8694e6144df1a79396b2706dd9de108bc54a05e891fc29';
   static const Duration _uploadTimeout = Duration(seconds: 90);
   static const Duration _streamTimeout = Duration(minutes: 3);
@@ -354,6 +354,7 @@ class ApiService {
     required String machineType,
     required String problemContext,
     required int attemptCount,
+    String previousSteps = '[]',                  // ← visual memory from client
     void Function(double progress)? onProgress,
     void Function(String status)? onStatus,
   }) async {
@@ -362,11 +363,11 @@ class ApiService {
       ..headers['X-App-Key'] = _appKey
       ..files.add(await http.MultipartFile.fromPath('image', imageFile.path))
       ..fields.addAll({
-        'step_text': stepText,
-        'machine_type': machineType,
+        'step_text':       stepText,
+        'machine_type':    machineType,
         'problem_context': problemContext,
-        'attempt_count': attemptCount.toString(),
-        'previous_steps': '[]',
+        'attempt_count':   attemptCount.toString(),
+        'previous_steps':  previousSteps,          // ← was hardcoded '[]'
       });
 
     onStatus?.call('Verifying step…');

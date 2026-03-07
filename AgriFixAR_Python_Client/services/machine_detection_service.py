@@ -20,11 +20,11 @@ _MODEL_PRETRAINED = os.environ.get("CLIP_PRETRAINED",  "datacompdr")
 #     Wrong machine or non-machinery  → 0.25–0.45
 #   0.55 = "confident enough to skip Gemini"
 #   0.35 = "has a weak signal, worth including in fusion"
-_CLIP_STRONG     = 0.55   # trust CLIP alone above this
+_CLIP_STRONG     = 0.40   # trust CLIP alone above this
 _CLIP_WEAK       = 0.35   # include in fusion above this
 _AUDIO_STRONG    = 0.70   # trust audio alone above this
 _AUDIO_WEAK      = 0.40   # include in fusion above this
-_FUSED_MIN       = 0.60   # fused result above this → skip Gemini
+_FUSED_MIN       = 0.50   # fused result above this → skip Gemini
 
 # ── Frame quality thresholds ──────────────────────────────────────────────────
 _BLUR_MIN        = 80.0   # Laplacian variance — below = blurry, reject

@@ -31,8 +31,7 @@ from utils.machine_registry import (
 
 logger = logging.getLogger(__name__)
 _GEMINI_MODEL = "models/gemini-2.5-flash"
-_MAX_IMAGE_DIM = 512
-
+_MAX_IMAGE_DIM = 720
 # ── Jargon substitution map ───────────────────────────────────────────────────
 # 5 terms cover ~95% of real failures across all 11 machines.
 # Gemini handles the rest from context; spelling every term out wastes tokens.
@@ -91,12 +90,32 @@ async def verify_step_with_gemini(
 
         prompt = f"""Farm machinery camera verification. Farmer tapped Analyze on their {machine_type}.
 {electric_flag}{lang_note}
+
 Context: problem={problem_context} | step="{step_text}"
+
+ACTION CHECK:
+The farmer is trying to perform the action described in the step.
+If the correct part is visible but the action has NOT been performed
+(for example pedal not pressed, lever not moved, cable still connected),
+explain the mistake in feedback and tell the farmer what action to perform.
+Do NOT say "image unclear" if the part is visible but the action is missing.
+If the correct part is visible but the action is incorrect or incomplete,
+status MUST be "fail".
+
 Find: {required_part} in {area_hint} ({area_desc}) | attempt={attempt_count}
+Only report a part if it is clearly visible in the image. Do not guess hidden parts.
+
 Focus: {obs_hint}
 Jargon→plain: {_UNIVERSAL_JARGON_MAP}
+
 AI observes only — never ask farmer to describe, speak, or report anything.
-Feedback: one sentence. On pass/fail: WHERE to move camera (colour+shape+landmark) or what was found. On unclear: how to fix the shot.
+
+ai_observation: 1 sentence — what the camera sees right now in plain physical words. No jargon.
+
+feedback: EXACTLY two short lines separated by a newline.
+
+Line 1: what the farmer did wrong.
+Line 2: the exact action the farmer must perform next.
 
 Return ONLY this JSON:
 {{
@@ -104,9 +123,9 @@ Return ONLY this JSON:
   "confidence": 0.0-1.0,
   "detected_part": "<physical description of what is visible>",
   "correct_part": "{required_part}",
-  "ai_observation": "<one plain sentence — farmer language, no jargon>",
-  "feedback": "<one sentence — EN>",
-  "feedback_hi": "<same — simple Hindi>",
+  "ai_observation": "<1 sentence: what camera sees in plain words>",
+  "feedback": "<2 lines max: line 1 = what farmer did wrong, line 2 = exact fix>",
+  "feedback_hi": "<same 2 lines — simple village Hindi>",
   "safety_note": null
 }}
 pass=part_visible+assessable(conf≥0.70); fail=wrong_area; unclear=bad_image; unsafe=danger_visible."""
@@ -164,8 +183,8 @@ def _fallback_verification(required_part: str, machine_type: str, attempt_count:
         "status": "unclear", "verified": False, "confidence": 0.0,
         "detected_part": "Could not identify — image unclear",
         "correct_part": required_part, "machine_type": machine_type,
-        "ai_observation": "The camera image is not clear enough to see the part.",
-        "feedback": "Move closer — forearm-length away — hold still, then tap Analyze.",
-        "feedback_hi": "कैमरे को करीब लाएं — हाथ की लंबाई जितनी दूरी — स्थिर रखें, फिर विश्लेषण दबाएं।",
+        "ai_observation": "The image is too dark or blurry to see the part.",
+        "feedback": "The camera cannot see the part clearly.\nMove closer — forearm-length away — hold still, then tap Analyze.",
+        "feedback_hi": "कैमरे को हिस्से के पास लाएं — हाथ की लंबाई जितनी दूरी।\nस्थिर रखें, फिर विश्लेषण दबाएं।",
         "attempt_count": attempt_count,
     }

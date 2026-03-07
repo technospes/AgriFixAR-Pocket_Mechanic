@@ -11,22 +11,6 @@ class AnalysisStep {
 }
 
 // ── Public entry point ───────────────────────────────────────────
-/// Call this from your "Find Solution" button.
-///
-/// [runAnalysis] receives a [markDone(stepIndex)] callback.
-/// Call markDone(0), markDone(1), markDone(2), markDone(3) as each
-/// backend stage completes. Steps can arrive in any order.
-///
-/// [onCompleted] fires automatically after all 4 steps are done.
-///
-/// Example:
-///   showAnalysisSheet(
-///     context,
-///     runAnalysis: (markDone) async {
-///       await ApiService.diagnose(onStepDone: markDone);
-///     },
-///     onCompleted: () => context.go('/solution'),
-///   );
 Future<void> showAnalysisSheet(
   BuildContext context, {
   required Future<void> Function(
@@ -39,9 +23,7 @@ Future<void> showAnalysisSheet(
     context: context,
     isScrollControlled: true,
     backgroundColor: Colors.transparent,
-    // FIX: transparent so BackdropFilter is visible
     barrierColor: Colors.transparent,
-    // REFINEMENT 1: prevent accidental swipe-dismiss mid-analysis
     isDismissible: false,
     enableDrag: false,
     builder: (_) => _AnalysisSheetWithOverlay(
@@ -52,7 +34,6 @@ Future<void> showAnalysisSheet(
 }
 
 // ── Overlay wrapper ──────────────────────────────────────────────
-// Covers the full screen with blur + dark scrim behind the panel.
 class _AnalysisSheetWithOverlay extends StatelessWidget {
   final Future<void> Function(
     void Function(int) markActive,
@@ -69,13 +50,10 @@ class _AnalysisSheetWithOverlay extends StatelessWidget {
   Widget build(BuildContext context) {
     return Stack(
       children: [
-        // Full-screen blur + dim layer
         BackdropFilter(
           filter: ImageFilter.blur(sigmaX: 8, sigmaY: 8),
-          // FIX: .withValues() instead of deprecated .withOpacity()
           child: Container(color: Colors.black.withValues(alpha: 0.35)),
         ),
-        // Sheet panel anchored to bottom
         Align(
           alignment: Alignment.bottomCenter,
           child: _AnalysisSheet(
@@ -108,12 +86,11 @@ class _AnalysisSheet extends StatefulWidget {
 class _AnalysisSheetState extends State<_AnalysisSheet>
     with TickerProviderStateMixin {
 
-  // REFINEMENT 4+5: strings in one place for easy l10n migration later
   static const _stepLabels = [
-    'Analyzing machinery type...',
-    'Transcribing audio complaint...',
-    'Querying repair manuals...',
-    'Generating step-by-step guide...',
+    'Identifying your machine from the video...',
+    'Understanding your voice complaint...',
+    'Searching repair manuals for your issue...',
+    'Preparing your step-by-step repair guide...',
   ];
 
   late final List<AnalysisStep> _steps;
@@ -122,7 +99,10 @@ class _AnalysisSheetState extends State<_AnalysisSheet>
   late final List<AnimationController> _spinControllers;
 
   double _progress = 0.0;
-  bool _hasError = false;
+  bool   _hasError = false;
+
+  int _doneCount    = 0;   
+  // int _displayHead  = 0;   
 
   @override
   void initState() {
@@ -133,34 +113,25 @@ class _AnalysisSheetState extends State<_AnalysisSheet>
     _checkControllers = List.generate(
       _steps.length,
       (_) => AnimationController(
-        vsync: this,
-        duration: const Duration(milliseconds: 280),
-      ),
+        vsync: this, duration: const Duration(milliseconds: 280)),
     );
+    _checkScales = _checkControllers.map((c) =>
+      Tween<double>(begin: 0.6, end: 1.0).animate(
+        CurvedAnimation(parent: c, curve: Curves.easeOutBack))).toList();
 
-    _checkScales = _checkControllers.map((c) {
-      return Tween<double>(begin: 0.6, end: 1.0).animate(
-        CurvedAnimation(parent: c, curve: Curves.easeOutBack),
-      );
-    }).toList();
-
-    // FIX 1: No ..repeat() here — only spin when step is active
     _spinControllers = List.generate(
       _steps.length,
       (_) => AnimationController(
-        vsync: this,
-        duration: const Duration(milliseconds: 1400),
-      ),
+        vsync: this, duration: const Duration(milliseconds: 1400)),
     );
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      // backend fires stage_start(0) immediately → markActive(0) drives the spinner
-      widget.runAnalysis(_setActive, _markDone).catchError((error) {
+      _activateVisualRow(0);
+
+      widget.runAnalysis(_onBackendStageStart, _onBackendStageDone)
+          .catchError((error) {
         if (!mounted) return;
-        // REFINEMENT 3: stop all spinning if error occurs
-        for (final c in _spinControllers) {
-          c.stop();
-        }
+        for (final c in _spinControllers) c.stop();
         setState(() => _hasError = true);
       });
     });
@@ -173,37 +144,55 @@ class _AnalysisSheetState extends State<_AnalysisSheet>
     super.dispose();
   }
 
-  // FIX 1: Only the newly active step starts its spinner
-  void _setActive(int i) {
-    if (!mounted || i >= _steps.length) return;
-    setState(() => _steps[i].status = StepStatus.active);
-    _spinControllers[i].repeat(); // start spin only for this step
+  void _onBackendStageStart(int backendIndex) {
+    // No-op
   }
 
-  void _markDone(int i) {
+  void _onBackendStageDone(int backendIndex) {
+    if (!mounted) return;
+
+    _doneCount++;
+    final visualRow = _doneCount - 1; 
+
+    if (visualRow >= _steps.length) return;
+    if (_steps[visualRow].status == StepStatus.completed) return;
+
+    setState(() {
+      _steps[visualRow].status = StepStatus.completed;
+      _spinControllers[visualRow].stop();
+      _progress = _doneCount / _steps.length;
+    });
+    _checkControllers[visualRow].forward();
+
+    final nextVisual = _doneCount; 
+    if (nextVisual < _steps.length) {
+      Future.delayed(const Duration(milliseconds: 160), () {
+        if (mounted) _activateVisualRow(nextVisual);
+      });
+    } else {
+      Future.delayed(const Duration(milliseconds: 600), () {
+        if (mounted) {
+          Navigator.of(context).pop();
+          widget.onCompleted();
+        }
+      });
+    }
+  }
+
+  void _activateVisualRow(int i) {
     if (!mounted || i >= _steps.length) return;
-    // REFINEMENT 2: guard against double markDone calls
+    
+    // 🚨 THE FIX: Prevent Race Condition!
+    // If the backend completes stages faster than the 160ms visual delay,
+    // this row might have already been marked as 'completed'. 
+    // We must NOT revert it back to 'active' (PROCESSING).
     if (_steps[i].status == StepStatus.completed) return;
 
     setState(() {
-      _steps[i].status = StepStatus.completed;
-      _spinControllers[i].stop(); // stop spin for this step
-      _progress =
-          _steps.where((s) => s.status == StepStatus.completed).length /
-              _steps.length;
+      // _displayHead = i;
+      _steps[i].status = StepStatus.active;
     });
-    _checkControllers[i].forward();
-
-    final next = i + 1;
-    if (next < _steps.length) {
-      Future.delayed(const Duration(milliseconds: 150), () => _setActive(next));
-    } else {
-      // All steps complete → brief pause → close + navigate
-      Future.delayed(const Duration(milliseconds: 600), () {
-        if (mounted) Navigator.of(context).pop();
-        widget.onCompleted();
-      });
-    }
+    _spinControllers[i].repeat();
   }
 
   @override
@@ -224,7 +213,6 @@ class _AnalysisSheetState extends State<_AnalysisSheet>
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // ── Drag handle ──
           Container(
             width: 36,
             height: 4,
@@ -234,8 +222,6 @@ class _AnalysisSheetState extends State<_AnalysisSheet>
             ),
           ),
           const SizedBox(height: 24),
-
-          // ── Title ──
           const Text(
             'AI Analysis in Progress',
             style: TextStyle(
@@ -245,10 +231,8 @@ class _AnalysisSheetState extends State<_AnalysisSheet>
             ),
           ),
           const SizedBox(height: 8),
-
-          // ── Subtitle ──
           const Text(
-            'Please wait while we analyze your machine issue.',
+            'This takes about 15–30 seconds. Please keep the app open.',
             textAlign: TextAlign.center,
             style: TextStyle(
               fontSize: 14,
@@ -258,7 +242,6 @@ class _AnalysisSheetState extends State<_AnalysisSheet>
           ),
           const SizedBox(height: 28),
 
-          // ── Error state (FIX 5) ──
           if (_hasError) ...[
             const Icon(
               Icons.error_outline_rounded,
@@ -281,8 +264,6 @@ class _AnalysisSheetState extends State<_AnalysisSheet>
               child: const Text('Dismiss'),
             ),
           ] else ...[
-
-            // ── Checklist ──
             ...List.generate(
               _steps.length,
               (i) => _StepRow(
@@ -292,8 +273,6 @@ class _AnalysisSheetState extends State<_AnalysisSheet>
               ),
             ),
             const SizedBox(height: 24),
-
-            // ── Progress bar ──
             ClipRRect(
               borderRadius: BorderRadius.circular(4),
               child: TweenAnimationBuilder<double>(
@@ -304,14 +283,11 @@ class _AnalysisSheetState extends State<_AnalysisSheet>
                   value: val,
                   minHeight: 6,
                   backgroundColor: const Color(0xFFE5E7EB),
-                  valueColor:
-                      const AlwaysStoppedAnimation(Color(0xFF10B981)),
+                  valueColor: const AlwaysStoppedAnimation(Color(0xFF10B981)),
                 ),
               ),
             ),
             const SizedBox(height: 8),
-
-            // ── Progress % label ──
             Align(
               alignment: Alignment.centerRight,
               child: Text(
@@ -379,7 +355,6 @@ class _StepRow extends StatelessWidget {
         );
 
       case StepStatus.active:
-        // REFINEMENT 4: CurvedAnimation with linear curve for smoother spin
         return RotationTransition(
           turns: CurvedAnimation(
             parent: spinController,
@@ -388,7 +363,7 @@ class _StepRow extends StatelessWidget {
           child: const Icon(
             Icons.timelapse_rounded,
             color: Color(0xFF10B981),
-            size: 24, // FIX 3: 24px fits cleanly in 32px container
+            size: 24,
           ),
         );
 
@@ -436,7 +411,7 @@ class _StepRow extends StatelessWidget {
           child: Text(
             'DONE',
             textAlign: TextAlign.right,
-            style: TextStyle(
+            style: const TextStyle(
               fontSize: 10,
               fontWeight: FontWeight.w600,
               letterSpacing: 0.3,

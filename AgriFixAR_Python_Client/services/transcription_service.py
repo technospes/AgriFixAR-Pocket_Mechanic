@@ -32,7 +32,16 @@ async def transcribe_audio_with_gemini(audio_path: Path) -> str:
         if audio_path.stat().st_size > MAX_AUDIO_SIZE:
             logger.warning("Audio file too large — may be truncated by Gemini")
 
-        audio_file = genai.upload_file(str(audio_path))
+        import mimetypes
+
+        mime_type, _ = mimetypes.guess_type(str(audio_path))
+        mime_type = mime_type or "audio/mp4"
+
+        audio_file = genai.upload_file(
+            str(audio_path),
+            mime_type=mime_type
+        )
+
         model = genai.GenerativeModel("models/gemini-2.5-flash")
 
         prompt = """You are an expert assistant who understands how Indian farmers speak about problems with their farm machinery and equipment.

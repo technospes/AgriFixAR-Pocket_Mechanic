@@ -130,7 +130,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             Align(
               alignment: Alignment.topRight,
               child: _LanguagePill(
-                displayName: langProvider.displayName,
                 flag: langProvider.flag,
                 onTap: () =>
                     setState(() => _showLanguagePanel = true),
@@ -269,36 +268,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 // ── Sub-widgets ───────────────────────────────────────────────────────────────
 
 class _LanguagePill extends StatelessWidget {
-  final String displayName;
   final String flag;
   final VoidCallback onTap;
-  const _LanguagePill(
-      {required this.displayName,
-      required this.flag,
-      required this.onTap});
+  const _LanguagePill({required this.flag, required this.onTap});
 
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        height: 36,
-        padding: const EdgeInsets.symmetric(horizontal: 14),
+        width: 44,
+        height: 44,
         decoration: BoxDecoration(
           color: Colors.white.withValues(alpha: 0.18),
-          borderRadius: BorderRadius.circular(18),
+          shape: BoxShape.circle,
           border: Border.all(
               color: Colors.white.withValues(alpha: 0.28), width: 1),
         ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.language_rounded,
-                color: Colors.white, size: 15),
-            const SizedBox(width: 6),
-            Text('$flag  $displayName',
-                style: AppTextStyles.languageBtn),
-          ],
+        child: Center(
+          child: Text(flag, style: const TextStyle(fontSize: 22)),
         ),
       ),
     );

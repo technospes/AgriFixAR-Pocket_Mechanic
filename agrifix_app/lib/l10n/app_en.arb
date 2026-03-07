@@ -33,5 +33,17 @@
   "uploadStep5": "Solution ready",
   "uploadErrorTitle": "Something went wrong",
   "uploadErrorSubtitle": "Check your internet and try again",
-  "uploadRetry": "Retry"
+  "uploadRetry": "Retry",
+  "aiRepairGuide": "AI Repair Guide",
+  "solutionFound": "SOLUTION FOUND",
+  "stepNumber": "Step {number}",
+  "@stepNumber": {
+    "placeholders": {
+      "number": { "type": "int" }
+    }
+  },
+  "currentTask": "Current Task",
+  "startArGuide": "Start AR Guide",
+  "prev": "Prev",
+  "next": "Next"
 }

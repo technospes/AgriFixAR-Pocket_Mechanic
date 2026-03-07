@@ -33,5 +33,17 @@
   "uploadStep5": "समाधान तैयार है",
   "uploadErrorTitle": "कुछ गलत हुआ",
   "uploadErrorSubtitle": "इंटरनेट जांचें और पुनः प्रयास करें",
-  "uploadRetry": "पुनः प्रयास करें"
+  "uploadRetry": "पुनः प्रयास करें",
+  "aiRepairGuide": "एआई मरम्मत गाइड",
+  "solutionFound": "समाधान मिल गया",
+  "stepNumber": "चरण {number}",
+  "@stepNumber": {
+    "placeholders": {
+      "number": { "type": "int" }
+    }
+  },
+  "currentTask": "वर्तमान कार्य",
+  "startArGuide": "एआर गाइड शुरू करें",
+  "prev": "पिछला",
+  "next": "अगला"
 }

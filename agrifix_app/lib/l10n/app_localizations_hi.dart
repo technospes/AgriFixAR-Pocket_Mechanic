@@ -106,4 +106,27 @@ class AppLocalizationsHi extends AppLocalizations {
 
   @override
   String get uploadRetry => 'पुनः प्रयास करें';
+
+  @override
+  String get aiRepairGuide => 'एआई मरम्मत गाइड';
+
+  @override
+  String get solutionFound => 'समाधान मिल गया';
+
+  @override
+  String stepNumber(int number) {
+    return 'चरण $number';
+  }
+
+  @override
+  String get currentTask => 'वर्तमान कार्य';
+
+  @override
+  String get startArGuide => 'एआर गाइड शुरू करें';
+
+  @override
+  String get prev => 'पिछला';
+
+  @override
+  String get next => 'अगला';
 }

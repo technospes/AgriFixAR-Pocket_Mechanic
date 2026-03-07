@@ -291,6 +291,48 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Retry'**
   String get uploadRetry;
+
+  /// No description provided for @aiRepairGuide.
+  ///
+  /// In en, this message translates to:
+  /// **'AI Repair Guide'**
+  String get aiRepairGuide;
+
+  /// No description provided for @solutionFound.
+  ///
+  /// In en, this message translates to:
+  /// **'SOLUTION FOUND'**
+  String get solutionFound;
+
+  /// No description provided for @stepNumber.
+  ///
+  /// In en, this message translates to:
+  /// **'Step {number}'**
+  String stepNumber(int number);
+
+  /// No description provided for @currentTask.
+  ///
+  /// In en, this message translates to:
+  /// **'Current Task'**
+  String get currentTask;
+
+  /// No description provided for @startArGuide.
+  ///
+  /// In en, this message translates to:
+  /// **'Start AR Guide'**
+  String get startArGuide;
+
+  /// No description provided for @prev.
+  ///
+  /// In en, this message translates to:
+  /// **'Prev'**
+  String get prev;
+
+  /// No description provided for @next.
+  ///
+  /// In en, this message translates to:
+  /// **'Next'**
+  String get next;
 }
 
 class _AppLocalizationsDelegate

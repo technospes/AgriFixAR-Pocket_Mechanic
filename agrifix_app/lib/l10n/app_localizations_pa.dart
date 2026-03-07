@@ -106,4 +106,27 @@ class AppLocalizationsPa extends AppLocalizations {
 
   @override
   String get uploadRetry => 'ਦੁਬਾਰਾ ਕੋਸ਼ਿਸ਼ ਕਰੋ';
+
+  @override
+  String get aiRepairGuide => 'AI Repair Guide';
+
+  @override
+  String get solutionFound => 'SOLUTION FOUND';
+
+  @override
+  String stepNumber(int number) {
+    return 'Step $number';
+  }
+
+  @override
+  String get currentTask => 'Current Task';
+
+  @override
+  String get startArGuide => 'Start AR Guide';
+
+  @override
+  String get prev => 'Prev';
+
+  @override
+  String get next => 'Next';
 }

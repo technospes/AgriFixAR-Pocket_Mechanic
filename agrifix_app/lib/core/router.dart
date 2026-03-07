@@ -1,12 +1,9 @@
-import 'package:flutter/material.dart';
+// import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import '../screens/home/home_screen.dart';
 import '../screens/upload/upload_screen.dart';
 import '../../screens/solution/solution_screen.dart';
-import '../../screens/ar_guide/ar_guide_screen.dart'; // ← ADDED
-// Replace the placeholders below as you build each screen:
-// import '../screens/solution/solution_screen.dart';
-// import '../screens/ar_guide/ar_guide_screen.dart';
+import '../../screens/ar_guide/ar_guide_screen.dart';
 
 class AppRoutes {
   static const home     = '/';
@@ -39,27 +36,3 @@ final appRouter = GoRouter(
     ),
   ],
 );
-
-class _PlaceholderScreen extends StatelessWidget {
-  final String title;
-  const _PlaceholderScreen(this.title);
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFF1A1A1A),
-      appBar: AppBar(
-        backgroundColor: Colors.transparent,
-        foregroundColor: Colors.white,
-        title: Text(title),
-      ),
-      body: Center(
-        child: Text(
-          '$title\n(Coming soon)',
-          style: const TextStyle(color: Colors.white54, fontSize: 18),
-          textAlign: TextAlign.center,
-        ),
-      ),
-    );
-  }
-}

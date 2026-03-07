@@ -1,5 +1,6 @@
 // ignore_for_file: deprecated_member_use
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
@@ -10,6 +11,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 import '../../core/providers/diagnosis_provider.dart';
+import '../../core/providers/language_provider.dart';
 import '../../services/api_service.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 
@@ -62,9 +64,11 @@ class _ARGuideScreenState extends State<ARGuideScreen>
   _ARState   _arState       = _ARState.scanning;
   bool       _voiceActive   = false;
   bool       _panelExpanded = false;
-  int        _attemptCount  = 0;
+  int        _attemptCount    = 0;
+  final List<Map<String, dynamic>> _attemptResults = [];  // visual memory for current step
   _ToastKind _toastKind     = _ToastKind.analyzing;
   String     _dangerMessage = '';
+  String     _dynamicFeedback = '';
   final FlutterTts _tts = FlutterTts();
   CameraController? _cameraController;
   bool _cameraReady      = false;
@@ -79,14 +83,33 @@ class _ARGuideScreenState extends State<ARGuideScreen>
     try {
       final cameras = await availableCameras();
       if (cameras.isEmpty) return;
+      // medium = 1280×720. "low" (352×288) gave Gemini Vision too few pixels to
+      // distinguish machine parts, causing false "blurry/unclear" rejections.
       _cameraController = CameraController(
-        cameras.first, ResolutionPreset.low,
+        cameras.first, ResolutionPreset.veryHigh,
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.jpeg,
       );
       await _cameraController!.initialize();
+
+      // Auto-focus + auto-exposure: both dramatically improve part recognition.
+      // setFocusMode keeps the lens continuously hunting for sharpness so a
+      // stationary phone still locks onto a part at any depth.
+      // setExposureMode prevents the frame from being over- or under-exposed in
+      // low-light engine bays, which is the most common false-blur trigger.
+      // Wrapped in try/catch because a handful of older devices throw
+      // CameraException("focusModeNotSupported") — we still want the camera.
+      try {
+        await _cameraController!.setFocusMode(FocusMode.auto);
+        await _cameraController!.setExposureMode(ExposureMode.auto);
+      } catch (modeErr) {
+        debugPrint('ARGuide: focus/exposure mode not supported — $modeErr');
+      }
+
       if (mounted) setState(() => _cameraReady = true);
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('ARGuide: camera init failed — $e');
+    }
   }
 
   Future<void> _pauseCamera()  async {
@@ -130,10 +153,35 @@ class _ARGuideScreenState extends State<ARGuideScreen>
         vsync: this, duration: const Duration(seconds: 1))
       ..repeat();
     _initCamera();
-    _initTts();
+    // TTS language is applied in didChangeDependencies() once the tree is ready
   }
-  Future<void> _initTts() async {
-    await _tts.setLanguage('en-US');
+
+  // Called on first frame AND whenever an InheritedWidget this widget depends
+  // on changes (e.g. LanguageProvider.setLocale). Both cases need a fresh TTS
+  // language — we always stop() first because flutter_tts caches the previous
+  // voice engine internally and setLanguage() alone is not enough to flush it.
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final langCode = context.read<LanguageProvider>().languageCode;
+    _initTts(langCode);
+  }
+
+  /// Maps app locale → BCP-47 TTS tag.
+  static String _ttsLangFor(String code) {
+    switch (code) {
+      case 'hi': return 'hi-IN';
+      case 'pa': return 'pa-IN';
+      default:   return 'en-US';
+    }
+  }
+
+  Future<void> _initTts(String langCode) async {
+    // stop() before setLanguage() is required: flutter_tts keeps the previous
+    // voice engine loaded; calling setLanguage() while it is cached does nothing
+    // on several Android OEM builds.  stop() forces a full engine reset.
+    await _tts.stop();
+    await _tts.setLanguage(_ttsLangFor(langCode));
     await _tts.setSpeechRate(0.48);
     _tts.setCompletionHandler(() {
       if (mounted) setState(() => _voiceActive = false);
@@ -238,7 +286,8 @@ class _ARGuideScreenState extends State<ARGuideScreen>
     final stepText = step?.textEn.isNotEmpty == true
         ? step!.textEn : step?.text ?? '';
     final machine  = prov.solution?.machineType ?? 'tractor';
-    final problem  = prov.solution?.problemIdentified ?? '';
+    final isHindi = context.read<LanguageProvider>().languageCode == 'hi';
+    final problem  = prov.solution?.getLocalizedProblem(isHindi) ?? '';
 
     Map<String, dynamic> result;
     try {
@@ -248,6 +297,7 @@ class _ARGuideScreenState extends State<ARGuideScreen>
         machineType:    machine,
         problemContext: problem,
         attemptCount:   _attemptCount,
+        previousSteps:  jsonEncode(_attemptResults),  // send visual memory to server
       );
     } on Exception {
       await _showToast(_ToastKind.error);
@@ -285,6 +335,26 @@ class _ARGuideScreenState extends State<ARGuideScreen>
       _transitionTo(_ARState.verified);
       HapticFeedback.heavyImpact();
     } else {
+      // Append this failed attempt to history so next call has full context
+      _attemptResults.add({
+        'attempt_count': result['attempt_count'] ?? _attemptCount,
+        'status':        result['status']        ?? 'unclear',
+        'detected_part': result['detected_part'] ?? '',
+        'feedback':      result['feedback']      ?? '',
+      });
+
+      if (mounted) {
+        final isHindi = context.read<LanguageProvider>().languageCode == 'hi';
+        setState(() {
+          final rawFeedback = isHindi
+              ? (result['feedback_hi'] ?? result['feedback'])
+              : result['feedback'];
+          _dynamicFeedback = rawFeedback ??
+                             result['ai_observation'] ??
+                             'Image unclear or wrong part captured — see hint below for guidance.';
+        });
+      }
+
       await _showToast(_ToastKind.resultWarn);
       await _resumeCamera();
       _transitionTo(_ARState.unclear);
@@ -297,10 +367,12 @@ class _ARGuideScreenState extends State<ARGuideScreen>
     _resumeCamera();
     setState(() {
       _currentStep++;
-      _arState       = _ARState.scanning;
-      _attemptCount  = 0;
-      _panelExpanded = false;
+      _arState        = _ARState.scanning;
+      _attemptCount   = 0;
+      _panelExpanded  = false;
+      _dynamicFeedback = '';
     });
+    _attemptResults.clear();  // reset visual memory for the new step
     _verifiedCtrl.reset();
   }
 
@@ -315,6 +387,7 @@ class _ARGuideScreenState extends State<ARGuideScreen>
     final screenH  = MediaQuery.of(context).size.height;
     final screenW  = MediaQuery.of(context).size.width;
     final safePad  = MediaQuery.of(context).padding;
+    final isHindi  = context.watch<LanguageProvider>().languageCode == 'hi';
 
     // Compute the scan-box rect so the blur cut-out aligns with the painted box.
     final viewportH    = screenH - _kPanelHeight - safePad.top;
@@ -336,7 +409,7 @@ class _ARGuideScreenState extends State<ARGuideScreen>
 
             // 1. Full-screen camera / stub / perm-denied
             if (_cameraPermDenied)
-              const _CameraPermDeniedFallback()
+              _CameraPermDeniedFallback(isHindi: isHindi)
             else if (_cameraReady && _cameraController != null)
               Positioned.fill(child: CameraPreview(_cameraController!))
             else
@@ -367,23 +440,22 @@ class _ARGuideScreenState extends State<ARGuideScreen>
                 opacity: _panelExpanded ? 0.0 : 1.0,
                 child: _CentreArea(
                   arState:      _arState,
-                  verifiedFade: _verifiedFade, // Removed cornerPulse here!
+                  verifiedFade: _verifiedFade,
                   onCapture:    _onCapture,
                   boxRect:      boxRect,
+                  isHindi:      isHindi,
                 ),
               ),
             ),
 
-            // 6. Top bar — ✕ left, 🔊 right, vertically centred with scan box.
-            // boxTop + _kBoxSize/2 = vertical centre of the scan window.
-            // We offset by half the button height (44/2 = 22) so the button
-            // midpoint sits exactly on the scan-box centre line.
+            // 6. Top bar
             Positioned(
               top: safePad.top + 16, 
               left: 20,
               right: 20,
               child: _TopBar(
                 voiceActive: _voiceActive,
+                isHindi: isHindi,
                 onClose: () => Navigator.of(context).pop(),
                 onVoice: () async {
                   HapticFeedback.lightImpact();
@@ -392,10 +464,10 @@ class _ARGuideScreenState extends State<ARGuideScreen>
                     await _tts.stop();
                   } else {
                     setState(() => _voiceActive = true);
-                    final stepText = step?.textEn.isNotEmpty == true 
-                        ? step!.textEn 
-                        : step?.text ?? 'Locate the component';
-                    await _tts.stop(); // clear any queues
+                    final stepText = step != null
+                        ? step.getLocalizedText(isHindi)
+                        : (isHindi ? 'घटक ढूंढें' : 'Locate the component');
+                    await _tts.stop();
                     await _tts.speak(stepText);
                   }
                 },
@@ -409,6 +481,8 @@ class _ARGuideScreenState extends State<ARGuideScreen>
               kind:        _toastKind,
               spinnerCtrl: _spinnerCtrl,
               topOffset:   safePad.top + 66,
+              dynamicFeedback: _dynamicFeedback,
+              isHindi:     isHindi,
             ),
 
             // 8. Next Part button (verified only)
@@ -418,7 +492,10 @@ class _ARGuideScreenState extends State<ARGuideScreen>
                 left: 24, right: 24,
                 child: FadeTransition(
                   opacity: _verifiedFade,
-                  child: _NextPartButton(onTap: () => _nextPart(steps)),
+                  child: _NextPartButton(
+                    onTap: () => _nextPart(steps),
+                    isHindi: isHindi,
+                  ),
                 ),
               ),
 
@@ -426,14 +503,16 @@ class _ARGuideScreenState extends State<ARGuideScreen>
             Positioned(
               left: 0, right: 0, bottom: 0,
               child: _BottomPanel(
-                step:      step,
-                nextStep:  nextStep,
-                stepIndex: _currentStep,
-                total:     total,
-                arState:   _arState,
-                expanded:  _panelExpanded,
-                screenH:   screenH,
-                onToggle:  () => setState(
+                step:        step,
+                nextStep:    nextStep,
+                stepIndex:   _currentStep,
+                total:       total,
+                arState:     _arState,
+                expanded:    _panelExpanded,
+                screenH:     screenH,
+                feedbackMsg: _dynamicFeedback,
+                isHindi:     isHindi,
+                onToggle:    () => setState(
                     () => _panelExpanded = !_panelExpanded),
               ),
             ),
@@ -443,6 +522,7 @@ class _ARGuideScreenState extends State<ARGuideScreen>
               Positioned.fill(
                 child: _DangerPanel(
                   message: _dangerMessage,
+                  isHindi: isHindi,
                   onDismiss: () async {
                     await _resumeCamera();
                     _transitionTo(_ARState.scanning);
@@ -517,7 +597,8 @@ class _CameraPreviewStub extends StatelessWidget {
 }
 
 class _CameraPermDeniedFallback extends StatelessWidget {
-  const _CameraPermDeniedFallback();
+  final bool isHindi;
+  const _CameraPermDeniedFallback({required this.isHindi});
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -531,13 +612,15 @@ class _CameraPermDeniedFallback extends StatelessWidget {
               const Icon(Icons.no_photography_rounded,
                   color: _C.textMuted, size: 56),
               const SizedBox(height: 20),
-              Text('Camera Access Required',
+              Text(isHindi ? 'कैमरा एक्सेस आवश्यक है' : 'Camera Access Required',
                 textAlign: TextAlign.center,
                 style: GoogleFonts.inter(fontSize: 20,
                     fontWeight: FontWeight.w700, color: _C.textPrimary)),
               const SizedBox(height: 10),
               Text(
-                'Please allow camera access in your device settings to use the AR guide.',
+                isHindi
+                    ? 'AR गाइड उपयोग करने के लिए डिवाइस सेटिंग में कैमरा एक्सेस दें।'
+                    : 'Please allow camera access in your device settings to use the AR guide.',
                 textAlign: TextAlign.center,
                 style: GoogleFonts.inter(
                     fontSize: 14, color: _C.textMuted, height: 1.55)),
@@ -550,7 +633,7 @@ class _CameraPermDeniedFallback extends StatelessWidget {
                   decoration: BoxDecoration(
                     color: _C.primary,
                     borderRadius: BorderRadius.circular(16)),
-                  child: Text('Open Settings',
+                  child: Text(isHindi ? 'सेटिंग खोलें' : 'Open Settings',
                     style: GoogleFonts.inter(fontSize: 15,
                         fontWeight: FontWeight.w600, color: Colors.black87)),
                 ),
@@ -604,10 +687,12 @@ class _GradientOverlay extends StatelessWidget {
 // ─────────────────────────────────────────────────────────────────────────
 class _TopBar extends StatelessWidget {
   final bool         voiceActive;
+  final bool         isHindi;
   final VoidCallback onClose;
   final VoidCallback onVoice;
   const _TopBar({
     required this.voiceActive,
+    required this.isHindi,
     required this.onClose,
     required this.onVoice,
   });
@@ -635,7 +720,7 @@ class _TopBar extends StatelessWidget {
         
         // Centered Speaking Pill
         if (voiceActive) 
-          const _SpeakingPill(),
+          _SpeakingPill(isHindi: isHindi),
       ],
     );
   }
@@ -683,9 +768,11 @@ class _CircleBtn extends StatelessWidget {
 }
 
 class _SpeakingPill extends StatelessWidget {
-  const _SpeakingPill();
+  final bool isHindi;
+  const _SpeakingPill({required this.isHindi});
   @override
   Widget build(BuildContext context) {
+    final label = isHindi ? 'बोल रहा है...' : 'Speaking...';
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
@@ -697,7 +784,7 @@ class _SpeakingPill extends StatelessWidget {
         children: [
           const Icon(Icons.graphic_eq_rounded, color: _C.primary, size: 16),
           const SizedBox(width: 6),
-          Text('Speaking...',
+          Text(label,
             style: GoogleFonts.inter(
               fontSize: 12, fontWeight: FontWeight.w500,
               color: _C.textSoft)),
@@ -716,6 +803,8 @@ class _ToastPositioned extends StatelessWidget {
   final _ToastKind          kind;
   final AnimationController spinnerCtrl;
   final double              topOffset;
+  final String              dynamicFeedback;
+  final bool                isHindi;
 
   const _ToastPositioned({
     required this.slideAnim,
@@ -723,6 +812,8 @@ class _ToastPositioned extends StatelessWidget {
     required this.kind,
     required this.spinnerCtrl,
     required this.topOffset,
+    this.dynamicFeedback = '',
+    this.isHindi = false,
   });
 
   @override
@@ -736,7 +827,7 @@ class _ToastPositioned extends StatelessWidget {
           child: Transform.translate(
               offset: Offset(0, slideAnim.value), child: child),
         ),
-        child: _ToastCard(kind: kind, spinnerCtrl: spinnerCtrl),
+        child: _ToastCard(kind: kind, spinnerCtrl: spinnerCtrl, dynamicFeedback: dynamicFeedback, isHindi: isHindi),
       ),
     );
   }
@@ -745,7 +836,9 @@ class _ToastPositioned extends StatelessWidget {
 class _ToastCard extends StatelessWidget {
   final _ToastKind          kind;
   final AnimationController spinnerCtrl;
-  const _ToastCard({required this.kind, required this.spinnerCtrl});
+  final String              dynamicFeedback;
+  final bool                isHindi;
+  const _ToastCard({required this.kind, required this.spinnerCtrl, this.dynamicFeedback = '', this.isHindi = false});
 
   @override
   Widget build(BuildContext context) {
@@ -768,37 +861,51 @@ class _ToastCard extends StatelessWidget {
             ),
           ),
         );
-        message = 'Sending image to AI for analysis…';
+        message = isHindi
+            ? 'AI को विश्लेषण के लिए छवि भेज रहा है…'
+            : 'Sending image to AI for analysis…';
         break;
       case _ToastKind.sent:
         accent      = _C.primary;
         leadingIcon = const Icon(Icons.check_circle_rounded,
             color: _C.primary, size: 22);
-        message = 'Image sent successfully — awaiting AI response…';
+        message = isHindi
+            ? 'छवि भेजी गई — AI प्रतिक्रिया की प्रतीक्षा है…'
+            : 'Image sent successfully — awaiting AI response…';
         break;
       case _ToastKind.analyzed:
         accent      = _C.primary;
         leadingIcon = const Icon(Icons.check_circle_rounded,
             color: _C.primary, size: 22);
-        message = 'Image analyzed successfully by AI';
+        message = isHindi
+            ? 'AI ने छवि का सफलतापूर्वक विश्लेषण किया'
+            : 'Image analyzed successfully by AI';
         break;
       case _ToastKind.resultOk:
         accent      = _C.primary;
         leadingIcon = const Icon(Icons.verified_rounded,
             color: _C.primary, size: 22);
-        message = 'Correct part identified — no damage detected ✓';
+        message = isHindi
+            ? 'सही भाग पहचाना गया — कोई खराबी नहीं ✓'
+            : 'Correct part identified — no damage detected ✓';
         break;
       case _ToastKind.resultWarn:
         accent      = _C.warning;
         leadingIcon = const Icon(Icons.warning_amber_rounded,
             color: _C.warning, size: 22);
-        message = 'Image unclear or wrong part captured — see hint below for guidance';
+        message = dynamicFeedback.isNotEmpty
+            ? dynamicFeedback
+            : (isHindi
+                ? 'छवि अस्पष्ट है — नीचे संकेत देखें'
+                : 'Image unclear or wrong part captured — see hint below for guidance');
         break;
       case _ToastKind.error:
         accent      = _C.danger;
         leadingIcon = const Icon(Icons.error_outline_rounded,
             color: _C.danger, size: 22);
-        message = 'Connection error — please check your internet and try again';
+        message = isHindi
+            ? 'कनेक्शन त्रुटि — इंटरनेट जांचें और दोबारा प्रयास करें'
+            : 'Connection error — please check your internet and try again';
         break;
     }
 
@@ -864,16 +971,20 @@ class _CentreArea extends StatelessWidget {
   final Animation<double> verifiedFade;
   final VoidCallback      onCapture;
   final Rect              boxRect;
+  final bool              isHindi;
 
   const _CentreArea({
     required this.arState,
     required this.verifiedFade,
     required this.onCapture,
-    required this.boxRect, 
+    required this.boxRect,
+    required this.isHindi,
   });
 
   @override
   Widget build(BuildContext context) {
+    final lblTarget  = isHindi ? 'लक्ष्य'      : 'TARGET';
+    final lblAnalyze = isHindi ? 'भाग विश्लेषण करें' : 'Analyze Part';
     return Stack(
       children: [
         // 1. Verified Badge (Floats just above the box)
@@ -883,7 +994,7 @@ class _CentreArea extends StatelessWidget {
             left: 0, right: 0,
             child: FadeTransition(
               opacity: verifiedFade,
-              child: const Center(child: _ComponentVerifiedBadge()),
+              child: Center(child: _ComponentVerifiedBadge(isHindi: isHindi)),
             ),
           ),
 
@@ -898,7 +1009,7 @@ class _CentreArea extends StatelessWidget {
                 )
               : _SolidScanBox(
                   color: arState == _ARState.unclear ? _C.warning : Colors.white,
-                  label: arState == _ARState.scanning ? 'TARGET' : null,
+                  label: arState == _ARState.scanning ? lblTarget : null,
                 ),
         ),
 
@@ -921,7 +1032,7 @@ class _CentreArea extends StatelessWidget {
                     color: arState == _ARState.scanning
                         ? _C.textSoft.withOpacity(0.85)
                         : _C.textMuted.withOpacity(0.35)),
-                  child: const Text('Analyze Part'),
+                  child: Text(lblAnalyze),
                 ),
               ],
             ),
@@ -998,9 +1109,11 @@ class _SolidBoxPainter extends CustomPainter {
 }
 
 class _ComponentVerifiedBadge extends StatelessWidget {
-  const _ComponentVerifiedBadge();
+  final bool isHindi;
+  const _ComponentVerifiedBadge({required this.isHindi});
   @override
   Widget build(BuildContext context) {
+    final label = isHindi ? 'घटक सत्यापित' : 'COMPONENT VERIFIED';
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
       decoration: BoxDecoration(
@@ -1012,7 +1125,7 @@ class _ComponentVerifiedBadge extends StatelessWidget {
         children: [
           const Icon(Icons.verified_rounded, color: _C.primary, size: 18),
           const SizedBox(width: 8),
-          Text('COMPONENT VERIFIED',
+          Text(label,
             style: GoogleFonts.inter(
               fontSize: 12, fontWeight: FontWeight.w700,
               letterSpacing: 1.0, color: _C.primary)),
@@ -1079,7 +1192,8 @@ class _CaptureButtonState extends State<_CaptureButton> {
 // ─────────────────────────────────────────────────────────────────────────
 class _NextPartButton extends StatefulWidget {
   final VoidCallback onTap;
-  const _NextPartButton({required this.onTap});
+  final bool isHindi;
+  const _NextPartButton({required this.onTap, required this.isHindi});
   @override
   State<_NextPartButton> createState() => _NextPartButtonState();
 }
@@ -1088,6 +1202,7 @@ class _NextPartButtonState extends State<_NextPartButton> {
   bool _pressed = false;
   @override
   Widget build(BuildContext context) {
+    final label = widget.isHindi ? 'अगला भाग' : 'Next Part';
     return GestureDetector(
       onTapDown:   (_) => setState(() => _pressed = true),
       onTapUp:     (_) { setState(() => _pressed = false); widget.onTap(); },
@@ -1110,7 +1225,7 @@ class _NextPartButtonState extends State<_NextPartButton> {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Text('Next Part',
+              Text(label,
                 style: GoogleFonts.inter(
                   fontSize: 17, fontWeight: FontWeight.w600,
                   color: Colors.black87)),
@@ -1136,13 +1251,18 @@ class _BottomPanel extends StatelessWidget {
   final _ARState     arState;
   final bool         expanded;
   final double       screenH;
+  final String       feedbackMsg;
   final VoidCallback onToggle;
 
+  final bool         isHindi;
+
   const _BottomPanel({
-    required this.step,      required this.nextStep,
-    required this.stepIndex, required this.total,
-    required this.arState,   required this.expanded,
-    required this.screenH,   required this.onToggle,
+    required this.step,        required this.nextStep,
+    required this.stepIndex,   required this.total,
+    required this.arState,     required this.expanded,
+    required this.screenH,     required this.onToggle,
+    this.feedbackMsg = '',
+    this.isHindi = false,
   });
 
   @override
@@ -1201,7 +1321,7 @@ class _BottomPanel extends StatelessWidget {
                     ),
                   )
                 else ...[
-                  Text('STEP ${stepIndex + 1}: COMPLETE',
+                  Text(isHindi ? 'चरण ${stepIndex + 1}: पूर्ण' : 'STEP ${stepIndex + 1}: COMPLETE',
                     style: GoogleFonts.inter(
                       fontSize: 12, fontWeight: FontWeight.w700,
                       letterSpacing: 0.8, color: _C.primary)),
@@ -1224,7 +1344,7 @@ class _BottomPanel extends StatelessWidget {
                     borderRadius: BorderRadius.circular(20),
                     border: Border.all(
                         color: _C.primary.withOpacity(0.30), width: 1)),
-                  child: Text('Component Verified — No Damage Detected',
+                  child: Text(isHindi ? 'घटक सत्यापित — कोई क्षति नहीं' : 'Component Verified — No Damage Detected',
                     style: GoogleFonts.inter(
                       fontSize: 12, fontWeight: FontWeight.w600,
                       color: _C.primary)),
@@ -1257,7 +1377,11 @@ class _BottomPanel extends StatelessWidget {
                             color: _C.warning, size: 16)),
                       const SizedBox(width: 8),
                       Expanded(child: Text(
-                        'Hold your phone steady and ensure the part fills the frame, then tap Analyze again.',
+                        feedbackMsg.isNotEmpty
+                            ? feedbackMsg
+                            : (isHindi
+                                ? 'फोन स्थिर रखें और भाग फ्रेम में आए, फिर विश्लेषण करें।'
+                                : 'Hold your phone steady and ensure the part fills the frame, then tap Analyze again.'),
                         style: GoogleFonts.inter(
                           fontSize: 13, fontWeight: FontWeight.w500,
                           color: _C.warning, height: 1.45))),
@@ -1269,7 +1393,8 @@ class _BottomPanel extends StatelessWidget {
               if (expanded && step != null) ...[
                 const SizedBox(height: 12),
                 Text(
-                  step!.textEn.isNotEmpty ? step!.textEn : step!.text,
+                  step!.getLocalizedText(
+                    context.watch<LanguageProvider>().languageCode == 'hi'),
                   style: GoogleFonts.inter(
                     fontSize: 14, color: _C.textMuted, height: 1.55)),
                 if (step!.safetyWarning != null) ...[
@@ -1317,11 +1442,14 @@ class _BottomPanel extends StatelessWidget {
 // ─────────────────────────────────────────────────────────────────────────
 class _DangerPanel extends StatelessWidget {
   final String       message;
+  final bool         isHindi;
   final VoidCallback onDismiss;
-  const _DangerPanel({required this.message, required this.onDismiss});
+  const _DangerPanel({required this.message, required this.isHindi, required this.onDismiss});
 
   @override
   Widget build(BuildContext context) {
+    final lblDanger  = isHindi ? '⚠ खतरा पता चला' : '⚠ DANGER DETECTED';
+    final lblDismiss = isHindi ? 'समझ गया — सावधानी से जारी रखें' : 'I understand — Resume safely';
     return Container(
       color: const Color(0xF2180000),
       child: SafeArea(
@@ -1333,7 +1461,7 @@ class _DangerPanel extends StatelessWidget {
               const Icon(Icons.dangerous_rounded,
                   color: Color(0xFFFF4B4B), size: 80),
               const SizedBox(height: 24),
-              Text('⚠ DANGER DETECTED',
+              Text(lblDanger,
                 style: GoogleFonts.inter(
                   fontSize: 26, fontWeight: FontWeight.w800,
                   color: const Color(0xFFFF4B4B), letterSpacing: 1.2)),
@@ -1363,7 +1491,7 @@ class _DangerPanel extends StatelessWidget {
                     borderRadius: BorderRadius.circular(16),
                     border: Border.all(
                         color: Colors.white.withOpacity(0.15))),
-                  child: Text('I understand — Resume safely',
+                  child: Text(lblDismiss,
                     textAlign: TextAlign.center,
                     style: GoogleFonts.inter(
                       fontSize: 15, fontWeight: FontWeight.w600,
@@ -1421,16 +1549,17 @@ class _InstructionHeading extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final isHindi = context.watch<LanguageProvider>().languageCode == 'hi';
     if (step == null) {
-      return Text('Locate the component',
+      return Text(isHindi ? 'घटक ढूंढें' : 'Locate the component',
         maxLines: 4,
         overflow: TextOverflow.ellipsis,
         style: GoogleFonts.inter(
-          fontSize: 19, fontWeight: FontWeight.w700, // Adjusted font size
+          fontSize: 19, fontWeight: FontWeight.w700,
           color: _C.textPrimary, height: 1.3));
     }
     
-    final full    = verified ? _nextInstruction() : _currentInstruction();
+    final full    = verified ? _nextInstruction(isHindi) : _currentInstruction(isHindi);
     final keyword = verified ? _nextKeyword() : _currentKeyword();
 
     if (keyword.isEmpty || !full.contains(keyword)) {
@@ -1465,19 +1594,21 @@ class _InstructionHeading extends StatelessWidget {
   }
 
   // Removed the hard 80-character substring cutoff. Flutter handles it now!
-  String _currentInstruction() {
-    return step!.textEn.isNotEmpty ? step!.textEn : step!.text;
+  String _currentInstruction(bool isHindi) {
+    return step!.getLocalizedText(isHindi);
   }
 
-  String _nextInstruction() {
-    if (nextStep == null) return 'All steps complete!';
+  String _nextInstruction(bool isHindi) {
+    if (nextStep == null) return isHindi ? 'सभी चरण पूर्ण!' : 'All steps complete!';
     final vc   = nextStep!.visualCue ?? '';
-    final body = nextStep!.textEn.isNotEmpty
-        ? nextStep!.textEn : nextStep!.text;
+    final body = nextStep!.getLocalizedText(isHindi);
     if (vc.isNotEmpty) {
-      return 'Excellent. Now locate the ${vc.replaceAll('_', ' ')}.';
+      final partName = vc.replaceAll('_', ' ');
+      return isHindi
+          ? 'शानदार। अब $partName ढूंढें।'
+          : 'Excellent. Now locate the $partName.';
     }
-    return 'Excellent. $body';
+    return isHindi ? 'शानदार। $body' : 'Excellent. $body';
   }
 
   String _currentKeyword() => (step!.visualCue ?? '').replaceAll('_', ' ');
@@ -1507,6 +1638,8 @@ class _ProgressBar extends StatelessWidget {
 // Demo steps fallback
 // ─────────────────────────────────────────────────────────────────────────
 final _demoSteps = List.generate(12, (i) => StepData(
+  stepTitleEn: 'Step ${i + 1}',   // <-- ADDED
+  stepTitleHi: 'चरण ${i + 1}',      // <-- ADDED
   text:      'Inspect component ${i + 1} carefully before proceeding.',
   textEn:    'Inspect component ${i + 1} carefully before proceeding.',
   textHi:    '',

@@ -1601,151 +1601,151 @@ class _SheetTile extends StatelessWidget {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// _ProgressPanel + internals (unchanged from previous version)
-// ─────────────────────────────────────────────────────────────────────────────
-class _ProgressPanel extends StatelessWidget {
-  final AppLocalizations l10n; final int currentStep; final double progressValue;
-  final UploadState uploadState; final String errorTitle; final String errorSubtitle;
-  final VoidCallback onRetry;
+// // _ProgressPanel + internals (unchanged from previous version)
+// // ─────────────────────────────────────────────────────────────────────────────
+// class _ProgressPanel extends StatelessWidget {
+//   final AppLocalizations l10n; final int currentStep; final double progressValue;
+//   final UploadState uploadState; final String errorTitle; final String errorSubtitle;
+//   final VoidCallback onRetry;
 
-  const _ProgressPanel({required this.l10n, required this.currentStep,
-      required this.progressValue, required this.uploadState,
-      required this.errorTitle, required this.errorSubtitle, required this.onRetry});
+//   const _ProgressPanel({required this.l10n, required this.currentStep,
+//       required this.progressValue, required this.uploadState,
+//       required this.errorTitle, required this.errorSubtitle, required this.onRetry});
 
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      height: MediaQuery.of(context).size.height * 0.62,
-      decoration: const BoxDecoration(
-        color: AppColors.cardWhite,
-        borderRadius: BorderRadius.only(
-          topLeft: Radius.circular(28), topRight: Radius.circular(28))),
-      padding: const EdgeInsets.fromLTRB(24, 0, 24, 32),
-      child: uploadState == UploadState.error
-          ? _ErrorContent(l10n: l10n, title: errorTitle,
-              subtitle: errorSubtitle, onRetry: onRetry)
-          : _ChecklistContent(l10n: l10n, currentStep: currentStep,
-              progressValue: progressValue),
-    );
-  }
-}
+//   @override
+//   Widget build(BuildContext context) {
+//     return Container(
+//       height: MediaQuery.of(context).size.height * 0.62,
+//       decoration: const BoxDecoration(
+//         color: AppColors.cardWhite,
+//         borderRadius: BorderRadius.only(
+//           topLeft: Radius.circular(28), topRight: Radius.circular(28))),
+//       padding: const EdgeInsets.fromLTRB(24, 0, 24, 32),
+//       child: uploadState == UploadState.error
+//           ? _ErrorContent(l10n: l10n, title: errorTitle,
+//               subtitle: errorSubtitle, onRetry: onRetry)
+//           : _ChecklistContent(l10n: l10n, currentStep: currentStep,
+//               progressValue: progressValue),
+//     );
+//   }
+// }
 
-class _ChecklistContent extends StatelessWidget {
-  final AppLocalizations l10n; final int currentStep; final double progressValue;
-  const _ChecklistContent({required this.l10n, required this.currentStep,
-      required this.progressValue});
+// class _ChecklistContent extends StatelessWidget {
+//   final AppLocalizations l10n; final int currentStep; final double progressValue;
+//   const _ChecklistContent({required this.l10n, required this.currentStep,
+//       required this.progressValue});
 
-  @override
-  Widget build(BuildContext context) {
-    final steps = [l10n.uploadStep1, l10n.uploadStep2, l10n.uploadStep3,
-        l10n.uploadStep4, l10n.uploadStep5];
-    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      const SizedBox(height: 12),
-      Center(child: Container(width: 36, height: 4,
-          decoration: BoxDecoration(color: AppColors.divider,
-              borderRadius: BorderRadius.circular(2)))),
-      const SizedBox(height: 24),
-      Text(l10n.uploadAnalyzing, style: AppTextStyles.progressTitle),
-      const SizedBox(height: 20),
-      Expanded(child: ListView.builder(
-        physics: const NeverScrollableScrollPhysics(),
-        itemCount: steps.length,
-        itemBuilder: (_, i) => _StepRow(
-          label: steps[i],
-          state: i < currentStep ? _StepState.done
-              : i == currentStep ? _StepState.active : _StepState.pending,
-        ),
-      )),
-      const SizedBox(height: 16),
-      ClipRRect(
-        borderRadius: BorderRadius.circular(3),
-        child: TweenAnimationBuilder<double>(
-          tween: Tween(begin: 0.0, end: progressValue),
-          duration: const Duration(milliseconds: 400),
-          curve: Curves.easeOut,
-          builder: (_, val, __) => LinearProgressIndicator(
-            value: val, minHeight: 6,
-            backgroundColor: const Color(0xFFEAEAEA),
-            valueColor: const AlwaysStoppedAnimation(AppColors.uploadGreen),
-          ),
-        ),
-      ),
-    ]);
-  }
-}
+//   @override
+//   Widget build(BuildContext context) {
+//     final steps = [l10n.uploadStep1, l10n.uploadStep2, l10n.uploadStep3,
+//         l10n.uploadStep4, l10n.uploadStep5];
+//     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+//       const SizedBox(height: 12),
+//       Center(child: Container(width: 36, height: 4,
+//           decoration: BoxDecoration(color: AppColors.divider,
+//               borderRadius: BorderRadius.circular(2)))),
+//       const SizedBox(height: 24),
+//       Text(l10n.uploadAnalyzing, style: AppTextStyles.progressTitle),
+//       const SizedBox(height: 20),
+//       Expanded(child: ListView.builder(
+//         physics: const NeverScrollableScrollPhysics(),
+//         itemCount: steps.length,
+//         itemBuilder: (_, i) => _StepRow(
+//           label: steps[i],
+//           state: i < currentStep ? _StepState.done
+//               : i == currentStep ? _StepState.active : _StepState.pending,
+//         ),
+//       )),
+//       const SizedBox(height: 16),
+//       ClipRRect(
+//         borderRadius: BorderRadius.circular(3),
+//         child: TweenAnimationBuilder<double>(
+//           tween: Tween(begin: 0.0, end: progressValue),
+//           duration: const Duration(milliseconds: 400),
+//           curve: Curves.easeOut,
+//           builder: (_, val, __) => LinearProgressIndicator(
+//             value: val, minHeight: 6,
+//             backgroundColor: const Color(0xFFEAEAEA),
+//             valueColor: const AlwaysStoppedAnimation(AppColors.uploadGreen),
+//           ),
+//         ),
+//       ),
+//     ]);
+//   }
+// }
 
-enum _StepState { pending, active, done }
+// enum _StepState { pending, active, done }
 
-class _StepRow extends StatelessWidget {
-  final String label; final _StepState state;
-  const _StepRow({required this.label, required this.state});
+// class _StepRow extends StatelessWidget {
+//   final String label; final _StepState state;
+//   const _StepRow({required this.label, required this.state});
 
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(height: 60, child: Row(children: [
-      AnimatedSwitcher(
-          duration: const Duration(milliseconds: 200), child: _icon()),
-      const SizedBox(width: 16),
-      Expanded(child: Text(label, style: AppTextStyles.progressStep.copyWith(
-        color: state == _StepState.pending
-            ? AppColors.textHint : AppColors.textPrimary,
-      ))),
-    ]));
-  }
+//   @override
+//   Widget build(BuildContext context) {
+//     return SizedBox(height: 60, child: Row(children: [
+//       AnimatedSwitcher(
+//           duration: const Duration(milliseconds: 200), child: _icon()),
+//       const SizedBox(width: 16),
+//       Expanded(child: Text(label, style: AppTextStyles.progressStep.copyWith(
+//         color: state == _StepState.pending
+//             ? AppColors.textHint : AppColors.textPrimary,
+//       ))),
+//     ]));
+//   }
 
-  Widget _icon() {
-    switch (state) {
-      case _StepState.pending:
-        return Container(key: const ValueKey('p'), width: 32, height: 32,
-            decoration: BoxDecoration(shape: BoxShape.circle,
-                border: Border.all(color: AppColors.divider, width: 2)));
-      case _StepState.active:
-        return const SizedBox(key: ValueKey('a'), width: 32, height: 32,
-            child: CircularProgressIndicator(strokeWidth: 2.5,
-                valueColor: AlwaysStoppedAnimation(AppColors.uploadGreen)));
-      case _StepState.done:
-        return Container(key: const ValueKey('d'), width: 32, height: 32,
-            decoration: const BoxDecoration(
-                color: AppColors.uploadGreen, shape: BoxShape.circle),
-            child: const Icon(Icons.check_rounded, color: Colors.white, size: 18))
-        .animate()
-        .scale(begin: const Offset(0.5, 0.5), duration: 200.ms,
-            curve: Curves.easeOutBack)
-        .fadeIn(duration: 150.ms);
-    }
-  }
-}
+//   Widget _icon() {
+//     switch (state) {
+//       case _StepState.pending:
+//         return Container(key: const ValueKey('p'), width: 32, height: 32,
+//             decoration: BoxDecoration(shape: BoxShape.circle,
+//                 border: Border.all(color: AppColors.divider, width: 2)));
+//       case _StepState.active:
+//         return const SizedBox(key: ValueKey('a'), width: 32, height: 32,
+//             child: CircularProgressIndicator(strokeWidth: 2.5,
+//                 valueColor: AlwaysStoppedAnimation(AppColors.uploadGreen)));
+//       case _StepState.done:
+//         return Container(key: const ValueKey('d'), width: 32, height: 32,
+//             decoration: const BoxDecoration(
+//                 color: AppColors.uploadGreen, shape: BoxShape.circle),
+//             child: const Icon(Icons.check_rounded, color: Colors.white, size: 18))
+//         .animate()
+//         .scale(begin: const Offset(0.5, 0.5), duration: 200.ms,
+//             curve: Curves.easeOutBack)
+//         .fadeIn(duration: 150.ms);
+//     }
+//   }
+// }
 
-class _ErrorContent extends StatelessWidget {
-  final AppLocalizations l10n; final String title; final String subtitle;
-  final VoidCallback onRetry;
-  const _ErrorContent({required this.l10n, required this.title,
-      required this.subtitle, required this.onRetry});
+// class _ErrorContent extends StatelessWidget {
+//   final AppLocalizations l10n; final String title; final String subtitle;
+//   final VoidCallback onRetry;
+//   const _ErrorContent({required this.l10n, required this.title,
+//       required this.subtitle, required this.onRetry});
 
-  @override
-  Widget build(BuildContext context) {
-    return Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-      const Icon(Icons.wifi_off_rounded, size: 52, color: Color(0xFFBBBBBB)),
-      const SizedBox(height: 20),
-      Text(title, style: AppTextStyles.progressTitle.copyWith(fontSize: 18),
-          textAlign: TextAlign.center),
-      const SizedBox(height: 8),
-      Text(subtitle, style: AppTextStyles.progressStep.copyWith(
-          color: AppColors.textSecondary), textAlign: TextAlign.center),
-      const SizedBox(height: 32),
-      GestureDetector(
-        onTap: onRetry,
-        child: Container(
-          width: double.infinity, height: AppSpacing.uploadButtonHeight,
-          decoration: BoxDecoration(
-            color: AppColors.uploadGreen,
-            borderRadius: BorderRadius.circular(AppSpacing.uploadButtonRadius),
-            boxShadow: AppShadows.findSolutionButton,
-          ),
-          child: Center(child: Text(l10n.uploadRetry,
-              style: AppTextStyles.buttonPrimary)),
-        ),
-      ),
-    ]);
-  }
-}
+//   @override
+//   Widget build(BuildContext context) {
+//     return Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+//       const Icon(Icons.wifi_off_rounded, size: 52, color: Color(0xFFBBBBBB)),
+//       const SizedBox(height: 20),
+//       Text(title, style: AppTextStyles.progressTitle.copyWith(fontSize: 18),
+//           textAlign: TextAlign.center),
+//       const SizedBox(height: 8),
+//       Text(subtitle, style: AppTextStyles.progressStep.copyWith(
+//           color: AppColors.textSecondary), textAlign: TextAlign.center),
+//       const SizedBox(height: 32),
+//       GestureDetector(
+//         onTap: onRetry,
+//         child: Container(
+//           width: double.infinity, height: AppSpacing.uploadButtonHeight,
+//           decoration: BoxDecoration(
+//             color: AppColors.uploadGreen,
+//             borderRadius: BorderRadius.circular(AppSpacing.uploadButtonRadius),
+//             boxShadow: AppShadows.findSolutionButton,
+//           ),
+//           child: Center(child: Text(l10n.uploadRetry,
+//               style: AppTextStyles.buttonPrimary)),
+//         ),
+//       ),
+//     ]);
+//   }
+// }

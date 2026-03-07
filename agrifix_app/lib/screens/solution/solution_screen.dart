@@ -7,6 +7,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import 'package:go_router/go_router.dart';                  // AR nav
 import '../../core/providers/diagnosis_provider.dart';
+import '../../core/providers/language_provider.dart';
 import '../../core/router.dart';                      // AppRoutes
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -51,25 +52,50 @@ class _SolutionScreenState extends State<SolutionScreen>
     _initTts();
   }
 
+  // ── TTS language helpers ──────────────────────────────────────────────
+
+  /// Maps app locale code → BCP-47 TTS tag supported by flutter_tts.
+  static String _ttsLangFor(String code) {
+    switch (code) {
+      case 'hi': return 'hi-IN';
+      case 'pa': return 'pa-IN';
+      default:   return 'en-US';
+    }
+  }
+
+  /// Registers callbacks and sets initial TTS parameters.
+  /// Language is NOT set here — it is set in _applyTtsLanguage() which is
+  /// called both from initState (via addPostFrameCallback so context is ready)
+  /// and from didChangeDependencies on every locale change.
   Future<void> _initTts() async {
-    await _tts.setLanguage('en-US');
     await _tts.setSpeechRate(0.48);   // slightly slower — easier for farmers
     await _tts.setVolume(1.0);
     await _tts.setPitch(1.0);
 
-    // Keep _isSpeaking in sync with actual TTS state
-    _tts.setStartHandler(() {
-      if (mounted) setState(() => _isSpeaking = true);
-    });
-    _tts.setCompletionHandler(() {
-      if (mounted) setState(() => _isSpeaking = false);
-    });
-    _tts.setCancelHandler(() {
-      if (mounted) setState(() => _isSpeaking = false);
-    });
-    _tts.setErrorHandler((_) {
-      if (mounted) setState(() => _isSpeaking = false);
-    });
+    _tts.setStartHandler(()      { if (mounted) setState(() => _isSpeaking = true);  });
+    _tts.setCompletionHandler(() { if (mounted) setState(() => _isSpeaking = false); });
+    _tts.setCancelHandler(()    { if (mounted) setState(() => _isSpeaking = false); });
+    _tts.setErrorHandler((_)    { if (mounted) setState(() => _isSpeaking = false); });
+  }
+
+  /// Flushes the cached voice engine then applies the new language.
+  ///
+  /// flutter_tts keeps the previous TTS engine loaded in memory. On many
+  /// Android OEM builds (Samsung, Xiaomi, Oppo) calling setLanguage() without
+  /// stop() first is silently ignored — the old language keeps playing.
+  /// stop() forces a full engine reset; setLanguage() then loads the correct
+  /// locale from scratch.
+  Future<void> _applyTtsLanguage(String langCode) async {
+    await _tts.stop();
+    await _tts.setLanguage(_ttsLangFor(langCode));
+  }
+
+  // Called on first frame AND whenever LanguageProvider emits a locale change.
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final langCode = context.read<LanguageProvider>().languageCode;
+    _applyTtsLanguage(langCode);   // async — fire-and-forget is safe here
   }
 
   /// Speak a string, stopping any current speech first.
@@ -115,36 +141,71 @@ class _SolutionScreenState extends State<SolutionScreen>
   List<StepData> _stepsFromProvider(DiagnosisProvider prov) =>
       prov.solution?.steps ?? [];
 
-  String _problemTitleFromProvider(DiagnosisProvider prov) =>
-      prov.problemDescription ??
-      prov.solution?.problemIdentified ??
-      'Machine issue detected';
+  String _problemTitleFromProvider(DiagnosisProvider prov) {
+    final isHindi = context.read<LanguageProvider>().languageCode == 'hi';
+    return prov.problemDescription ??
+        prov.solution!.getLocalizedProblem(isHindi);
+  }
 
-  String _stepBody(StepData step) =>
-      step.textEn.isNotEmpty ? step.textEn : step.text;
+  String _stepBody(StepData step) {
+    // Read locale from the tree — context is available because _stepBody is
+    // only ever called from build() or helpers called from build().
+    final isHindi = context.read<LanguageProvider>().languageCode == 'hi';
+    // getLocalizedText: returns textHi when isHindi && textHi non-empty,
+    // otherwise falls back to textEn, then text — matching StepData contract.
+    return step.getLocalizedText(isHindi);
+  }
 
   String _stepTitle(StepData step) {
-    const partTitles = {
-      'ignition_key':       'Check the ignition key',
-      'battery_terminal':   'Inspect battery terminals',
-      'fuel_cap':           'Check the fuel cap',
-      'fan_belt':           'Examine the fan belt',
-      'clutch_pedal':       'Inspect the clutch pedal',
-      'clutch_cable':       'Check the clutch cable',
-      'gear_lever':         'Check the gear lever',
-      'air_filter':         'Examine the air filter',
-      'spark_plug':         'Check the spark plug',
-      'radiator_cap':       'Inspect the radiator cap',
-      'engine_oil_dipstick':'Check engine oil level',
-      'wiring_harness':     'Inspect the wiring',
-      'hydraulic_pump':     'Check the hydraulic pump',
-      'fuel_filter':        'Locate the main Fuel Filter assembly',
-      'drain_plug':         'Unscrew the top drain plug carefully',
+    final isHindi = context.read<LanguageProvider>().languageCode == 'hi';
+
+    // 1. Prefer the server-supplied localized title (step_title_hi / step_title_en)
+    final serverTitle = step.getLocalizedTitle(isHindi);
+    if (serverTitle.isNotEmpty) return serverTitle;
+
+    // 2. Fall back to a static lookup map — bilingual
+    const partTitlesEn = {
+      'ignition_key':        'Check the ignition key',
+      'battery_terminal':    'Inspect battery terminals',
+      'fuel_cap':            'Check the fuel cap',
+      'fan_belt':            'Examine the fan belt',
+      'clutch_pedal':        'Inspect the clutch pedal',
+      'clutch_cable':        'Check the clutch cable',
+      'gear_lever':          'Check the gear lever',
+      'air_filter':          'Examine the air filter',
+      'spark_plug':          'Check the spark plug',
+      'radiator_cap':        'Inspect the radiator cap',
+      'engine_oil_dipstick': 'Check engine oil level',
+      'wiring_harness':      'Inspect the wiring',
+      'hydraulic_pump':      'Check the hydraulic pump',
+      'fuel_filter':         'Locate the fuel filter',
+      'drain_plug':          'Unscrew the drain plug carefully',
     };
+    const partTitlesHi = {
+      'ignition_key':        'इग्निशन चाबी जांचें',
+      'battery_terminal':    'बैटरी टर्मिनल जांचें',
+      'fuel_cap':            'ईंधन टोपी जांचें',
+      'fan_belt':            'फैन बेल्ट देखें',
+      'clutch_pedal':        'क्लच पेडल जांचें',
+      'clutch_cable':        'क्लच केबल जांचें',
+      'gear_lever':          'गियर लीवर जांचें',
+      'air_filter':          'एयर फ़िल्टर देखें',
+      'spark_plug':          'स्पार्क प्लग जांचें',
+      'radiator_cap':        'रेडिएटर कैप जांचें',
+      'engine_oil_dipstick': 'इंजन ऑयल लेवल जांचें',
+      'wiring_harness':      'वायरिंग जांचें',
+      'hydraulic_pump':      'हाइड्रोलिक पंप जांचें',
+      'fuel_filter':         'ईंधन फ़िल्टर ढूंढें',
+      'drain_plug':          'ड्रेन प्लग खोलें',
+    };
+
     final part = step.visualCue ?? '';
-    if (partTitles.containsKey(part)) return partTitles[part]!;
+    final map  = isHindi ? partTitlesHi : partTitlesEn;
+    if (map.containsKey(part)) return map[part]!;
+
+    // 3. Last resort: truncate the step body
     final body = _stepBody(step);
-    if (body.isEmpty) return 'Perform inspection';
+    if (body.isEmpty) return isHindi ? 'निरीक्षण करें' : 'Perform inspection';
     final cut = body.lastIndexOf(' ', 44);
     return cut > 10 ? '${body.substring(0, cut)}…'
                     : '${body.substring(0, body.length.clamp(0, 44))}…';
@@ -161,7 +222,7 @@ class _SolutionScreenState extends State<SolutionScreen>
     return m[step.visualCue ?? ''] ?? '🔧';
   }
 
-  // ── Navigation ────────────────────────────────────────────────────────
+  // ── i18n helper ───────────────────────────────────────────────────────────
   void _jumpTo(int index, List<StepData> steps) {
     if (index < 0 || index >= steps.length) return;
     HapticFeedback.lightImpact();
@@ -192,6 +253,7 @@ class _SolutionScreenState extends State<SolutionScreen>
     final prov    = context.watch<DiagnosisProvider>();
     final steps   = _stepsFromProvider(prov);
     final problem = _problemTitleFromProvider(prov);
+    final isHindi = context.watch<LanguageProvider>().languageCode == 'hi';
 
     while (_stepKeys.length < steps.length) _stepKeys.add(GlobalKey());
 
@@ -220,6 +282,7 @@ class _SolutionScreenState extends State<SolutionScreen>
 
                   // Header  (voice + share live here)
                   _HeaderRow(
+                    isHindi: isHindi,
                     isSpeaking: _isSpeaking,
                     onBack:  () => Navigator.of(context).pop(),
                     onVoice: () => _toggleVoice(steps),
@@ -234,7 +297,7 @@ class _SolutionScreenState extends State<SolutionScreen>
 
                   const SizedBox(height: 20),
 
-                  _SolutionCard(problem: problem)
+                  _SolutionCard(problem: problem, isHindi: isHindi)
                       .animate()
                       .fadeIn(duration: 380.ms, delay: 80.ms)
                       .slideY(begin: 0.06, end: 0,
@@ -244,7 +307,7 @@ class _SolutionScreenState extends State<SolutionScreen>
                   const SizedBox(height: 20),
 
                   if (steps.isEmpty)
-                    _EmptyState()
+                    _EmptyState(isHindi: isHindi)
                   else
                     ...List.generate(steps.length, (i) {
                       return Padding(
@@ -257,6 +320,7 @@ class _SolutionScreenState extends State<SolutionScreen>
                           body:        _stepBody(steps[i]),
                           isActive:    i == _currentStep,
                           isPast:      i < _currentStep,
+                          isHindi:     isHindi,
                           entranceCtrl: i == _currentStep ? _entranceCtrl : null,
                         ),
                       );
@@ -276,6 +340,7 @@ class _SolutionScreenState extends State<SolutionScreen>
               currentStep: _currentStep,
               totalSteps:  steps.length,
               bottomPad:   bottomPad,
+              isHindi:     isHindi,
               onPrev: () => _jumpTo(_currentStep - 1, steps),
               onNext: () => _jumpTo(_currentStep + 1, steps),
               onAR: () => context.push(AppRoutes.arGuide, extra: _currentStep),
@@ -299,6 +364,7 @@ class _FixedBottomBar extends StatelessWidget {
   final int currentStep;
   final int totalSteps;
   final double bottomPad;
+  final bool isHindi;
   final VoidCallback onPrev;
   final VoidCallback onNext;
   final VoidCallback onAR;
@@ -307,6 +373,7 @@ class _FixedBottomBar extends StatelessWidget {
     required this.currentStep,
     required this.totalSteps,
     required this.bottomPad,
+    required this.isHindi,
     required this.onPrev,
     required this.onNext,
     required this.onAR,
@@ -316,6 +383,8 @@ class _FixedBottomBar extends StatelessWidget {
   Widget build(BuildContext context) {
     final canPrev = currentStep > 0;
     final canNext = currentStep < totalSteps - 1;
+    final lblPrev = isHindi ? 'पिछला' : 'Prev';
+    final lblNext = isHindi ? 'अगला'  : 'Next';
 
     return Container(
       // Frosted white strip
@@ -345,7 +414,7 @@ class _FixedBottomBar extends StatelessWidget {
                       const Icon(Icons.arrow_back_rounded,
                           size: 18, color: Color(0xFF6B7280)),
                       const SizedBox(width: 5),
-                      Text('Prev',
+                      Text(lblPrev,
                         style: GoogleFonts.inter(
                           fontSize: 15, fontWeight: FontWeight.w500,
                           color: const Color(0xFF6B7280))),
@@ -380,7 +449,7 @@ class _FixedBottomBar extends StatelessWidget {
                       borderRadius: BorderRadius.circular(24),
                     ),
                     child: Row(mainAxisSize: MainAxisSize.min, children: [
-                      Text('Next',
+                      Text(lblNext,
                         style: GoogleFonts.inter(
                           fontSize: 15, fontWeight: FontWeight.w600,
                           color: _SC.textDark)),
@@ -396,7 +465,7 @@ class _FixedBottomBar extends StatelessWidget {
           ],
 
           // ── AR button ──────────────────────────────────────────────
-          _ARButton(onTap: onAR),
+          _ARButton(onTap: onAR, isHindi: isHindi),
         ],
       ),
     );
@@ -407,11 +476,13 @@ class _FixedBottomBar extends StatelessWidget {
 // _HeaderRow  —  back · title · voice toggle · share
 // ═══════════════════════════════════════════════════════════════════════════
 class _HeaderRow extends StatelessWidget {
+  final bool isHindi;
   final bool isSpeaking;
   final VoidCallback onBack;
   final VoidCallback onVoice;
 
   const _HeaderRow({
+    required this.isHindi,
     required this.isSpeaking,
     required this.onBack,
     required this.onVoice,
@@ -419,6 +490,7 @@ class _HeaderRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final title = isHindi ? 'AI मरम्मत गाइड' : 'AI Repair Guide';
     return Row(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
@@ -433,7 +505,7 @@ class _HeaderRow extends StatelessWidget {
         ),
 
         Expanded(
-          child: Text('AI Repair Guide',
+          child: Text(title,
             textAlign: TextAlign.center,
             style: GoogleFonts.inter(
               fontSize: 21, fontWeight: FontWeight.w600,
@@ -517,10 +589,12 @@ class _ProgressBars extends StatelessWidget {
 // ═══════════════════════════════════════════════════════════════════════════
 class _SolutionCard extends StatelessWidget {
   final String problem;
-  const _SolutionCard({required this.problem});
+  final bool isHindi;
+  const _SolutionCard({required this.problem, required this.isHindi});
 
   @override
   Widget build(BuildContext context) {
+    final label = isHindi ? 'समाधान मिला' : 'SOLUTION FOUND';
     return Container(
       padding: const EdgeInsets.symmetric(
           horizontal: _SS.cardPad, vertical: 16),
@@ -544,7 +618,7 @@ class _SolutionCard extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('SOLUTION FOUND',
+                Text(label,
                   style: GoogleFonts.inter(
                     fontSize: 11, fontWeight: FontWeight.w600,
                     color: const Color(0xFF8C8C8C), letterSpacing: 1.3)),
@@ -573,6 +647,7 @@ class _StepCard extends StatelessWidget {
   final String body;
   final bool isActive;
   final bool isPast;
+  final bool isHindi;
   final AnimationController? entranceCtrl;
 
   const _StepCard({
@@ -582,11 +657,14 @@ class _StepCard extends StatelessWidget {
     required this.body,
     required this.isActive,
     required this.isPast,
+    required this.isHindi,
     this.entranceCtrl,
   });
 
   @override
   Widget build(BuildContext context) {
+    final lblStep    = isHindi ? 'चरण $stepNumber'    : 'Step $stepNumber';
+    final lblCurrent = isHindi ? 'वर्तमान कार्य' : 'Current Task';
     final opacity = isActive ? 1.0 : (isPast ? 0.50 : 0.38);
 
     Widget card = AnimatedOpacity(
@@ -617,7 +695,7 @@ class _StepCard extends StatelessWidget {
                       : const Color(0xFFF3F4F6),
                   borderRadius: BorderRadius.circular(16),
                 ),
-                child: Text('Step $stepNumber',
+                child: Text(lblStep,
                   style: GoogleFonts.inter(
                     fontSize: 13, fontWeight: FontWeight.w600,
                     color: isActive ? _SC.primary : const Color(0xFF9CA3AF))),
@@ -628,7 +706,7 @@ class _StepCard extends StatelessWidget {
                     decoration: const BoxDecoration(
                         color: _SC.primary, shape: BoxShape.circle)),
                 const SizedBox(width: 5),
-                Text('Current Task',
+                Text(lblCurrent,
                   style: GoogleFonts.inter(
                     fontSize: 13, fontWeight: FontWeight.w500,
                     color: const Color(0xFF86D7A8))),
@@ -708,7 +786,8 @@ class _StepCard extends StatelessWidget {
 // ═══════════════════════════════════════════════════════════════════════════
 class _ARButton extends StatefulWidget {
   final VoidCallback onTap;
-  const _ARButton({required this.onTap});
+  final bool isHindi;
+  const _ARButton({required this.onTap, required this.isHindi});
 
   @override
   State<_ARButton> createState() => _ARButtonState();
@@ -719,6 +798,7 @@ class _ARButtonState extends State<_ARButton> {
 
   @override
   Widget build(BuildContext context) {
+    final label = widget.isHindi ? 'AR गाइड शुरू करें' : 'Start AR Guide';
     return GestureDetector(
       onTapDown: (_) => setState(() => _pressed = true),
       onTapUp:   (_) { setState(() => _pressed = false); widget.onTap(); },
@@ -745,7 +825,7 @@ class _ARButtonState extends State<_ARButton> {
               const Icon(Icons.camera_alt_rounded,
                   color: Colors.white, size: 22),
               const SizedBox(width: 10),
-              Text('Start AR Guide',
+              Text(label,
                 style: GoogleFonts.inter(
                   fontSize: 18, fontWeight: FontWeight.w600,
                   color: Colors.white, letterSpacing: 0.15)),
@@ -761,6 +841,9 @@ class _ARButtonState extends State<_ARButton> {
 // _EmptyState
 // ═══════════════════════════════════════════════════════════════════════════
 class _EmptyState extends StatelessWidget {
+  final bool isHindi;
+  const _EmptyState({required this.isHindi});
+
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -771,13 +854,15 @@ class _EmptyState extends StatelessWidget {
         const Icon(Icons.build_circle_outlined,
             size: 48, color: Color(0xFFD1D5DB)),
         const SizedBox(height: 16),
-        Text('No repair steps available',
+        Text(isHindi ? 'मरम्मत के चरण उपलब्ध नहीं' : 'No repair steps available',
           style: GoogleFonts.inter(
             fontSize: 16, fontWeight: FontWeight.w600,
             color: const Color(0xFF6B7280))),
         const SizedBox(height: 8),
         Text(
-          'The diagnosis completed but no guide was generated.\nPlease try uploading again.',
+          isHindi
+              ? 'निदान पूर्ण हुआ लेकिन कोई गाइड नहीं बनी।\nकृपया दोबारा अपलोड करें।'
+              : 'The diagnosis completed but no guide was generated.\nPlease try uploading again.',
           textAlign: TextAlign.center,
           style: GoogleFonts.inter(
             fontSize: 14, color: const Color(0xFF9CA3AF), height: 1.55)),

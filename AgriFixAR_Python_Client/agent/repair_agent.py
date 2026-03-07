@@ -35,6 +35,8 @@ _GEMINI_MODEL = "models/gemini-2.5-flash"
 _MASTER_AGENT_PROMPT = """\
 You are a stateful farm machinery diagnostic agent. Decide ONE safe next step.
 Rules: never re-check verified-OK parts; unclear→retry same step; unsafe→stop immediately.
+Step text rule: text_en must be 3–4 sentences — WHERE part is (colour+shape+landmark), \
+WHAT to do with hands, WHAT to see/hear/feel when done. No jargon. Farmer has zero training.
 
 MACHINE: {machine_type} | STAGE: {current_stage} | ATTEMPTS: {attempt_count}
 TRIAGE ORDER: {triage_hint}
@@ -59,14 +61,14 @@ Return ONLY this JSON:
   "status": "continue" | "resolved" | "escalate" | "unsafe",
   "reasoning_summary": "<2-3 sentences — what was found and why this next step>",
   "next_step": {{
-    "text": "<primary language>",
-    "text_en": "<English — colour/shape/position/landmark>",
-    "text_hi": "<Hindi — simple village language>",
+    "text": "<copy of text_en>",
+    "text_en": "<3–4 sentences: WHERE part is + colour/shape/landmark | WHAT hands do | WHAT to see/hear when correct>",
+    "text_hi": "<same 3–4 sentences in simple village Hindi — NOT formal>",
     "visual_cue": "<snake_case_part_id>",
     "ar_model": "<part.obj>",
     "required_part": "<snake_case_part_id>",
     "area_hint": "<one of allowed values above>",
-    "safety_warning": "<one sentence or null>"
+    "safety_warning": "<one plain sentence or null>"
   }},
   "updated_memory": {{
     "verified_parts": {{"<part>": "ok|damaged|unclear"}},
@@ -213,6 +215,17 @@ def _parse_response(raw: str, machine_type: str) -> AgentNextResponse:
         if area not in allowed:
             logger.warning(f"⚠️  [{machine_type}] Invalid area_hint '{area}' → correcting")
             ns["area_hint"] = allowed[0] if allowed else "engine_compartment"
+
+        # Validate step text length — log if too short (prompt compliance check)
+        text_en = ns.get("text_en", "")
+        if len(text_en.split()) < 25:
+            logger.warning(
+                f"⚠️  [{machine_type}] Agent text_en only {len(text_en.split())} words — "
+                "expected 3–4 guided sentences"
+            )
+        # Keep legacy "text" field in sync
+        if not ns.get("text") and text_en:
+            ns["text"] = text_en
 
         return AgentNextResponse(
             status             = data.get("status", "continue"),

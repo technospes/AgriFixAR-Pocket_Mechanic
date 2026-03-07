@@ -1,26 +1,37 @@
-# Use Python 3.11
-FROM python:3.11
+# Base image
+FROM python:3.11-slim
 
-# Set working directory
-WORKDIR /code
+# Prevent Python buffering
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
-# Install FFmpeg
-RUN apt-get update && apt-get install -y ffmpeg
+# Working directory
+WORKDIR /app
 
-# Create cache directory
-RUN mkdir -p /code/cache
-RUN chmod -R 777 /code
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    git \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install Python libraries (No Cache)
-COPY ./requirements.txt /code/requirements.txt
-# Added --no-cache-dir to ensure fresh download
-RUN pip install --no-cache-dir --upgrade -r /code/requirements.txt
+# Copy requirements first (better Docker caching)
+COPY requirements.txt .
 
-# Copy code
+# Upgrade pip
+RUN pip install --upgrade pip
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy project files
 COPY . .
 
-# Expose port
+# Create runtime directories
+RUN mkdir -p cache temp_uploads
+
+# HuggingFace Spaces requires port 7860
 EXPOSE 7860
 
-# Start command
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
+# Start server
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860", "--loop", "uvloop"]

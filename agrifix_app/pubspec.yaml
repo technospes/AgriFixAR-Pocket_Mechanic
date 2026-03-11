@@ -46,18 +46,28 @@ dependencies:
   path_provider: ^2.1.4
   path: ^1.9.0
 
-# dev_dependencies intentionally empty.
-# flutter_test removed because test/widget_test.dart was referencing
-# 'MyApp' (the default Flutter stub) which doesn't exist in this project,
-# causing 14 analyzer errors. Add flutter_test back when writing real tests.
-dev_dependencies: {}
+# Added flutter_launcher_icons here
+dev_dependencies:
+  flutter_launcher_icons: ^0.13.1
+  flutter_native_splash: ^2.4.0
 
 flutter:
   generate: true
   uses-material-design: true
   assets:
     - assets/videos/
-    - assets/images/
+    - assets/images/app_icon.png
 
-camera: ^0.10.5+9
-permission_handler: ^11.3.1
+# 👇 Configuration to generate your app logo automatically
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/images/app_icon.png"
+  min_sdk_size: 21
+
+flutter_native_splash:
+  color: "#FFFFFF" # You can change this hex code to match the beige background of your logo!
+  image: "assets/images/app_icon.png"
+  android_12:
+    image: "assets/images/app_icon.png"
+    color: "#FFFFFF"

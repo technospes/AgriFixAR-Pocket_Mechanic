@@ -20,7 +20,7 @@ _MODEL_PRETRAINED = os.environ.get("CLIP_PRETRAINED",  "datacompdr")
 #     Wrong machine or non-machinery  → 0.25–0.45
 #   0.55 = "confident enough to skip Gemini"
 #   0.35 = "has a weak signal, worth including in fusion"
-_CLIP_STRONG     = 0.40   # trust CLIP alone above this
+_CLIP_STRONG     = 0.36   # trust CLIP alone above this
 _CLIP_WEAK       = 0.35   # include in fusion above this
 _AUDIO_STRONG    = 0.70   # trust audio alone above this
 _AUDIO_WEAK      = 0.40   # include in fusion above this
@@ -102,6 +102,25 @@ _MACHINE_PROMPTS: dict[str, list[str]] = {
         "a Kirloskar or Lister diesel engine with a large flywheel",
         "a diesel engine driving a water pump by a belt",
         "a standalone diesel engine with an exhaust pipe and decompression lever",
+    ],
+    # ── New machines added: cultivator / sprayer / irrigation ────────────────
+    "cultivator": [
+        "a photo of a tractor-mounted cultivator implement in a field",
+        "a soil cultivator with tines or shovels attached to a tractor",
+        "a farm cultivator stirring and aerating soil between crop rows",
+        "a multi-row cultivator frame being pulled by a tractor",
+    ],
+    "sprayer": [
+        "a photo of a knapsack or back-mounted pesticide sprayer",
+        "a motorised crop sprayer being used in a farm field",
+        "a boom sprayer mounted on a tractor spraying pesticide",
+        "a hand-pump agricultural sprayer with a pressure tank and nozzle",
+    ],
+    "drip_irrigation": [
+        "a photo of drip irrigation pipes and emitters in a farm field",
+        "a drip irrigation filter unit and pressure regulator on a farm",
+        "a micro-irrigation lateral pipe with drippers installed in soil",
+        "a drip irrigation control valve and fertigation tank assembly",
     ],
 }
 
@@ -187,6 +206,30 @@ _AUDIO_KEYWORDS: dict[str, list[tuple[str, float]]] = {
         ("decompression lever", 0.8), ("hand crank", 0.7),
         ("standalone engine", 0.8), ("lombardini", 0.8),
     ],
+    # ── New machines ─────────────────────────────────────────────────────────
+    "cultivator": [
+        ("cultivator", 1.0), ("कल्टीवेटर", 1.0),
+        ("tine", 0.9), ("soil tiller", 0.9), ("weeder", 0.8),
+        ("inter cultivation", 0.9), ("kulti", 0.9), ("kultivator", 0.9),
+        ("dantali", 0.8), ("दंताली", 0.8),          # common Hindi/Gujarati term
+        ("shovel tine", 0.8), ("sweep", 0.7),
+    ],
+    "sprayer": [
+        ("sprayer", 1.0), ("स्प्रेयर", 1.0), ("spray machine", 1.0),
+        ("pesticide machine", 1.0), ("keetnaashak machine", 0.9),
+        ("knapsack", 0.9), ("boom sprayer", 1.0), ("power sprayer", 0.9),
+        ("nozzle", 0.7), ("pump spray", 0.8), ("dawa machine", 0.9),
+        ("दवाई मशीन", 0.9), ("छिड़काव", 0.9),         # Hindi: "chidkav" = spraying
+        ("fog machine", 0.8), ("mist blower", 0.8),
+    ],
+    "drip_irrigation": [
+        ("drip irrigation", 1.0), ("drip system", 1.0), ("ड्रिप", 1.0),
+        ("micro irrigation", 1.0), ("sprinkler", 0.9), ("स्प्रिंकलर", 0.9),
+        ("dripper", 0.9), ("lateral pipe", 0.8), ("emitter", 0.8),
+        ("filter unit", 0.8), ("fertigation", 0.8), ("pressure regulator", 0.7),
+        ("paani pipe", 0.6), ("seench pipe", 0.7), ("सिंचाई पाइप", 0.8),
+        ("rain gun", 0.9), ("mini sprinkler", 0.9),
+    ],
 }
 
 # Flat list for O(n) scan: (keyword, machine_id, weight)
@@ -224,7 +267,12 @@ class DetectionResult:
     clip_confidence:  float
     audio_confidence: float
     gemini_used:      bool
-    frame_used:       Optional[str]   # "early" | "mid" | None
+    frame_used:       Optional[str]        # "early" | "mid" | None
+    frames:           list = field(default_factory=list)
+    # ↑ JPEG bytes of the already-decoded PIL frames (early/mid/late order).
+    # Populated by detect_machine() at zero extra cost — the PIL images were
+    # already in memory from _extract_frames(). main.py reads these directly
+    # for Gemini diagnosis instead of re-opening and re-decoding the video.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -445,6 +493,33 @@ def _best_frame(frames: list[_Frame]) -> Optional[_Frame]:
     """Legacy single-frame selector — used by detect_machine for Gemini fallback."""
     result = _best_frames(frames, n=1)
     return result[0] if result else None
+
+
+def _frames_to_jpeg(frames: list[_Frame], max_px: int = 512) -> list[bytes]:
+    """
+    JPEG-encode the PIL images that _extract_frames() already decoded.
+
+    This is the zero-cost path: the frames are already in RAM as PIL.Image
+    objects. We just resize to 512px (for Gemini — larger than CLIP's 256px
+    to preserve visual detail) and encode to JPEG bytes.
+
+    No video file is re-opened. No cv2 decode. Pure in-memory PIL operations.
+    Cost: ~2–5 ms per frame for the JPEG encode step.
+
+    Preserves original label order: [early, mid, late].
+    """
+    import io as _io
+    result: list[bytes] = []
+    for fr in frames:
+        try:
+            img = fr.image.copy()
+            img.thumbnail((max_px, max_px))
+            buf = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            result.append(buf.getvalue())
+        except Exception as exc:
+            logger.warning(f"⚠️  Frame [{fr.label}] JPEG encode failed: {exc}")
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -766,6 +841,10 @@ async def detect_machine(
         f"source={final.source}  gemini={gemini_used}  [{elapsed_ms:.0f}ms]"
     )
 
+    # JPEG-encode the frames that are already in RAM — zero extra video decode.
+    # main.py reads detection.frames directly; _extract_clip_frames() is gone.
+    jpeg_frames = _frames_to_jpeg(all_frames) if all_frames else []
+
     return DetectionResult(
         machine_type     = canonical,
         confidence       = round(final.confidence, 4),
@@ -774,4 +853,5 @@ async def detect_machine(
         audio_confidence = round(audio_result.confidence if audio_result else 0.0, 4),
         gemini_used      = gemini_used,
         frame_used       = "+".join(f.label for f in top_frames) if top_frames else None,
+        frames           = jpeg_frames,
     )

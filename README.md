@@ -382,7 +382,7 @@ APP_SECRET_KEY=[Insert Secret Key]
 
 ```
 
-uvicorn main:app --host 0.0.0.0 --port 7680 --reload
+uvicorn main:app --host 0.0.0.0 --port 7860 --reload
 
 ```
 
@@ -390,7 +390,7 @@ API documentation:
 
 ```
 
-[http://localhost:7680/docs](http://localhost:7680/docs)
+[http://localhost:7860/docs](http://localhost:7860/docs)
 
 ```
 

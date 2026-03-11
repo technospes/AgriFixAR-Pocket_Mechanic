@@ -17,7 +17,15 @@ class RepairSession(BaseModel):
     machine_type: str
     problem: str
     verified_parts: Dict[str, Literal["ok", "damaged", "unclear"]] = Field(default_factory=dict)
+    verified_observations: Dict[str, str] = Field(default_factory=dict)
+    # ↑ Gemini's actual visual finding per part, e.g.:
+    #   {"battery_terminal": "white powder visible on both clamps — corrosion confirmed"}
+    #   Gives the agent richer context than just "ok"/"damaged" labels.
     diagnostic_path: List[str] = Field(default_factory=list)
+    generated_steps: List[str] = Field(default_factory=list)
+    # ↑ Step IDs + part from the diagnosis plan, e.g. ["s1:battery_terminal:visual", ...]
+    #   Populated when the session is linked to a /diagnose plan so the agent
+    #   never re-generates a step the plan already covers, and never skips one it marked critical.
     current_stage: int = 0
     attempt_count: int = 0
     last_verification: Optional[Dict] = None
@@ -64,6 +72,11 @@ class CreateSessionRequest(BaseModel):
     machine_type: str
     problem_description: str
     language: str = "en"
+    diagnosis_steps: List[Dict] = Field(default_factory=list)
+    # ↑ Optional: pass the steps array from /diagnose response so the agent
+    #   knows exactly which parts the plan covers and in what order.
+    #   Each item should be a step dict with at least step_id, required_part, step_type.
+    #   When provided, session.generated_steps is populated at creation time.
 
 
 class CreateSessionResponse(BaseModel):

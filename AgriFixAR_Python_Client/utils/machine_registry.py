@@ -942,7 +942,70 @@ _PROFILES: List[MachineProfile] = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lookup index (built once at import time)
+# Merge new machines from machine_registry_additions.py
+# ─────────────────────────────────────────────────────────────────────────────
+# The additions file stores profiles as plain dicts for portability.
+# Here we convert each dict → MachineProfile + MachineAreaZone + MachinePart
+# and append them to _PROFILES so every public API function sees them.
+
+def _profile_from_dict(d: dict) -> MachineProfile:
+    """Convert a machine_registry_additions profile dict to a MachineProfile."""
+    return MachineProfile(
+        machine_id            = d["machine_id"],
+        aliases               = list(d.get("aliases", [d["machine_id"]])),
+        label_en              = d["label_en"],
+        label_hi              = d["label_hi"],
+        category              = d.get("category", "other"),
+        farmer_intro_en       = d.get("farmer_intro_en", ""),
+        farmer_intro_hi       = d.get("farmer_intro_hi", ""),
+        diagnostic_context    = d.get("diagnostic_context", ""),
+        critical_parts        = d.get("critical_parts", []),
+        fuel_system_parts     = d.get("fuel_system_parts", []),
+        base_safety_warnings_en = d.get("base_safety_warnings_en", []),
+        base_safety_warnings_hi = d.get("base_safety_warnings_hi", []),
+        area_zones = [
+            MachineAreaZone(
+                id                    = z["id"],
+                label_en              = z["label_en"],
+                label_hi              = z["label_hi"],
+                farmer_description_en = z.get("farmer_description_en", ""),
+                farmer_description_hi = z.get("farmer_description_hi", ""),
+            )
+            for z in d.get("area_zones", [])
+        ],
+        parts = [
+            MachinePart(
+                id                    = p["id"],
+                area_zone             = p.get("area_zone", ""),
+                label_en              = p.get("label_en", ""),
+                label_hi              = p.get("label_hi", ""),
+                farmer_description_en = p.get("farmer_description_en", ""),
+                farmer_description_hi = p.get("farmer_description_hi", ""),
+                ar_model              = p.get("ar_model", "part.obj"),
+            )
+            for p in d.get("parts", [])
+        ],
+    )
+
+
+try:
+    from .machine_registry_additions import NEW_MACHINE_PROFILES, NEW_MACHINE_ALIASES
+    for _raw in NEW_MACHINE_PROFILES:
+        # Skip if this machine_id is already registered (idempotent on reload)
+        if _raw["machine_id"] not in {p.machine_id for p in _PROFILES}:
+            _PROFILES.append(_profile_from_dict(_raw))
+except ImportError:
+    # Additions file missing — registry still fully functional for existing machines
+    NEW_MACHINE_ALIASES = {}
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "⚠️  machine_registry_additions.py not found — "
+        "cultivator/sprayer/drip_irrigation profiles not loaded."
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lookup indexes (built once at import time, AFTER all profiles are merged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ID_INDEX: Dict[str, MachineProfile] = {p.machine_id: p for p in _PROFILES}
@@ -952,7 +1015,12 @@ for _profile in _PROFILES:
     for _alias in _profile.aliases:
         _ALIAS_INDEX[_alias.lower()] = _profile
 
-# Build the global part→area map across ALL machines
+# Also register the string-keyed aliases from the additions file
+for _alias_str, _canonical_id in NEW_MACHINE_ALIASES.items():
+    if _canonical_id in _ID_INDEX:
+        _ALIAS_INDEX[_alias_str.lower()] = _ID_INDEX[_canonical_id]
+
+# Build the global part→area map across ALL machines (including new ones)
 _GLOBAL_PART_AREA_MAP: Dict[str, str] = {}
 for _profile in _PROFILES:
     for _part in _profile.parts:

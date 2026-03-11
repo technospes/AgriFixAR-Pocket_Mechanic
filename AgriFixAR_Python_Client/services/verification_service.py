@@ -69,6 +69,7 @@ async def verify_step_with_gemini(
     attempt_count: int,
     language: str = "en",
     include_hindi: bool = False,
+    previous_steps: str = "[]",
 ) -> dict:
     """Verify a repair step for any supported farm machine — token-optimised."""
     logger.info(
@@ -88,9 +89,33 @@ async def verify_step_with_gemini(
         electric_flag = "⚡ UNSAFE if live wires/terminals visible near hands.\n" if is_electric else ""
         lang_note     = "feedback in Hindi preferred.\n" if language == "hi" else ""
 
-        prompt = f"""Farm machinery camera verification. Farmer tapped Analyze on their {machine_type}.
-{electric_flag}{lang_note}
+        # ── Visual memory: steps already verified this session ────────────────
+        # Flutter sends previous_steps as a JSON array of attempt dicts.
+        # We inject a compact summary so Gemini knows what was already confirmed
+        # and avoids re-describing parts the farmer already found correctly.
+        history_block = ""
+        try:
+            import json as _json
+            prev = _json.loads(previous_steps) if previous_steps else []
+            # Must be a list — a dict/string/int would pass json.loads() but
+            # iterating it would produce garbage keys sent to Gemini.
+            if not isinstance(prev, list):
+                prev = []
+            passed = [s for s in prev if s.get("status") in ("answered", "pass", "verified")]
+            if passed:
+                lines = [
+                    f"  • {s.get('detected_part', '?')}: {s.get('feedback', s.get('status', '?'))}"
+                    for s in passed[-5:]  # last 5 confirmed steps max — keep prompt lean
+                ]
+                history_block = (
+                    "\nALREADY CONFIRMED THIS SESSION (do not re-describe these parts):\n"
+                    + "\n".join(lines) + "\n"
+                )
+        except Exception:
+            pass  # malformed previous_steps — silently skip, never crash verify
 
+        prompt = f"""Farm machinery camera verification. Farmer tapped Analyze on their {machine_type}.
+{electric_flag}{lang_note}{history_block}
 Context: problem={problem_context} | step="{step_text}"
 
 ACTION CHECK:

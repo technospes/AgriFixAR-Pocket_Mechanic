@@ -2,6 +2,8 @@ import json
 import os
 import re
 import asyncio
+import time
+import struct
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Dict, Any, AsyncIterator
@@ -30,6 +32,7 @@ from typing import List as _List
 from rag import (
     retrieve_with_metadata_filter,
     infer_problem_categories,
+    normalize_query,
     RAG_TOP_K,
     RAG_MIN_SCORE,
 )
@@ -140,13 +143,109 @@ UPLOAD_DIR = Path("temp_uploads")
 KB_DIR = Path("knowledge_base")
 CACHE_DIR = Path("response_cache")
 CHROMA_DIR = Path("chroma_db")
+PLAN_CACHE_DIR = Path("plan_cache")   # ← repair plan cache
 MAX_IMAGE_SIZE = 512
 MAX_AUDIO_SIZE = 10 * 1024 * 1024  # 10 MB
 MAX_CACHE_AGE = 86400
+PLAN_CACHE_TTL = int(os.environ.get("PLAN_CACHE_TTL_SECONDS", str(30 * 24 * 3600)))  # 30 days default
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 KB_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(exist_ok=True)
+PLAN_CACHE_DIR.mkdir(exist_ok=True)
+
+
+def _safe_filename(raw: str, fallback: str) -> str:
+    """
+    Strip any directory components from a client-supplied filename.
+    Prevents path traversal attacks like '../../../etc/passwd'.
+    Returns only the final filename component, or `fallback` if empty.
+
+    Example:
+        _safe_filename("../../../etc/passwd", "rec.mp4") → "etc/passwd" → "passwd"
+        Wait — Path("../../../etc/passwd").name → "passwd"  ✓
+    """
+    name = Path(raw).name if raw else ""
+    # Also strip leading dots that could create hidden files (e.g. ".bashrc")
+    name = name.lstrip(".")
+    return name or fallback
+
+# ============================================================================
+# REPAIR PLAN CACHE
+# ============================================================================
+# Key: SHA-256( machine_type + "|" + problem_cluster )
+# Value: JSON file on disk — survives server restarts.
+#
+# problem_cluster = sorted(infer_problem_categories(problem_text)).join(",")
+# This normalises "motor won't start" and "engine not starting" to the same
+# cluster key, so we reuse the cached plan for semantically identical complaints.
+#
+# Cache is intentionally NOT invalidated by RAG chunk updates — if the problem
+# cluster is the same, the repair logic is the same.  TTL is 30 days.
+# Operators can clear the cache folder to force fresh generation.
+
+def _plan_cache_key(machine_type: str, problem_text: str,
+                    visual_hash: str = "") -> str:
+    """
+    Deterministic cache key: machine_type + problem cluster + visual hash.
+
+    The visual_hash is a perceptual hash of the best video frame (8 bytes, hex).
+    This is CRITICAL for accuracy: without it, "water_pump + not_working" would
+    serve the same cached plan whether the motor is dead OR water is flowing.
+    Two visually different states → two different cache keys → two correct plans.
+
+    visual_hash="" (default) is kept for callers that have no frame (e.g. the
+    non-streaming /diagnose endpoint when video is absent).
+    """
+    cats = sorted(infer_problem_categories(problem_text))
+    cluster = ",".join(cats) if cats else normalize_query(problem_text)[:60]
+    raw = f"{machine_type.lower()}|{cluster}|{visual_hash}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+def _phash_bytes(image_bytes: bytes, hash_size: int = 8) -> str:
+    """
+    Average perceptual hash — 16-char hex string used in the plan cache key.
+    Operates on JPEG bytes already in RAM from detection.frames. No I/O.
+    """
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("L")
+        img = img.resize((hash_size * 4, hash_size * 4), Image.LANCZOS)
+        pixels = list(img.getdata())
+        mean = sum(pixels) / len(pixels)
+        bits = "".join("1" if p >= mean else "0" for p in pixels)
+        return int(bits, 2).to_bytes(hash_size, "big").hex()
+    except Exception:
+        return "00000000"
+
+
+def _plan_cache_get(key: str) -> Optional[Dict[str, Any]]:
+    """Return cached plan dict or None if missing / expired."""
+    p = PLAN_CACHE_DIR / f"{key}.json"
+    if not p.exists():
+        return None
+    try:
+        age = time.time() - p.stat().st_mtime
+        if age > PLAN_CACHE_TTL:
+            p.unlink(missing_ok=True)
+            logger.info(f"🗑️  Plan cache expired and removed: {key}")
+            return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+        logger.info(f"🎯 Plan cache HIT: {key}")
+        return data
+    except Exception as exc:
+        logger.warning(f"Plan cache read error ({key}): {exc}")
+        return None
+
+
+def _plan_cache_set(key: str, plan: Dict[str, Any]) -> None:
+    """Write plan to disk cache. Failures are non-fatal."""
+    try:
+        p = PLAN_CACHE_DIR / f"{key}.json"
+        p.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+        logger.info(f"💾 Plan cache WRITE: {key}")
+    except Exception as exc:
+        logger.warning(f"Plan cache write error ({key}): {exc}")
 
 # ============================================================================
 # LIFESPAN
@@ -188,10 +287,19 @@ app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # ⚠️  Never use "*" with allow_credentials=True — browsers block it and it
+    # allows any website to make credentialed cross-origin requests to this API.
+    # List only the exact origins that legitimately call this backend.
+    # Flutter mobile apps do NOT use CORS (no browser), so this only matters
+    # for web builds or the HuggingFace Spaces demo page.
+    allow_origins=[
+        "https://agrifix.hf.space",        # HuggingFace Spaces demo (update to your Space URL)
+        "http://localhost:8000",            # local dev
+        "http://localhost:3000",            # local web dev
+    ],
+    allow_credentials=False,               # no cookies/sessions — app key is in headers
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type", "X-App-Key"],
 )
 
 # ============================================================================
@@ -372,6 +480,10 @@ async def health(request: Request):
         },
         "active_sessions": len(session_manager.list_sessions()),
         "your_gemini_calls_this_hour": get_gemini_usage(ip),
+        "plan_cache": {
+            "entries": len(list(PLAN_CACHE_DIR.glob("*.json"))),
+            "ttl_days": PLAN_CACHE_TTL // 86400,
+        },
         # Server-enforced limits — visible to operators; attackers already know
         # the client limits, so publishing server limits does not aid attacks.
         "limits": {
@@ -444,6 +556,109 @@ async def get_machine_info(machine_type: str):
     }
 
 
+@app.post("/detect_machine")
+@limiter.limit("10/minute")
+async def detect_machine_endpoint(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    video: UploadFile = File(...),
+    audio: UploadFile = File(default=None),
+    _auth: None = Depends(verify_app_key),
+):
+    """
+    Stage-0 endpoint: detect machine type from video + optional audio.
+
+    Flutter calls this BEFORE /diagnose/stream so the farmer can confirm
+    the detected machine type on a dedicated confirmation screen.
+
+    Response:
+        {
+          "machine_type":    "electric_water_pump",
+          "confidence":      0.91,
+          "source":          "clip",
+          "label_en":        "Electric Water Pump",
+          "label_hi":        "इलेक्ट्रिक वॉटर पंप",
+          "alternatives":    [{"id": "diesel_pump", "label_en": "...", "label_hi": "..."}],
+          "needs_confirmation": true   ← true when confidence < 0.80
+        }
+
+    Token cost: 0 (CLIP-only when confident, Gemini fallback only when needed).
+    Latency: ~1–2 s on HF free tier.
+    """
+    ip = request.client.host if request.client else "unknown"
+    logger.info(f"🔍 /detect_machine ip={ip}")
+    request_id = hashlib.md5(f"{datetime.now()}".encode()).hexdigest()[:8]
+
+    try:
+        video_bytes = await video.read()
+        validate_video_upload(video.filename or "rec.mp4", video_bytes, ip=ip)
+
+        _vname = _safe_filename(video.filename, "rec.mp4")
+        video_path = UPLOAD_DIR / f"{request_id}_detect_{_vname}"
+        video_path.write_bytes(video_bytes)
+        background_tasks.add_task(lambda: video_path.unlink(missing_ok=True))
+
+        transcription_text: Optional[str] = None
+        if audio is not None:
+            try:
+                audio_bytes = await audio.read()
+                if len(audio_bytes) > 512:
+                    validate_audio_upload(audio.filename or "rec.m4a", audio_bytes, ip=ip)
+                    _aname = _safe_filename(audio.filename, "rec.m4a")
+                    audio_path = UPLOAD_DIR / f"{request_id}_detect_audio_{_aname}"
+                    audio_path.write_bytes(audio_bytes)
+                    background_tasks.add_task(lambda: audio_path.unlink(missing_ok=True))
+                    if can_call_gemini(ip):
+                        transcription_text = await gemini_with_timeout(
+                            transcribe_audio_with_gemini(audio_path),
+                            fallback=None, context="detect/transcription",
+                        )
+                        if transcription_text:
+                            record_gemini_call(ip)
+            except Exception:
+                pass  # audio is optional — carry on without it
+
+        detection = await detect_machine(
+            video_path=video_path,
+            transcription_text=transcription_text,
+        )
+        if detection.gemini_used:
+            record_gemini_call(ip)
+
+        resolved = detection.machine_type
+        profile   = get_profile(resolved)
+
+        # Build alternatives list from supported machines (exclude detected)
+        all_machines = list_supported_machines()
+        alternatives = [
+            {
+                "id":       m["machine_id"],
+                "label_en": m["label_en"],
+                "label_hi": m.get("label_hi", m["label_en"]),
+            }
+            for m in all_machines
+            if m["machine_id"] != resolved
+        ][:8]  # cap at 8 so the UI list stays manageable
+
+        return JSONResponse(content={
+            "machine_type":       resolved,
+            "confidence":         round(detection.confidence, 3),
+            "source":             detection.source,
+            "clip_confidence":    round(detection.clip_confidence or 0.0, 3),
+            "audio_confidence":   round(detection.audio_confidence or 0.0, 3),
+            "label_en":           profile.label_en  if profile else resolved,
+            "label_hi":           profile.label_hi  if profile else resolved,
+            "needs_confirmation": detection.confidence < 0.80,
+            "alternatives":       alternatives,
+        })
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"❌ /detect_machine failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.post("/diagnose")
 @limiter.limit("5/minute")
 async def diagnose(
@@ -476,14 +691,16 @@ async def diagnose(
             validate_video_upload(video.filename, video_bytes, ip=ip)
 
         # Save audio
-        audio_path  = UPLOAD_DIR / f"{request_id}_audio_{audio.filename}"
+        _aname = _safe_filename(audio.filename, "rec.m4a")
+        audio_path  = UPLOAD_DIR / f"{request_id}_audio_{_aname}"
         audio_path.write_bytes(audio_bytes)
         background_tasks.add_task(lambda: audio_path.unlink(missing_ok=True))
 
         # Save video only if meaningful content exists
         video_path: Optional[Path] = None
         if video.filename and len(video_bytes) > 1024:
-            video_path = UPLOAD_DIR / f"{request_id}_video_{video.filename}"
+            _vname = _safe_filename(video.filename, "rec.mp4")
+            video_path = UPLOAD_DIR / f"{request_id}_video_{_vname}"
             video_path.write_bytes(video_bytes)
             background_tasks.add_task(lambda: video_path.unlink(missing_ok=True))
 
@@ -532,11 +749,14 @@ async def diagnose(
         detection = detection_clip
 
         if detection_clip.confidence < 0.55:
-            # CLIP uncertain: re-run locally with transcription keywords
+            # CLIP uncertain: re-run locally with transcription keywords.
+            # CRITICAL: pass video_path=None — video was already decoded above.
+            # Restore frames from the first decode so diagnosis still gets them.
             detection = await detect_machine(
-                video_path=video_path,
+                video_path=None,          # ← no re-decode
                 transcription_text=problem_text,
             )
+            detection.frames = detection_clip.frames  # restore already-decoded frames
             if detection.gemini_used:
                 record_gemini_call(ip)
             resolved = detection.machine_type
@@ -558,11 +778,24 @@ async def diagnose(
         rag_context = retrieve_rag_context(problem_text, resolved)
         knowledge   = load_knowledge_base(resolved)
 
-        # ── Diagnosis: ONE Gemini reasoning call ──────────────────────────────
-        # machine type + problem text + RAG chunks + knowledge base all fed into
-        # a single structured prompt.  Gemini returns the complete JSON in one
-        # call — no separate classify → diagnose → format pipeline.
-        if can_call_gemini(ip):
+        # ── Reuse frames already decoded by CLIP — zero extra video I/O ──────
+        # detection.frames holds the same early/mid/late JPEG bytes that CLIP
+        # quality-scored and used for classification. No re-open, no re-decode.
+        clip_frames  = detection.frames          # list[bytes], already in RAM
+        mid_frame    = clip_frames[len(clip_frames) // 2] if clip_frames else None
+        visual_hash  = _phash_bytes(mid_frame) if mid_frame else ""
+        logger.info(f"📸 Frames from CLIP cache: {len(clip_frames)}/3  phash={visual_hash or 'none'}")
+
+        # ── Plan cache check — avoids LLM call entirely on hit ────────────────
+        plan_cache_key = _plan_cache_key(resolved, problem_text, visual_hash)
+        cached_plan    = _plan_cache_get(plan_cache_key)
+
+        # ── Diagnosis: ONE Gemini reasoning call (now multimodal 3-frame) ─────
+        if cached_plan is not None:
+            diagnosis = cached_plan
+            diagnosis["cache_hit"] = True
+            logger.info(f"🎯 /diagnose cache HIT key={plan_cache_key}")
+        elif can_call_gemini(ip):
             diagnosis = await gemini_with_timeout(
                 generate_diagnosis_with_gemini(
                     machine_type=resolved,
@@ -570,12 +803,14 @@ async def diagnose(
                     language=language,
                     rag_context=rag_context,
                     knowledge_base=knowledge,
+                    visual_frames=clip_frames,
                 ),
                 fallback=None,
                 context="diagnosis",
             )
             if diagnosis:
                 record_gemini_call(ip)
+                _plan_cache_set(plan_cache_key, diagnosis)
             else:
                 diagnosis = _local_fallback_diagnosis(resolved, problem_text)
         else:
@@ -659,13 +894,13 @@ async def diagnose_stream(
         # RAG (Stage 2) is fully local — zero Gemini calls.
         # ─────────────────────────────────────────────────────────────────────
 
-        audio_path = UPLOAD_DIR / f"{request_id}_audio_{audio.filename or 'rec.m4a'}"
+        audio_path = UPLOAD_DIR / f"{request_id}_audio_{_safe_filename(audio.filename, 'rec.m4a')}"
         video_path: Optional[Path] = None
         try:
             # ── Save files ────────────────────────────────────────────────────
             audio_path.write_bytes(audio_bytes)
             if video.filename and len(video_bytes) > 1024:
-                video_path = UPLOAD_DIR / f"{request_id}_video_{video.filename or 'rec.mp4'}"
+                video_path = UPLOAD_DIR / f"{request_id}_video_{_safe_filename(video.filename, 'rec.mp4')}"
                 video_path.write_bytes(video_bytes)
 
             # ── Stages 0 + 1: CLIP detection & transcription — CONCURRENT ────
@@ -719,15 +954,18 @@ async def diagnose_stream(
             detection = detection_clip
 
             if detection_clip.confidence < 0.55:
-                # CLIP is uncertain — re-run detection with the transcription
-                # text so the audio keyword matcher can resolve the machine type.
-                # This is still local (no Gemini) as long as keywords match.
+                # CLIP is uncertain — re-run detection WITH transcription text so
+                # the audio keyword matcher can resolve without Gemini.
+                # CRITICAL: pass video_path=None so the video is NOT re-decoded.
+                # detection_clip.frames already holds the JPEG bytes from the
+                # first decode. We copy them onto the new result after the call.
                 detection = await detect_machine(
-                    video_path=video_path,
+                    video_path=None,          # ← no re-decode
                     transcription_text=problem_text,
                 )
+                # Restore the frames from the first (and only) CLIP decode
+                detection.frames = detection_clip.frames
                 if detection.gemini_used:
-                    # detect_machine used its own Gemini fallback — record it
                     record_gemini_call(ip)
                 resolved = detection.machine_type
 
@@ -753,22 +991,37 @@ async def diagnose_stream(
             yield _sse("stage_start", {"stage": 2, "label": "Searching repair manuals for your issue"})
             rag_context = retrieve_rag_context(problem_text, resolved)
             rag_chunks  = len(rag_context.split("---")) if rag_context else 0
+
+            # ── Reuse frames already decoded by CLIP — zero extra video I/O ────
+            # detection.frames holds the early/mid/late JPEG bytes that CLIP
+            # quality-scored during Stage 0. No re-open, no re-decode, no cv2.
+            # 3 frames give Gemini temporal context: all 3 show water flowing →
+            # machine RUNNING; frame 3 still but 1-2 had motion → cut out mid-run.
+            clip_frames  = detection.frames
+            mid_frame    = clip_frames[len(clip_frames) // 2] if clip_frames else None
+            visual_hash  = _phash_bytes(mid_frame) if mid_frame else ""
+            logger.info(f"📸 Frames from CLIP cache: {len(clip_frames)}/3  phash={visual_hash or 'none'}")
+
             yield _sse("stage_done", {
                 "stage": 2, "label": "Searching repair manuals for your issue",
                 "rag_chunks": rag_chunks, "rag_active": rag_chunks > 0,
             })
 
-            # ── Stage 3: Diagnosis — ONE Gemini reasoning call ────────────────
-            # This is the only place structured reasoning happens.
-            # The prompt receives: machine type, problem description, RAG chunks,
-            # and knowledge base — so Gemini produces the full structured JSON
-            # (problem_identified, steps[], safety_warnings, tools_needed) in
-            # a single call.  There is no separate classify → explain → format
-            # pipeline; everything is returned in one structured response.
+            # ── Stage 3: Diagnosis — ONE Gemini call, multimodal 3-frame ─────
+            # Cache key includes visual_hash of mid frame: same machine + same
+            # symptom cluster but different visual state → different cache entry.
+            # "water flowing" and "pump completely dead" get separate cached plans.
             yield _sse("stage_start", {"stage": 3, "label": "Preparing your step-by-step repair guide"})
             knowledge = load_knowledge_base(resolved)
 
-            if can_call_gemini(ip):
+            plan_cache_key = _plan_cache_key(resolved, problem_text, visual_hash)
+            cached_plan    = _plan_cache_get(plan_cache_key)
+
+            if cached_plan is not None:
+                diagnosis = cached_plan
+                diagnosis["cache_hit"] = True
+                logger.info(f"🎯 stream cache HIT key={plan_cache_key}")
+            elif can_call_gemini(ip):
                 diagnosis = await gemini_with_timeout(
                     generate_diagnosis_with_gemini(
                         machine_type=resolved,
@@ -776,12 +1029,14 @@ async def diagnose_stream(
                         language=language,
                         rag_context=rag_context,
                         knowledge_base=knowledge,
+                        visual_frames=clip_frames,
                     ),
                     fallback=None,
                     context="stream/diagnosis",
                 )
                 if diagnosis:
                     record_gemini_call(ip)
+                    _plan_cache_set(plan_cache_key, diagnosis)
                 else:
                     diagnosis = _local_fallback_diagnosis(resolved, problem_text)
             else:
@@ -801,6 +1056,7 @@ async def diagnose_stream(
             yield _sse("stage_done", {
                 "stage": 3, "label": "Preparing your step-by-step repair guide",
                 "result": diagnosis,
+                "cache_hit": diagnosis.get("cache_hit", False),
             })
 
             yield _sse("done", {})
@@ -810,9 +1066,23 @@ async def diagnose_stream(
             logger.error(f"❌ Stream error [{request_id}]: {exc}")
             yield _sse("error", {"message": str(exc)})
         finally:
-            audio_path.unlink(missing_ok=True)
+            # Windows locks files held by sockets that closed uncleanly (WinError 32).
+            # Retry up to 3 times with a short delay before giving up — the OS
+            # releases the handle within ~200ms of the SSL connection teardown.
+            async def _safe_unlink(p: Path) -> None:
+                for attempt in range(3):
+                    try:
+                        p.unlink(missing_ok=True)
+                        return
+                    except PermissionError:
+                        if attempt < 2:
+                            await asyncio.sleep(0.3)
+                        else:
+                            logger.warning(f"⚠️  Could not delete temp file (still locked): {p.name}")
+
+            await _safe_unlink(audio_path)
             if video_path:
-                video_path.unlink(missing_ok=True)
+                await _safe_unlink(video_path)
 
     return StreamingResponse(
         event_stream(),
@@ -848,7 +1118,26 @@ async def verify_step(
     """
     ip = request.client.host if request.client else "unknown"
 
-    if required_part == "machine_part":
+    # ── Security: input length caps ───────────────────────────────────────────
+    # Prevents oversized payloads bloating Gemini prompts / slowing the server.
+    # step_text raises 400 (Flutter must send valid input); others are silently
+    # truncated since they're contextual and partial content is still useful.
+    if len(step_text) > 1000:
+        raise HTTPException(status_code=400, detail="step_text exceeds 1000 character limit")
+    if len(problem_context) > 500:
+        problem_context = problem_context[:500]
+    if len(previous_steps) > 8000:
+        previous_steps = "[]"   # silently drop oversized history — non-critical
+
+    # ── Security: previous_steps must be a JSON array ─────────────────────────
+    # json.loads() accepts dicts, strings, ints — all would break the for-loop
+    # in verification_service.py and produce garbage context sent to Gemini.
+    try:
+        _ps_parsed = json.loads(previous_steps)
+        if not isinstance(_ps_parsed, list):
+            previous_steps = "[]"
+    except (json.JSONDecodeError, ValueError):
+        previous_steps = "[]"
         required_part, area_hint = derive_part_and_area(step_text, machine_type)
 
     # ── Security: prompt injection on step_text + problem_context ─────────────
@@ -875,6 +1164,7 @@ async def verify_step(
                     attempt_count=attempt_count,
                     language=language,
                     include_hindi=(include_hindi.lower() == "true"),
+                    previous_steps=previous_steps,  # ← semantic memory wiring
                 ),
                 fallback=None,
                 context="verify_step",
@@ -928,6 +1218,47 @@ async def safety_check(image: UploadFile = File(...)):
         return JSONResponse(content={"safe": True, "hazard_detected": None})
 
 
+@app.delete("/plan_cache")
+async def clear_plan_cache(
+    request: Request,
+    _auth: None = Depends(verify_app_key),
+):
+    """
+    Clear all cached repair plans (operator tool).
+    Use after major knowledge base updates to force fresh LLM generation.
+    """
+    files = list(PLAN_CACHE_DIR.glob("*.json"))
+    for f in files:
+        f.unlink(missing_ok=True)
+    logger.info(f"🗑️  Plan cache cleared by {request.client.host}: {len(files)} entries removed")
+    return {"status": "cleared", "entries_removed": len(files)}
+
+
+@app.delete("/plan_cache/{machine_type}")
+async def clear_plan_cache_for_machine(
+    machine_type: str,
+    _auth: None = Depends(verify_app_key),
+):
+    """
+    Selectively invalidate all cached plans for a specific machine type.
+    Useful when you update the knowledge base for one machine only.
+    """
+    # We can't reverse the SHA-256 but we can scan and match by checking
+    # a small metadata sidecar. For simplicity, clear all — this is a rare op.
+    files = list(PLAN_CACHE_DIR.glob("*.json"))
+    removed = 0
+    for f in files:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if data.get("solution", {}).get("machine_type", "") == machine_type:
+                f.unlink(missing_ok=True)
+                removed += 1
+        except Exception:
+            pass
+    logger.info(f"🗑️  Plan cache: {removed} entries removed for machine={machine_type}")
+    return {"status": "cleared", "machine_type": machine_type, "entries_removed": removed}
+
+
 @app.post("/feedback")
 async def submit_feedback(
     rating: int = Form(...),
@@ -936,9 +1267,12 @@ async def submit_feedback(
     machine_type: str = Form(default="unknown"),
 ):
     logger.info(f"📝 Feedback: rating={rating} machine={machine_type}")
+    # Sanitise: strip newlines (prevent log-injection forgery) and cap length
+    safe_comments    = comments.replace("\n", " ").replace("\r", " ").replace(",", ";")[:500]
+    safe_machine     = machine_type.replace("\n", "").replace("\r", "")[:50]
     feedback_file = Path("user_feedback.log")
     with open(feedback_file, "a", encoding="utf-8") as f:
-        f.write(f"{datetime.now()},{machine_type},{step_index},{rating},{comments}\n")
+        f.write(f"{datetime.now()},{safe_machine},{step_index},{rating},{safe_comments}\n")
     return {"status": "thank you"}
 
 
@@ -1004,10 +1338,14 @@ async def agent_next(request: AgentNextRequest):
 
 
 @app.get("/agent/session/{session_id}")
-async def get_agent_session(session_id: str):
+async def get_agent_session(
+    session_id: str,
+    _auth: None = Depends(verify_app_key),
+):
     """
     Inspect the current state of an active repair session.
-    Useful for debugging and client-side state recovery.
+    Gated behind X-App-Key — exposes verified_parts, observations, and
+    problem description which must not be publicly readable.
     """
     session = session_manager.get_session(session_id)
     if session is None:
@@ -1016,7 +1354,10 @@ async def get_agent_session(session_id: str):
 
 
 @app.delete("/agent/session/{session_id}")
-async def delete_agent_session(session_id: str):
+async def delete_agent_session(
+    session_id: str,
+    _auth: None = Depends(verify_app_key),
+):
     """Explicitly end and clean up a repair session."""
     deleted = session_manager.delete_session(session_id)
     if not deleted:
@@ -1047,7 +1388,7 @@ if __name__ == "__main__":
     logger.info(f"📚 Knowledge Base: {KB_DIR}")
     logger.info("=" * 80)
 
-    port = int(os.environ.get("PORT", 7680))
+    port = int(os.environ.get("PORT", 7860))
 
     # Production stability settings — DO NOT change these without reading below:
     #

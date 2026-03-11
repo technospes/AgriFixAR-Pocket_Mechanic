@@ -463,11 +463,9 @@ class KnowledgeBaseBuilder:
     def build_knowledge_base(self) -> bool:
         try:
             api_key = self.load_environment()
-
             logger.info("=== Starting Knowledge Base Build (Optimized) ===")
             logger.info(f"Knowledge dir : {self.knowledge_dir}")
             logger.info(f"DB dir        : {self.db_dir}")
-
             scan = self.scan_knowledge_directory()
             if not scan["all_files"]:
                 logger.error("No files found in knowledge directory!")

@@ -22,6 +22,7 @@ import logging
 import re
 
 import google.generativeai as genai
+from PIL import Image
 
 from utils.helpers import sanitize_json_text, generate_cache_key, get_cached_response, cache_response
 from utils.machine_registry import (
@@ -127,14 +128,38 @@ async def generate_diagnosis_with_gemini(
     language: str = "en",
     rag_context: str = "",
     knowledge_base: str = "",
+    visual_frames: list[bytes] | None = None,
 ) -> dict:
-    """Generate a step-by-step camera repair guide for any supported farm machine."""
-    logger.info(f"🧠 Diagnosis: {machine_type} — {problem_text[:60]}...")
+    """
+    Generate a step-by-step camera repair guide for any supported farm machine.
 
-    cache_key = generate_cache_key("diag", machine_type, problem_text, language)
+    When `visual_frames` is supplied (1–3 JPEG bytes, early/mid/late from CLIP)
+    the call is made as a multimodal Gemini request — all frames + text in one
+    call, no extra API charge.
+
+    Sending 3 frames instead of 1 gives Gemini temporal context:
+      • If all 3 show water flowing → machine is RUNNING, diagnose mechanical fault
+      • If frames 1-2 show motion but frame 3 is still → machine cut out mid-video
+      • If all 3 are stopped → machine is dead, check power/electrical
+
+    This directly fixes the transcription-mismatch problem (e.g. farmer says
+    "motor jammed" but Whisper heard "not working" — Gemini sees flowing water
+    and generates the correct mechanical-jam steps, not dead-power steps).
+    """
+    logger.info(f"🧠 Diagnosis: {machine_type} — {problem_text[:60]}..."
+                + (f" [multimodal {len(visual_frames)}-frame]" if visual_frames else " [text-only]"))
+
+    # visual_hash: phash of mid frame — ensures "pump dead" and "water flowing"
+    # never share a cached answer even when machine_type + text are identical.
+    # Folded into problem_text so generate_cache_key signature stays unchanged.
+    import hashlib as _hashlib
+    _mid = visual_frames[len(visual_frames) // 2] if visual_frames else None
+    _visual_hash = _hashlib.md5(_mid).hexdigest()[:8] if _mid else ""
+    _cache_problem = f"{problem_text}|vhash:{_visual_hash}"
+    cache_key = generate_cache_key("diag", machine_type, _cache_problem, language)
     cached = get_cached_response(cache_key)
     if cached:
-        logger.info("✅ Using cached diagnosis")
+        logger.info(f"✅ Using cached diagnosis [visual_hash={_visual_hash or 'none'}]")
         return cached
 
     rag_source = "RAG+Gemini" if rag_context else "Gemini-only"
@@ -162,21 +187,88 @@ async def generate_diagnosis_with_gemini(
     safety_en = get_safety_warnings(machine_type, "en")
     safety_en_compact = "; ".join(safety_en)  # single line vs multiline list
 
-    prompt = f"""You are an expert farm machinery mechanic writing a camera-guided repair walkthrough.
+    # ── Visual grounding block (only when frames are available) ──────────────
+    # Placed at the TOP of the prompt before all other context — Gemini anchors
+    # on visual truth first, then reads the (potentially noisy) transcript.
+    # 3 frames (early/mid/late) give temporal context CLIP already verified.
+    if visual_frames:
+        n = len(visual_frames)
+        frame_desc = "3 frames (early / mid / late)" if n == 3 else \
+                     "2 frames (early / late)" if n == 2 else "1 frame (mid)"
+        visual_block = f"""\
+VISUAL EVIDENCE — {frame_desc} from the farmer's video are attached to this message.
+CRITICAL INSTRUCTION: Study ALL attached images carefully BEFORE reading the transcript.
+
+TEMPORAL REASONING (use all {n} frame(s) together):
+  • All frames show machine RUNNING (water flowing / parts moving / lights on):
+      → Complaint is about PERFORMANCE or NOISE — NOT about the machine being dead.
+      → Do NOT generate steps to check power cables, breakers, or safety switches.
+  • Frames 1–2 show motion but last frame is stopped:
+      → Machine cut out mid-operation. Check thermal protection, overload, fuel.
+  • All frames show machine OFF/STOPPED (no water, no motion, no lights):
+      → Complaint is about FAILURE TO START — check power and electrical systems.
+  • IF THE TRANSCRIPT CONTRADICTS WHAT YOU SEE, TRUST THE IMAGES.
+      Example: transcript="not working", all frames show water flowing
+      → Diagnose a RUNNING machine with a mechanical fault (jam/noise/low pressure).
+      → NEVER generate dead-machine power-check steps in this case.
+
+"""
+    else:
+        visual_block = ""
+
+    prompt = f"""{visual_block}You are an expert farm machinery mechanic writing a camera-guided repair walkthrough.
 {electric_note}
 MACHINE: {machine_label} ({machine_type})
 KNOWLEDGE: {diag_ctx}
 SAFETY: {safety_kw}
 {ctx_block}
-PROBLEM: {problem_text}
+PROBLEM (farmer's transcript — may be imprecise due to accent/noise): {problem_text}
 
 {hi_note}{_LANG_RULES}
+
+DIAGNOSTIC REASONING & ACCURACY (CRITICAL):
+Before generating steps, analyze the problem and determine the most likely subsystem.
+Classify the issue into one of these categories:
+- electrical_starting
+- fuel_supply
+- engine_mechanical
+- cooling_system
+- transmission
+- hydraulic_system
+- sensor_or_electrical
+
+Write this classification and your mechanical reasoning in the "technical_analysis" field.
+Each step MUST directly help diagnose or fix the stated problem based on this reasoning.
+Do NOT include generic maintenance checks UNLESS directly related to the symptom.
+Prefer checking the most common mechanical failure points first. Order steps from easiest and safest to check → hardest.
+
+STEP TYPES (CRITICAL RULE):
+Choose the correct step_type for the physical reality of the task:
+1. "visual": Farmer must point the camera at a visible part. Choose parts that can be seen with a phone camera. Do not use internal engine components that require disassembly.
+2. "inspection": Physical check (e.g., pulling a belt, checking oil).
+3. "action": A manual task (e.g., cleaning a filter, turning a wrench). Farmer just taps Done.
+4. "observation": Listening/feeling (e.g., hearing a click, feeling heat).
+
+WORKFLOW LIMITS & STRUCTURE (STRICT):
+- Maximum 5 steps total.
+- STEP ID RULE: Use sequential step IDs: s1, s2, s3, s4, s5. Do not skip numbers.
+- Step 1 MUST ALWAYS be step_type "visual" to help the farmer locate the correct machine part.
+- At most 2 "inspection" steps.
+- At most 1 "observation" step.
+- The remaining steps must be "visual" or "action".
+- Ideal flow: visual (locate) -> inspection (check condition) -> action (fix) -> observation (confirm) -> action (finalise).
+
+ROUTING & OPTIONS:
+If step_type is "inspection" or "observation":
+- "question_en" is REQUIRED.
+- "options" MUST contain 2–4 items.
+Use "next_step" with a step_id to jump, or set "next_step": null for linear progression.
 
 Return ONLY this JSON (no markdown):
 {{
   "status": "success",
   "problem_description": "<1 plain sentence>",
-  "technical_analysis": "<2-3 sentences for mechanics>",
+  "technical_analysis": "<State subsystem category here, then 2-3 sentences of mechanical reasoning>",
   "solution": {{
     "status": "ready",
     "machine_type": "{machine_type}",
@@ -184,16 +276,28 @@ Return ONLY this JSON (no markdown):
     "problem_identified_hi": "<clear short title in Hindi>",
     "steps": [
       {{
+        "step_id": "s1",
+        "step_type": "<visual | inspection | action | observation>",
         "text": "<copy of text_en>",
-        "step_title_en": "<short action title (e.g., 'Inspect the clutch pedal')>",
+        "step_title_en": "<short action title>",
         "step_title_hi": "<same action title in simple Hindi>",
-        "text_en": "<3–4 sentences: WHERE part is + colour/shape/landmark | WHAT to do with hands | WHAT to see/hear when correct>",
-        "text_hi": "<same 3–4 sentences in simple village Hindi>",
-        "visual_cue": "<snake_case_part_id>",
-        "ar_model": "<part.obj>",
+        "text_en": "<3–4 sentences: WHERE part is + WHAT to do>",
+        "text_hi": "<same in simple village Hindi>",
+        "visual_cue": "<snake_case_part_id or null>",
+        "ar_model": "<part.obj or null>",
         "required_part": "<snake_case_part_id>",
         "area_hint": "<one of: {allowed}>",
-        "safety_warning": "<one plain sentence or null>"
+        "safety_warning": "<one plain sentence or null>",
+        "question_en": "<ONLY IF inspection/observation. e.g., 'What is the condition of the belt?'>",
+        "question_hi": "<Question in Hindi>",
+        "options": [
+          {{
+            "id": "a",
+            "label_en": "Looks fine",
+            "label_hi": "ठीक है",
+            "next_step": null
+          }}
+        ]
       }}
     ],
     "safety_warnings_en": {json.dumps(safety_en)},
@@ -204,10 +308,41 @@ Return ONLY this JSON (no markdown):
 PARTS (use as required_part): {parts_list}"""
 
     try:
+        import io as _io
+        import base64 as _base64
         model = genai.GenerativeModel(_GEMINI_MODEL)
-        response = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: model.generate_content(prompt)
-        )
+
+        # ── Build request: multimodal when frames are available ───────────────
+        # All 1–3 CLIP frames are sent as inline_data parts BEFORE the text
+        # prompt so Gemini anchors on visual truth first.
+        # Cost: ~258 vision tokens per 512×512 frame × up to 3 frames = ~774
+        # extra tokens per call (≈ $0.00009 at gemini-2.5-flash rates).
+        # Everything — all frames + full text prompt — is ONE generate_content()
+        # call. Zero extra API charges.
+        if visual_frames:
+            parts: list[dict] = []
+            for i, frame_bytes in enumerate(visual_frames):
+                frame_img = Image.open(_io.BytesIO(frame_bytes))
+                frame_img.thumbnail((512, 512), Image.LANCZOS)
+                buf = _io.BytesIO()
+                frame_img.save(buf, format="JPEG", quality=85)
+                label = ["early", "mid", "late"][i] if i < 3 else str(i)
+                parts.append({"inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": _base64.b64encode(buf.getvalue()).decode(),
+                }})
+                parts.append({"text": f"[Frame {i+1}/{len(visual_frames)} — {label}]"})
+            parts.append({"text": prompt})
+            content = [{"role": "user", "parts": parts}]
+            response = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: model.generate_content(content)
+            )
+            logger.info(f"🖼️  Diagnosis: MULTIMODAL call ({len(visual_frames)} CLIP frames + text)")
+        else:
+            response = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: model.generate_content(prompt)
+            )
+            logger.info("📝 Diagnosis: text-only call (no frames available)")
         json_text = sanitize_json_text(response.text)
         result = json.loads(json_text)
 
@@ -264,6 +399,19 @@ PARTS (use as required_part): {parts_list}"""
         result["machine_label"] = machine_label
         cache_response(cache_key, result)
         logger.info(f"✅ Diagnosis: {len(result['solution']['steps'])} steps [{rag_source}]")
+        # ---------------------------------------------------------
+        # 🟢 PURE DEBUG LOGGING (Zero impact on UI/UX)
+        # ---------------------------------------------------------
+        try:
+            formatted_steps = json.dumps(
+                result.get("solution", {}).get("steps", []), 
+                indent=2, 
+                ensure_ascii=False # Ensures Hindi characters print correctly in the terminal
+            )
+            logger.info(f"\n{'='*60}\n🤖 GENERATED STEPS LOG:\n{formatted_steps}\n{'='*60}")
+        except Exception as log_exc:
+            pass # If logging fails for any reason, fail silently. Never break the app!
+        # ---------------------------------------------------------
         return result
 
     except (json.JSONDecodeError, ValueError) as exc:

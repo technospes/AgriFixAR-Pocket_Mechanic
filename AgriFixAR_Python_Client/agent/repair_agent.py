@@ -44,8 +44,14 @@ SAFETY KEYWORDS: {safety_kw}
 
 PROBLEM: {problem_description}
 
-VERIFIED PARTS:
+VERIFIED PARTS (pass/fail/unclear):
 {verified_parts_json}
+
+WHAT THE CAMERA ACTUALLY SAW (Gemini's visual findings per part):
+{visual_observations}
+
+DIAGNOSIS PLAN — STEPS ALREADY GENERATED (do not repeat or skip any):
+{generated_steps_hint}
 
 LAST CAMERA RESULT:
 {last_verification_json}
@@ -75,6 +81,40 @@ Return ONLY this JSON:
     "diagnostic_path": ["<step_label>"]
   }}
 }}"""
+
+
+def _format_observations(session: RepairSession) -> str:
+    """Format verified_observations for the agent prompt.
+    Each line: PART_ID → what Gemini's camera actually saw.
+    Returns 'None yet.' when empty (first step of session).
+    """
+    if not session.verified_observations:
+        return "None yet."
+    return "\n".join(
+        f"  {part}: {obs}"
+        for part, obs in session.verified_observations.items()
+    )
+
+
+def _format_generated_steps(session: RepairSession) -> str:
+    """Format the diagnosis plan steps for the agent prompt.
+    Shows each step as 'sN: part_id (step_type)' so the agent knows
+    which parts were planned, in what order, and which have been done.
+    Returns 'Not linked to a diagnosis plan.' when empty.
+    """
+    if not session.generated_steps:
+        return "Not linked to a diagnosis plan."
+    done = set(session.verified_parts.keys())
+    lines = []
+    for entry in session.generated_steps:
+        # format: "s1:battery_terminal:visual"
+        parts = entry.split(":")
+        step_id   = parts[0] if len(parts) > 0 else "?"
+        part_id   = parts[1] if len(parts) > 1 else "?"
+        step_type = parts[2] if len(parts) > 2 else "?"
+        status = "✓ done" if part_id in done else "→ pending"
+        lines.append(f"  {step_id}: {part_id} ({step_type}) [{status}]")
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────
@@ -113,6 +153,8 @@ async def decide_next_step(
         safety_context       = safety_context,
         allowed_area_hints   = allowed_areas,
         known_parts          = known_parts,
+        visual_observations  = _format_observations(session),
+        generated_steps_hint = _format_generated_steps(session),
     )
 
     raw = await _call_gemini(prompt)
@@ -139,7 +181,7 @@ async def decide_next_step(
 # ─────────────────────────────────────────────
 
 def _apply_verification(session: RepairSession, verification: dict) -> None:
-    """Merge /verify_step result into session.verified_parts."""
+    """Merge /verify_step result into session.verified_parts and verified_observations."""
     part = (
         verification.get("required_part")
         or verification.get("correct_part")
@@ -159,6 +201,15 @@ def _apply_verification(session: RepairSession, verification: dict) -> None:
     else:
         session.verified_parts[part] = "unclear"
         logger.info(f"❓ [{session.machine_type}] unclear: {part} (conf={conf:.2f})")
+
+    # Store Gemini's actual visual finding — richer than just "ok"/"damaged".
+    # e.g. "white powder visible on both clamps — corrosion confirmed"
+    # This flows into the agent prompt so the next step reasons from what
+    # the camera actually saw, not just a pass/fail label.
+    obs = (verification.get("ai_observation") or "").strip()
+    if obs and obs.lower() not in ("", "none", "null"):
+        session.verified_observations[part] = obs
+        logger.info(f"👁️  [{session.machine_type}] observation stored: {part} → {obs[:80]}")
 
 
 def _build_safety_context(session: RepairSession) -> str:

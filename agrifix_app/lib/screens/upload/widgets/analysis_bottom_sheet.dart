@@ -16,6 +16,7 @@ Future<void> showAnalysisSheet(
   required Future<void> Function(
     void Function(int stepIndex) markActive,
     void Function(int stepIndex) markDone,
+    void Function() markCacheHit,          // ← NEW: triggers instant flash
   ) runAnalysis,
   required VoidCallback onCompleted,
 }) async {
@@ -38,6 +39,7 @@ class _AnalysisSheetWithOverlay extends StatelessWidget {
   final Future<void> Function(
     void Function(int) markActive,
     void Function(int) markDone,
+    void Function()    markCacheHit,
   ) runAnalysis;
   final VoidCallback onCompleted;
 
@@ -71,6 +73,7 @@ class _AnalysisSheet extends StatefulWidget {
   final Future<void> Function(
     void Function(int) markActive,
     void Function(int) markDone,
+    void Function()    markCacheHit,
   ) runAnalysis;
   final VoidCallback onCompleted;
 
@@ -100,8 +103,9 @@ class _AnalysisSheetState extends State<_AnalysisSheet>
 
   double _progress = 0.0;
   bool   _hasError = false;
+  bool   _cacheHit = false;   // true when stage-3 served from plan cache
 
-  int _doneCount    = 0;   
+  int _doneCount    = 0;
   // int _displayHead  = 0;   
 
   @override
@@ -128,7 +132,7 @@ class _AnalysisSheetState extends State<_AnalysisSheet>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _activateVisualRow(0);
 
-      widget.runAnalysis(_onBackendStageStart, _onBackendStageDone)
+      widget.runAnalysis(_onBackendStageStart, _onBackendStageDone, _onCacheHit)
           .catchError((error) {
         if (!mounted) return;
         for (final c in _spinControllers) c.stop();
@@ -146,6 +150,21 @@ class _AnalysisSheetState extends State<_AnalysisSheet>
 
   void _onBackendStageStart(int backendIndex) {
     // No-op
+  }
+
+  /// Called when the server returns cache_hit: true on stage-3.
+  /// Instantly completes all remaining steps with a brief flash delay
+  /// so the farmer sees the checklist complete quickly (feels snappy, not broken).
+  void _onCacheHit() {
+    if (!mounted) return;
+    setState(() => _cacheHit = true);
+    // Complete all pending steps with a short stagger
+    for (int i = _doneCount; i < _steps.length; i++) {
+      final delay = Duration(milliseconds: 80 * (i - _doneCount + 1));
+      Future.delayed(delay, () {
+        if (mounted) _onBackendStageDone(i);
+      });
+    }
   }
 
   void _onBackendStageDone(int backendIndex) {
@@ -231,6 +250,26 @@ class _AnalysisSheetState extends State<_AnalysisSheet>
             ),
           ),
           const SizedBox(height: 8),
+          if (_cacheHit)
+            Container(
+              margin: const EdgeInsets.only(bottom: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+              decoration: BoxDecoration(
+                color: const Color(0xFFE6F6EC),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.bolt_rounded, size: 14, color: Color(0xFF22C55E)),
+                  SizedBox(width: 4),
+                  Text('Instant — Cached Plan',
+                    style: TextStyle(
+                      fontSize: 12, fontWeight: FontWeight.w600,
+                      color: Color(0xFF22C55E))),
+                ],
+              ),
+            ),
           const Text(
             'This takes about 15–30 seconds. Please keep the app open.',
             textAlign: TextAlign.center,

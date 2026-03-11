@@ -69,6 +69,9 @@ class _ARGuideScreenState extends State<ARGuideScreen>
   _ToastKind _toastKind     = _ToastKind.analyzing;
   String     _dangerMessage = '';
   String     _dynamicFeedback = '';
+
+  // ── Inspection / action panel state ──────────────────────────────────────
+  bool   _inspectionPanelVisible = false;
   final FlutterTts _tts = FlutterTts();
   CameraController? _cameraController;
   bool _cameraReady      = false;
@@ -263,6 +266,15 @@ class _ARGuideScreenState extends State<ARGuideScreen>
     if (_arState != _ARState.scanning) return;
     if (!_cameraReady || _cameraController == null) return;
 
+    // Non-visual steps use the inspection / action panel, not the camera
+    final prov  = context.read<DiagnosisProvider>();
+    final steps = prov.solution?.steps ?? _demoSteps;
+    final step  = _currentStep < steps.length ? steps[_currentStep] : null;
+    if (step != null && (step.requiresDecisionPanel || step.isActionStep)) {
+      setState(() => _inspectionPanelVisible = true);
+      return;
+    }
+
     HapticFeedback.mediumImpact();
     _attemptCount++;
     await _pauseCamera();
@@ -280,9 +292,6 @@ class _ARGuideScreenState extends State<ARGuideScreen>
 
     await _showToast(_ToastKind.sent);
 
-    final prov     = context.read<DiagnosisProvider>();
-    final steps    = prov.solution?.steps ?? _demoSteps;
-    final step     = _currentStep < steps.length ? steps[_currentStep] : null;
     final stepText = step?.textEn.isNotEmpty == true
         ? step!.textEn : step?.text ?? '';
     final machine  = prov.solution?.machineType ?? 'tractor';
@@ -371,9 +380,96 @@ class _ARGuideScreenState extends State<ARGuideScreen>
       _attemptCount   = 0;
       _panelExpanded  = false;
       _dynamicFeedback = '';
+      _inspectionPanelVisible = false;
     });
-    _attemptResults.clear();  // reset visual memory for the new step
+    _attemptResults.clear();
     _verifiedCtrl.reset();
+
+    // Auto-show inspection panel for the new step if it requires one
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final prov  = context.read<DiagnosisProvider>();
+      final steps = prov.solution?.steps ?? _demoSteps;
+      if (_currentStep < steps.length) {
+        final s = steps[_currentStep];
+        if (s.requiresDecisionPanel || s.isActionStep) {
+          setState(() => _inspectionPanelVisible = true);
+        }
+      }
+    });
+  }
+
+  // ── Inspection / observation panel ───────────────────────────────────────
+
+  /// Farmer tapped an answer button in the inspection panel.
+  void _onInspectionAnswer(StepOption option, List<StepData> steps) {
+    HapticFeedback.mediumImpact();
+
+    // Record the answer in attempt history (same structure as visual attempts)
+    _attemptResults.add({
+      'attempt_count': 1,
+      'status':        'answered',
+      'detected_part': option.id,
+      'feedback':      option.labelEn,
+    });
+
+    setState(() {
+      _inspectionPanelVisible = false;
+    });
+
+    // Route to next_step if provided, otherwise advance linearly
+    if (option.nextStep.isNotEmpty) {
+      final prov = context.read<DiagnosisProvider>();
+      final targetIdx = prov.solution?.indexOfStepId(option.nextStep) ?? -1;
+      if (targetIdx >= 0 && targetIdx < steps.length) {
+        // Jump to the routed step
+        Future.delayed(const Duration(milliseconds: 300), () {
+          if (!mounted) return;
+          setState(() {
+            _currentStep            = targetIdx;
+            _arState                = _ARState.scanning;
+            _attemptCount           = 0;
+            _panelExpanded          = false;
+            _dynamicFeedback        = '';
+            _inspectionPanelVisible = false;
+          });
+          _attemptResults.clear();
+          _verifiedCtrl.reset();
+          // Auto-show panel if next step is also inspection
+          final nextS = steps[targetIdx];
+          if (nextS.requiresDecisionPanel || nextS.isActionStep) {
+            setState(() => _inspectionPanelVisible = true);
+          }
+        });
+        return;
+      }
+    }
+
+    // Linear advance — mark this step as verified and show Next Part button
+    Future.delayed(const Duration(milliseconds: 300), () {
+      if (!mounted) return;
+      _transitionTo(_ARState.verified);
+      HapticFeedback.heavyImpact();
+    });
+  }
+
+  /// Farmer tapped "Done" on an action step.
+  void _onActionDone() {
+    HapticFeedback.heavyImpact();
+    setState(() => _inspectionPanelVisible = false);
+    _transitionTo(_ARState.verified);
+  }
+
+  /// Expose inspection panel when entering a non-visual step.
+  void _maybeShowInspectionPanel(StepData? step) {
+    if (step == null) return;
+    if ((step.requiresDecisionPanel || step.isActionStep) &&
+        !_inspectionPanelVisible &&
+        _arState == _ARState.scanning) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) setState(() => _inspectionPanelVisible = true);
+      });
+    }
   }
 
   @override
@@ -388,6 +484,9 @@ class _ARGuideScreenState extends State<ARGuideScreen>
     final screenW  = MediaQuery.of(context).size.width;
     final safePad  = MediaQuery.of(context).padding;
     final isHindi  = context.watch<LanguageProvider>().languageCode == 'hi';
+
+    // Auto-trigger panel for non-visual steps on first render
+    _maybeShowInspectionPanel(step);
 
     // Compute the scan-box rect so the blur cut-out aligns with the painted box.
     final viewportH    = screenH - _kPanelHeight - safePad.top;
@@ -527,6 +626,20 @@ class _ARGuideScreenState extends State<ARGuideScreen>
                     await _resumeCamera();
                     _transitionTo(_ARState.scanning);
                   },
+                ),
+              ),
+
+            // 11. Inspection / action / observation panel
+            //     Slides up from the bottom on non-visual steps.
+            if (_inspectionPanelVisible && step != null)
+              Positioned(
+                left: 0, right: 0, bottom: 0,
+                child: _InspectionPanel(
+                  step:       step,
+                  isHindi:    isHindi,
+                  onAnswer:   (opt) => _onInspectionAnswer(opt, steps),
+                  onDone:     _onActionDone,
+                  onDismiss:  () => setState(() => _inspectionPanelVisible = false),
                 ),
               ),
           ],
@@ -1307,86 +1420,70 @@ class _BottomPanel extends StatelessWidget {
                 ),
               ),
 
-              Row(children: [
-                _StepBadge(stepIndex: stepIndex, verified: isVerified),
-                const SizedBox(width: 10),
-                if (!isVerified)
-                  Flexible(
-                    child: Text(
-                      (step?.visualCue ?? 'COMPONENT')
-                          .toUpperCase().replaceAll('_', ' '),
+              // ── When AI returns fail/unclear: replace the step header with
+              //    a full-width AI correction alert. The "STEP N · PART NAME"
+              //    row is hidden — the farmer's immediate next action is what
+              //    matters, not the step label they already read.
+              //    When verified or scanning: show the normal badge + heading.
+              if (arState == _ARState.unclear && feedbackMsg.isNotEmpty) ...[
+                // ── AI Correction Alert ──────────────────────────────────────
+                _AIFeedbackAlert(
+                  feedbackMsg: feedbackMsg,
+                  stepIndex:   stepIndex,
+                  step:        step,
+                  isHindi:     isHindi,
+                ),
+              ] else ...[
+                // ── Normal: badge + component label ─────────────────────────
+                Row(children: [
+                  _StepBadge(stepIndex: stepIndex, verified: isVerified),
+                  const SizedBox(width: 10),
+                  if (!isVerified)
+                    Flexible(
+                      child: Text(
+                        (step?.visualCue ?? 'COMPONENT')
+                            .toUpperCase().replaceAll('_', ' '),
+                        style: GoogleFonts.inter(
+                          fontSize: 12, fontWeight: FontWeight.w600,
+                          letterSpacing: 1.0, color: _C.textMuted),
+                      ),
+                    )
+                  else ...[
+                    Text(isHindi ? 'चरण ${stepIndex + 1}: पूर्ण' : 'STEP ${stepIndex + 1}: COMPLETE',
+                      style: GoogleFonts.inter(
+                        fontSize: 12, fontWeight: FontWeight.w700,
+                        letterSpacing: 0.8, color: _C.primary)),
+                    const Spacer(),
+                    if (total > 0)
+                      Text('${stepIndex + 1} / $total',
+                        style: GoogleFonts.inter(
+                          fontSize: 12, color: _C.textMuted)),
+                  ],
+                ]),
+
+                const SizedBox(height: 10),
+
+                if (isVerified) ...[
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: _C.primary.withOpacity(0.14),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(
+                          color: _C.primary.withOpacity(0.30), width: 1)),
+                    child: Text(isHindi ? 'घटक सत्यापित — कोई क्षति नहीं' : 'Component Verified — No Damage Detected',
                       style: GoogleFonts.inter(
                         fontSize: 12, fontWeight: FontWeight.w600,
-                        letterSpacing: 1.0, color: _C.textMuted),
-                    ),
-                  )
-                else ...[
-                  Text(isHindi ? 'चरण ${stepIndex + 1}: पूर्ण' : 'STEP ${stepIndex + 1}: COMPLETE',
-                    style: GoogleFonts.inter(
-                      fontSize: 12, fontWeight: FontWeight.w700,
-                      letterSpacing: 0.8, color: _C.primary)),
-                  const Spacer(),
-                  if (total > 0)
-                    Text('${stepIndex + 1} / $total',
-                      style: GoogleFonts.inter(
-                        fontSize: 12, color: _C.textMuted)),
-                ],
-              ]),
-
-              const SizedBox(height: 10),
-
-              if (isVerified) ...[
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 12, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: _C.primary.withOpacity(0.14),
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(
-                        color: _C.primary.withOpacity(0.30), width: 1)),
-                  child: Text(isHindi ? 'घटक सत्यापित — कोई क्षति नहीं' : 'Component Verified — No Damage Detected',
-                    style: GoogleFonts.inter(
-                      fontSize: 12, fontWeight: FontWeight.w600,
-                      color: _C.primary)),
-                ),
-                const SizedBox(height: 10),
-              ],
-
-              GestureDetector(
-                onTap: onToggle,
-                child: _InstructionHeading(
-                  step: step, nextStep: nextStep, verified: isVerified),
-              ),
-
-              if (arState == _ARState.unclear) ...[
-                const SizedBox(height: 10),
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 12, vertical: 10),
-                  decoration: BoxDecoration(
-                    color: _C.warning.withOpacity(0.12),
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(
-                        color: _C.warning.withOpacity(0.40), width: 1)),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Padding(
-                        padding: EdgeInsets.only(top: 2),
-                        child: Icon(Icons.photo_camera_rounded,
-                            color: _C.warning, size: 16)),
-                      const SizedBox(width: 8),
-                      Expanded(child: Text(
-                        feedbackMsg.isNotEmpty
-                            ? feedbackMsg
-                            : (isHindi
-                                ? 'फोन स्थिर रखें और भाग फ्रेम में आए, फिर विश्लेषण करें।'
-                                : 'Hold your phone steady and ensure the part fills the frame, then tap Analyze again.'),
-                        style: GoogleFonts.inter(
-                          fontSize: 13, fontWeight: FontWeight.w500,
-                          color: _C.warning, height: 1.45))),
-                    ],
+                        color: _C.primary)),
                   ),
+                  const SizedBox(height: 10),
+                ],
+
+                GestureDetector(
+                  onTap: onToggle,
+                  child: _InstructionHeading(
+                    step: step, nextStep: nextStep, verified: isVerified),
                 ),
               ],
 
@@ -1501,6 +1598,151 @@ class _DangerPanel extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// AI Feedback Alert — replaces the step heading when state is unclear/fail.
+//
+// The backend sends feedback as two lines separated by \n:
+//   Line 1: what the farmer did wrong   (shown as bold header)
+//   Line 2: the exact action to perform (shown as the instruction body)
+//
+// When only one line is returned, it fills the full body with no sub-header.
+// ─────────────────────────────────────────────────────────────────────────
+class _AIFeedbackAlert extends StatelessWidget {
+  final String    feedbackMsg;
+  final int       stepIndex;
+  final StepData? step;
+  final bool      isHindi;
+
+  const _AIFeedbackAlert({
+    required this.feedbackMsg,
+    required this.stepIndex,
+    this.step,
+    required this.isHindi,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final lines   = feedbackMsg.split('\n').where((l) => l.trim().isNotEmpty).toList();
+    final problem = lines.isNotEmpty ? lines.first.trim() : '';
+    final action  = lines.length > 1  ? lines.sublist(1).join(' ').trim() : '';
+
+    // Original step goal — shown as a muted reminder at the bottom of the alert
+    // so the farmer never loses track of what they were supposed to do.
+    final goalLabel = step?.visualCue?.toUpperCase().replaceAll('_', ' ') ?? '';
+    final goalText  = step != null ? step!.getLocalizedText(isHindi) : '';
+
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color:        _C.warning.withOpacity(0.10),
+        borderRadius: BorderRadius.circular(16),
+        border:       Border.all(color: _C.warning.withOpacity(0.45), width: 1.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // ── Header bar ───────────────────────────────────────────────────
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            decoration: BoxDecoration(
+              color: _C.warning.withOpacity(0.14),
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(14)),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.warning_amber_rounded, color: _C.warning, size: 16),
+                const SizedBox(width: 8),
+                Text(
+                  isHindi
+                      ? 'चरण ${stepIndex + 1} — सुधार'
+                      : 'STEP ${stepIndex + 1} — CORRECTION',
+                  style: GoogleFonts.inter(
+                    fontSize: 11, fontWeight: FontWeight.w700,
+                    letterSpacing: 0.9, color: _C.warning),
+                ),
+              ],
+            ),
+          ),
+
+          // ── Line 1: what went wrong ──────────────────────────────────────
+          if (problem.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 12, 14, 0),
+              child: Text(problem,
+                style: GoogleFonts.inter(
+                  fontSize: 15, fontWeight: FontWeight.w700,
+                  color: _C.textPrimary, height: 1.35)),
+            ),
+
+          // ── Line 2: exact action to take ────────────────────────────────
+          if (action.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 6, 14, 0),
+              child: Text(action,
+                style: GoogleFonts.inter(
+                  fontSize: 14, fontWeight: FontWeight.w500,
+                  color: _C.textSoft, height: 1.5)),
+            ),
+
+          // ── Divider ──────────────────────────────────────────────────────
+          if (goalText.isNotEmpty) ...[
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 12, 14, 0),
+              child: Divider(
+                color: Colors.white.withOpacity(0.08), height: 1),
+            ),
+
+            // ── Original goal reminder ────────────────────────────────────
+            // Muted so it doesn't compete with the correction, but always
+            // visible so the farmer remembers what they were trying to find.
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.my_location_rounded,
+                      color: _C.textMuted.withOpacity(0.55), size: 13),
+                  const SizedBox(width: 7),
+                  Expanded(
+                    child: RichText(
+                      text: TextSpan(
+                        style: GoogleFonts.inter(
+                          fontSize: 12, color: _C.textMuted,
+                          height: 1.45),
+                        children: [
+                          if (goalLabel.isNotEmpty) ...[
+                            TextSpan(
+                              text: '$goalLabel  ',
+                              style: GoogleFonts.inter(
+                                fontSize: 11, fontWeight: FontWeight.w700,
+                                letterSpacing: 0.7,
+                                color: _C.textMuted.withOpacity(0.70)),
+                            ),
+                          ],
+                          TextSpan(
+                            text: goalText,
+                            style: GoogleFonts.inter(
+                              fontSize: 12,
+                              color: _C.textMuted.withOpacity(0.65),
+                              height: 1.45),
+                          ),
+                        ],
+                      ),
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ] else
+            const SizedBox(height: 14),
+        ],
       ),
     );
   }
@@ -1635,11 +1877,294 @@ class _ProgressBar extends StatelessWidget {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Inspection / Action / Observation Panel
+//
+// Slides up from the bottom whenever step_type is:
+//   • inspection  — question + answer buttons
+//   • action      — instruction + Done button
+//   • observation — symptom buttons
+//
+// The farmer never has to type anything. Buttons are large (min 56dp)
+// with destructive answers coloured amber/red.
+// ─────────────────────────────────────────────────────────────────────────
+class _InspectionPanel extends StatefulWidget {
+  final StepData  step;
+  final bool      isHindi;
+  final void Function(StepOption) onAnswer;
+  final VoidCallback               onDone;
+  final VoidCallback               onDismiss;
+
+  const _InspectionPanel({
+    required this.step,
+    required this.isHindi,
+    required this.onAnswer,
+    required this.onDone,
+    required this.onDismiss,
+  });
+
+  @override
+  State<_InspectionPanel> createState() => _InspectionPanelState();
+}
+
+class _InspectionPanelState extends State<_InspectionPanel>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _slideCtrl;
+  late final Animation<Offset>   _slideAnim;
+
+  @override
+  void initState() {
+    super.initState();
+    _slideCtrl = AnimationController(
+      vsync: this, duration: const Duration(milliseconds: 360));
+    _slideAnim = Tween<Offset>(
+      begin: const Offset(0, 1), end: Offset.zero,
+    ).animate(CurvedAnimation(parent: _slideCtrl, curve: Curves.easeOutCubic));
+    _slideCtrl.forward();
+  }
+
+  @override
+  void dispose() {
+    _slideCtrl.dispose();
+    super.dispose();
+  }
+
+  // Colour tinting: destructive answers get amber/red background
+  static Color _optionBg(String id, int idx) {
+    // Convention: 'c' or last option is often "significant damage" → red tint
+    if (id == 'c') return const Color(0x22FF4B4B);
+    if (idx == 0)  return const Color(0x1A34D399); // first = positive → green
+    return const Color(0x14FFFFFF);
+  }
+  static Color _optionBorder(String id, int idx) {
+    if (id == 'c') return const Color(0x60FF4B4B);
+    if (idx == 0)  return const Color(0x5034D399);
+    return const Color(0x30FFFFFF);
+  }
+  static Color _optionText(String id, int idx) {
+    if (id == 'c') return const Color(0xFFFF7070);
+    if (idx == 0)  return const Color(0xFF34D399);
+    return const Color(0xFFEAEAEA);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final step    = widget.step;
+    final isHindi = widget.isHindi;
+    final isAction = step.isActionStep;
+
+    // Step type icon + label
+    final (typeIcon, typeLabel) = switch (step.stepType) {
+      StepType.inspection  => (Icons.touch_app_rounded,        isHindi ? 'निरीक्षण'    : 'INSPECTION'),
+      StepType.action      => (Icons.build_rounded,             isHindi ? 'कार्य'        : 'ACTION'),
+      StepType.observation => (Icons.hearing_rounded,           isHindi ? 'अवलोकन'     : 'OBSERVATION'),
+      _                    => (Icons.camera_alt_rounded,        isHindi ? 'दृश्य'        : 'VISUAL'),
+    };
+
+    return SlideTransition(
+      position: _slideAnim,
+      child: Container(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(context).size.height * 0.72,
+        ),
+        decoration: BoxDecoration(
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+          gradient: const LinearGradient(
+            begin: Alignment.topCenter, end: Alignment.bottomCenter,
+            colors: [Color(0xFF1E1E1E), Color(0xFF111111)],
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.70),
+              blurRadius: 40, offset: const Offset(0, -10)),
+          ],
+        ),
+        child: SafeArea(
+          top: false,
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // ── Drag handle ─────────────────────────────────────────
+                Center(
+                  child: Container(
+                    width: 36, height: 4,
+                    margin: const EdgeInsets.symmetric(vertical: 14),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.16),
+                      borderRadius: BorderRadius.circular(2)),
+                  ),
+                ),
+
+                // ── Step type badge ─────────────────────────────────────
+                Row(children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF2A2A2A),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(
+                        color: Colors.white.withOpacity(0.12), width: 1)),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(typeIcon, size: 13, color: _C.gold),
+                        const SizedBox(width: 5),
+                        Text(typeLabel,
+                          style: GoogleFonts.inter(
+                            fontSize: 11, fontWeight: FontWeight.w700,
+                            letterSpacing: 0.8, color: _C.gold)),
+                      ],
+                    ),
+                  ),
+                  const Spacer(),
+                  // Dismiss — only for non-action steps (action must be confirmed)
+                  if (!isAction)
+                    GestureDetector(
+                      onTap: widget.onDismiss,
+                      child: Container(
+                        width: 32, height: 32,
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.06),
+                          shape: BoxShape.circle),
+                        child: const Icon(Icons.close_rounded,
+                            color: _C.textMuted, size: 16)),
+                    ),
+                ]),
+
+                const SizedBox(height: 14),
+
+                // ── Step instruction ────────────────────────────────────
+                Text(step.getLocalizedText(isHindi),
+                  style: GoogleFonts.inter(
+                    fontSize: 15, color: _C.textSoft,
+                    fontWeight: FontWeight.w500, height: 1.5)),
+
+                // ── Safety warning ──────────────────────────────────────
+                if (step.safetyWarning != null) ...[
+                  const SizedBox(height: 10),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: _C.warning.withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                          color: _C.warning.withOpacity(0.35), width: 1)),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Padding(
+                          padding: EdgeInsets.only(top: 2),
+                          child: Icon(Icons.warning_amber_rounded,
+                              color: _C.warning, size: 15)),
+                        const SizedBox(width: 8),
+                        Expanded(child: Text(step.safetyWarning!,
+                          style: GoogleFonts.inter(
+                            fontSize: 12, color: _C.warning,
+                            fontWeight: FontWeight.w500, height: 1.4))),
+                      ],
+                    ),
+                  ),
+                ],
+
+                const SizedBox(height: 16),
+
+                if (isAction) ...[
+                  // ── Action step: single Done button ─────────────────
+                  _PanelButton(
+                    label:    isHindi ? '✓  कार्य पूर्ण हुआ' : '✓  Action Done',
+                    bgColor:  const Color(0x1A34D399),
+                    border:   const Color(0x5034D399),
+                    text:     const Color(0xFF34D399),
+                    onTap:    widget.onDone,
+                  ),
+                ] else ...[
+                  // ── Inspection / observation: question + answer buttons
+                  if (step.getLocalizedQuestion(isHindi) != null) ...[
+                    Text(step.getLocalizedQuestion(isHindi)!,
+                      style: GoogleFonts.inter(
+                        fontSize: 16, fontWeight: FontWeight.w700,
+                        color: _C.textPrimary, height: 1.3)),
+                    const SizedBox(height: 12),
+                  ],
+
+                  ...List.generate(step.options.length, (i) {
+                    final opt = step.options[i];
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: _PanelButton(
+                        label:   opt.getLocalizedLabel(isHindi),
+                        bgColor: _optionBg(opt.id, i),
+                        border:  _optionBorder(opt.id, i),
+                        text:    _optionText(opt.id, i),
+                        onTap:   () => widget.onAnswer(opt),
+                      ),
+                    );
+                  }),
+                ],
+
+                const SizedBox(height: 4),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PanelButton extends StatefulWidget {
+  final String label;
+  final Color bgColor, border, text;
+  final VoidCallback onTap;
+  const _PanelButton({
+    required this.label, required this.bgColor,
+    required this.border, required this.text, required this.onTap});
+  @override
+  State<_PanelButton> createState() => _PanelButtonState();
+}
+class _PanelButtonState extends State<_PanelButton> {
+  bool _pressed = false;
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTapDown:   (_) => setState(() => _pressed = true),
+      onTapUp:     (_) { setState(() => _pressed = false); widget.onTap(); },
+      onTapCancel: () => setState(() => _pressed = false),
+      child: AnimatedScale(
+        scale: _pressed ? 0.97 : 1.0,
+        duration: const Duration(milliseconds: 80),
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+          decoration: BoxDecoration(
+            color: widget.bgColor,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: widget.border, width: 1.2)),
+          child: Text(widget.label,
+            textAlign: TextAlign.center,
+            style: GoogleFonts.inter(
+              fontSize: 15, fontWeight: FontWeight.w600,
+              color: widget.text, height: 1.3)),
+        ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Demo steps fallback
 // ─────────────────────────────────────────────────────────────────────────
 final _demoSteps = List.generate(12, (i) => StepData(
-  stepTitleEn: 'Step ${i + 1}',   // <-- ADDED
-  stepTitleHi: 'चरण ${i + 1}',      // <-- ADDED
+  stepId:      's${i + 1}',
+  stepType:    i == 2 ? StepType.inspection
+             : i == 6 ? StepType.action
+             : i == 9 ? StepType.observation
+             : StepType.visual,
+  stepTitleEn: 'Step ${i + 1}',
+  stepTitleHi: 'चरण ${i + 1}',
   text:      'Inspect component ${i + 1} carefully before proceeding.',
   textEn:    'Inspect component ${i + 1} carefully before proceeding.',
   textHi:    '',
@@ -1647,4 +2172,12 @@ final _demoSteps = List.generate(12, (i) => StepData(
            : i == 4 ? 'fuse_box'
            : i == 5 ? 'battery_terminal'
            : null,
+  questionEn: i == 2 ? 'What is the condition of the component?' : null,
+  questionHi: i == 2 ? 'घटक की क्या स्थिति है?' : null,
+  options: i == 2 ? [
+    StepOption(id: 'a', labelEn: 'No damage visible',   labelHi: 'कोई क्षति नहीं', nextStep: 's4'),
+    StepOption(id: 'b', labelEn: 'Minor damage',         labelHi: 'मामूली क्षति',   nextStep: 's4'),
+    StepOption(id: 'c', labelEn: 'Significant damage',   labelHi: 'गंभीर क्षति',    nextStep: 's_replace'),
+    StepOption(id: 'd', labelEn: 'Haven\'t checked yet', labelHi: 'अभी नहीं देखा', nextStep: 's3'),
+  ] : [],
 ));

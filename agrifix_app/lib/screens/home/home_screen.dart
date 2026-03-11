@@ -92,6 +92,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   // ── Layer 1: Background ───────────────────────────────────────────────────
 
+// ── Layer 1: Background ───────────────────────────────────────────────────
+
   Widget _buildBackground() {
     if (_videoError || !_videoReady) {
       return Container(
@@ -105,13 +107,33 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       );
     }
     return SizedBox.expand(
-      child: FittedBox(
-        fit: BoxFit.cover,
-        child: SizedBox(
-          width:  _videoController.value.size.width,
-          height: _videoController.value.size.height,
-          child: VideoPlayer(_videoController),
-        ),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          // The actual video
+          FittedBox(
+            fit: BoxFit.cover,
+            child: SizedBox(
+              width:  _videoController.value.size.width,
+              height: _videoController.value.size.height,
+              child: VideoPlayer(_videoController),
+            ),
+          ),
+          // 👇 NEW: A subtle dark overlay over the video to make text readable
+          Container(
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: 0.25), // 25% overall darkness
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.center,
+                colors: [
+                  Colors.black.withValues(alpha: 0.65), // Darker at the top where the text is
+                  Colors.transparent,
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -139,7 +161,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             .fadeIn(duration: 600.ms, delay: 200.ms)
             .slideY(begin: -0.3, end: 0, curve: Curves.easeOutCubic),
 
-            const SizedBox(height: 64),
+            const SizedBox(height: 24),
 
             _LogoAndHeadline(
               headline: l10n?.homeHeadline ??
@@ -301,28 +323,29 @@ class _LogoAndHeadline extends StatelessWidget {
   Widget build(BuildContext context) {
     return Column(
       children: [
-        Container(
-          width: AppSpacing.logoSize,
-          height: AppSpacing.logoSize,
-          decoration: BoxDecoration(
-            color: AppColors.primaryGreen,
-            borderRadius:
-                BorderRadius.circular(AppSpacing.logoRadius),
-            boxShadow: [
+        // Removed the green background container entirely
+        // SizedBox(
+        //   width: AppSpacing.logoSize + 40, // Made slightly bigger for visibility
+        //   height: AppSpacing.logoSize + 40,
+        //   child: Image.asset(
+        //     'assets/images/app_icon.png', 
+        //     fit: BoxFit.contain, // Ensures the whole PNG fits without clipping
+        //   ),
+        // ),
+        const SizedBox(height: AppSpacing.md),
+        Text(
+          headline,
+          style: AppTextStyles.headline.copyWith(
+            shadows: [
               BoxShadow(
-                color: AppColors.primaryGreen.withValues(alpha: 0.45),
-                blurRadius: 28,
-                offset: const Offset(0, 10),
+                color: Colors.black.withValues(alpha: 0.7),
+                offset: const Offset(0, 2),
+                blurRadius: 6,
               ),
             ],
           ),
-          child: const Icon(Icons.bolt_rounded,
-              color: Colors.white, size: 34),
+          textAlign: TextAlign.center,
         ),
-        const SizedBox(height: AppSpacing.md),
-        Text(headline,
-            style: AppTextStyles.headline,
-            textAlign: TextAlign.center),
       ],
     );
   }

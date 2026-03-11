@@ -253,7 +253,7 @@ class _UploadScreenState extends State<UploadScreen>
 
     await showAnalysisSheet(
       context,
-      runAnalysis: (markActive, markDone) async {
+      runAnalysis: (markActive, markDone, markCacheHit) async {
         final result = await ApiService.uploadAndDiagnoseStreaming(
           videoPath: _videoPath!,
           audioPath: _audioPath!,
@@ -261,7 +261,11 @@ class _UploadScreenState extends State<UploadScreen>
           onStageComplete: (stageIndex, data) {
             markDone(stageIndex);
             if (stageIndex == 3 && data.containsKey('result')) {
-              diagProv.setDiagnosis(data['result'] as Map<String, dynamic>);
+              final res = data['result'] as Map<String, dynamic>;
+              if (data['cache_hit'] == true || res['cache_hit'] == true) {
+                markCacheHit();
+              }
+              diagProv.setDiagnosis(res);
             }
           },
         );

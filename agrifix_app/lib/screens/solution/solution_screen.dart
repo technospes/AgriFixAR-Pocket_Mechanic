@@ -297,7 +297,8 @@ class _SolutionScreenState extends State<SolutionScreen>
 
                   const SizedBox(height: 20),
 
-                  _SolutionCard(problem: problem, isHindi: isHindi)
+                  _SolutionCard(problem: problem, isHindi: isHindi,
+                      cacheHit: prov.solution?.cacheHit ?? false)
                       .animate()
                       .fadeIn(duration: 380.ms, delay: 80.ms)
                       .slideY(begin: 0.06, end: 0,
@@ -318,6 +319,7 @@ class _SolutionScreenState extends State<SolutionScreen>
                           title:       _stepTitle(steps[i]),
                           emoji:       _stepEmoji(steps[i]),
                           body:        _stepBody(steps[i]),
+                          stepType:    steps[i].stepType,
                           isActive:    i == _currentStep,
                           isPast:      i < _currentStep,
                           isHindi:     isHindi,
@@ -590,7 +592,8 @@ class _ProgressBars extends StatelessWidget {
 class _SolutionCard extends StatelessWidget {
   final String problem;
   final bool isHindi;
-  const _SolutionCard({required this.problem, required this.isHindi});
+  final bool cacheHit;
+  const _SolutionCard({required this.problem, required this.isHindi, this.cacheHit = false});
 
   @override
   Widget build(BuildContext context) {
@@ -603,34 +606,65 @@ class _SolutionCard extends StatelessWidget {
         borderRadius: BorderRadius.circular(20),
         border: Border.all(color: const Color(0xFFE6D2B8), width: 1),
       ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Container(
-            width: 42, height: 42,
-            decoration: const BoxDecoration(
-                color: Color(0xFFFF9F3F), shape: BoxShape.circle),
-            child: const Icon(Icons.check_rounded,
-                color: Colors.white, size: 22),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Container(
+                width: 42, height: 42,
+                decoration: const BoxDecoration(
+                    color: Color(0xFFFF9F3F), shape: BoxShape.circle),
+                child: const Icon(Icons.check_rounded,
+                    color: Colors.white, size: 22),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(label,
+                      style: GoogleFonts.inter(
+                        fontSize: 11, fontWeight: FontWeight.w600,
+                        color: const Color(0xFF8C8C8C), letterSpacing: 1.3)),
+                    const SizedBox(height: 3),
+                    Text(problem,
+                      style: GoogleFonts.inter(
+                        fontSize: 16, fontWeight: FontWeight.w600,
+                        color: _SC.textDark, height: 1.3),
+                      maxLines: 2, overflow: TextOverflow.ellipsis),
+                  ],
+                ),
+              ),
+            ],
           ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(label,
-                  style: GoogleFonts.inter(
-                    fontSize: 11, fontWeight: FontWeight.w600,
-                    color: const Color(0xFF8C8C8C), letterSpacing: 1.3)),
-                const SizedBox(height: 3),
-                Text(problem,
-                  style: GoogleFonts.inter(
-                    fontSize: 16, fontWeight: FontWeight.w600,
-                    color: _SC.textDark, height: 1.3),
-                  maxLines: 2, overflow: TextOverflow.ellipsis),
-              ],
+
+          // Cache-hit badge — visible only when served from plan cache
+          if (cacheHit) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: const Color(0xFFE6F6EC),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                    color: const Color(0xFF86D7A8).withOpacity(0.40), width: 1)),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.bolt_rounded,
+                      size: 13, color: Color(0xFF22C55E)),
+                  const SizedBox(width: 4),
+                  Text(
+                    isHindi ? 'त्वरित उत्तर (कैश)' : 'Instant result  ·  Cached plan',
+                    style: GoogleFonts.inter(
+                      fontSize: 11, fontWeight: FontWeight.w600,
+                      color: const Color(0xFF22C55E))),
+                ],
+              ),
             ),
-          ),
+          ],
         ],
       ),
     );
@@ -645,6 +679,7 @@ class _StepCard extends StatelessWidget {
   final String title;
   final String emoji;
   final String body;
+  final StepType stepType;     // ← new
   final bool isActive;
   final bool isPast;
   final bool isHindi;
@@ -655,17 +690,37 @@ class _StepCard extends StatelessWidget {
     required this.title,
     required this.emoji,
     required this.body,
+    required this.stepType,
     required this.isActive,
     required this.isPast,
     required this.isHindi,
     this.entranceCtrl,
   });
 
+  // Step type icon + colour + label
+  (IconData, Color, String) _typeInfo(bool isHindi) {
+    switch (stepType) {
+      case StepType.inspection:
+        return (Icons.touch_app_rounded,   const Color(0xFFF59E0B),
+                isHindi ? 'निरीक्षण'  : 'Inspection');
+      case StepType.action:
+        return (Icons.build_rounded,        const Color(0xFF6366F1),
+                isHindi ? 'कार्य'      : 'Action');
+      case StepType.observation:
+        return (Icons.hearing_rounded,      const Color(0xFF0EA5E9),
+                isHindi ? 'अवलोकन'   : 'Observation');
+      case StepType.visual:
+        return (Icons.camera_alt_rounded,   _SC.primary,
+                isHindi ? 'दृश्य'     : 'Visual');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final lblStep    = isHindi ? 'चरण $stepNumber'    : 'Step $stepNumber';
     final lblCurrent = isHindi ? 'वर्तमान कार्य' : 'Current Task';
     final opacity = isActive ? 1.0 : (isPast ? 0.50 : 0.38);
+    final (typeIcon, typeColor, typeLabel) = _typeInfo(isHindi);
 
     Widget card = AnimatedOpacity(
       duration: const Duration(milliseconds: 300),
@@ -687,6 +742,7 @@ class _StepCard extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(children: [
+              // Step number badge
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
                 decoration: BoxDecoration(
@@ -700,6 +756,30 @@ class _StepCard extends StatelessWidget {
                     fontSize: 13, fontWeight: FontWeight.w600,
                     color: isActive ? _SC.primary : const Color(0xFF9CA3AF))),
               ),
+
+              const SizedBox(width: 8),
+
+              // Step type badge  ← NEW
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+                decoration: BoxDecoration(
+                  color: typeColor.withOpacity(0.10),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: typeColor.withOpacity(0.25), width: 1),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(typeIcon, size: 11, color: typeColor),
+                    const SizedBox(width: 4),
+                    Text(typeLabel,
+                      style: GoogleFonts.inter(
+                        fontSize: 11, fontWeight: FontWeight.w600,
+                        color: typeColor)),
+                  ],
+                ),
+              ),
+
               const Spacer(),
               if (isActive) ...[
                 Container(width: 7, height: 7,

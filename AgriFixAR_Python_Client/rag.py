@@ -361,7 +361,10 @@ _QUERY_CATEGORY_MAP = {
 
     "not_starting": [
         "not start","won't start","no start","dead","not working",
-        "starter","crank","no crank","clicking"
+        "starter","crank","no crank","clicking",
+        "jammed","jam","seized","locked","stuck","won't turn",
+        "not spinning","not rotating","seized up","motor jam",
+        "अटका","जाम","फंसा"
     ],
 
     "noise": [
@@ -405,7 +408,9 @@ _QUERY_CATEGORY_MAP = {
 
     "water_flow": [
         "water","flow","pressure","discharge",
-        "no water","low pressure","weak flow"
+        "no water","low pressure","weak flow",
+        "motor","pump motor","monoblock motor","submersible motor",
+        "मोटर","पानी नहीं","पंप बंद"
     ],
 
     "cooling": [

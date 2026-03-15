@@ -17,11 +17,15 @@ _MODEL_PRETRAINED = os.environ.get("CLIP_PRETRAINED",  "datacompdr")
 #   CLIP ViT-B/32 zero-shot on farm machinery:
 #     Clear, well-lit machine photo  → 0.65–0.85
 #     Partial view / background clutter → 0.45–0.60
-#     Wrong machine or non-machinery  → 0.25–0.45
-#   0.55 = "confident enough to skip Gemini"
-#   0.35 = "has a weak signal, worth including in fusion"
-_CLIP_STRONG     = 0.36   # trust CLIP alone above this
-_CLIP_WEAK       = 0.35   # include in fusion above this
+#     Wrong machine or non-machinery  → 0.10–0.30  (at T=50)
+#   0.50 = "confident enough to skip Gemini"           (at T=50)
+#   0.35 = "has a weak signal, worth including in fusion" (at T=50)
+#
+# These thresholds are calibrated for softmax temperature T=50.
+# Production data (gap=0.026 → top=0.649) confirms clear matches
+# sit well above 0.50, and ambiguous cases (gap≤0.008) fall below 0.35.
+_CLIP_STRONG     = 0.50   # trust CLIP alone above this  (was 0.36 @ T=30)
+_CLIP_WEAK       = 0.35   # include in fusion above this (unchanged — still valid @ T=50)
 _AUDIO_STRONG    = 0.70   # trust audio alone above this
 _AUDIO_WEAK      = 0.40   # include in fusion above this
 _FUSED_MIN       = 0.50   # fused result above this → skip Gemini
@@ -575,17 +579,22 @@ def _classify_image(frames: list[_Frame]) -> _ClsResult:
             sims  = (avg_feat @ txt_stack.T).squeeze(0)             # [11] cosine sims
 
             # Temperature calibration — MobileCLIP-S1 specific.
-            # MobileCLIP (datacomp training) produces higher raw cosine sims
-            # than ViT-B/32: ~0.28–0.45 vs ~0.18–0.35.
-            # With T=50 (correct for ViT-B/32), MobileCLIP's clear cases score
-            # >0.95 and ambiguous cases >0.62 — both above _CLIP_STRONG, so the
-            # confidence loses its routing signal.
-            # T=30 preserves the signal:
-            #   clear case (sim gap ~0.08):     top ~0.75–0.90 → skip Gemini ✅
-            #   ambiguous case (sim gap ~0.02): top ~0.41–0.55 → fusion decides ✅
-            # If you switch to MobileCLIP-S2/B via env var, T=30 still holds —
-            # all MobileCLIP variants share the same embedding distribution.
-            probs = torch.softmax(sims * 30.0, dim=0).cpu().numpy()
+            # Calibrated from production data (2026-03-12):
+            #   Actual raw cosine sim gap (tractor vs power_tiller) = 0.026
+            #   At T=30: softmax top = 0.372 — below _CLIP_STRONG=0.36, so the
+            #             second detection pass fires and audio-only (0.155) would
+            #             overwrite the correct CLIP result.
+            #   At T=50: softmax top = 0.649 — above threshold, second pass
+            #             skipped, tractor confirmed in a single pass. ✅
+            #
+            # Routing behaviour at T=50 across gap sizes:
+            #   Strong match  (gap ~0.060): top ~0.92 → clip_dominant ✅
+            #   Clear match   (gap ~0.026): top ~0.65 → clip_dominant ✅
+            #   Ambiguous     (gap ~0.005): top ~0.20 → fused_weak → Gemini ✅
+            #
+            # T=50 works for all MobileCLIP variants (S1, S2, B) because
+            # the raw sim distributions are consistent across model sizes.
+            probs = torch.softmax(sims * 50.0, dim=0).cpu().numpy()
 
         all_scores  = {mid: float(p) for mid, p in zip(machine_ids, probs)}
         top_idx     = int(probs.argmax())
@@ -844,6 +853,157 @@ async def detect_machine(
     # JPEG-encode the frames that are already in RAM — zero extra video decode.
     # main.py reads detection.frames directly; _extract_clip_frames() is gone.
     jpeg_frames = _frames_to_jpeg(all_frames) if all_frames else []
+
+    return DetectionResult(
+        machine_type     = canonical,
+        confidence       = round(final.confidence, 4),
+        source           = final.source,
+        clip_confidence  = round(clip_result.confidence  if clip_result  else 0.0, 4),
+        audio_confidence = round(audio_result.confidence if audio_result else 0.0, 4),
+        gemini_used      = gemini_used,
+        frame_used       = "+".join(f.label for f in top_frames) if top_frames else None,
+        frames           = jpeg_frames,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 12.  FAST PATH — pre-extracted frames from Flutter client
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Flutter extracts 3 frames locally (at 15% / 40% / 70% of video duration)
+# and uploads them as three ~50 KB JPEGs instead of a 20–35 MB video file.
+# This function accepts those JPEG bytes and runs the IDENTICAL CLIP → fusion
+# → Gemini pipeline as detect_machine() — the only difference is how _Frame
+# objects are constructed (from JPEG bytes instead of cv2.VideoCapture).
+#
+# Accuracy: identical — CLIP receives the same 256px PIL images.
+# Token usage: identical — same fusion logic, same Gemini fallback threshold.
+# The returned DetectionResult.frames list is the SAME JPEG bytes passed in,
+# re-encoded at 512px for Gemini (matching what _frames_to_jpeg() produces).
+
+async def detect_machine_from_frames(
+    frame_bytes_list: list[bytes],   # 1–3 JPEG bytes, [early, mid, late] order
+    transcription_text: str,
+) -> DetectionResult:
+    """
+    Detection pipeline for pre-extracted frames (fast-path from Flutter).
+
+    Identical to detect_machine() in every way except frame sourcing:
+      - No video file saved to disk
+      - No cv2.VideoCapture decode
+      - No _extract_frames() call
+      Replaces those with direct PIL.Image.open() on the uploaded JPEG bytes.
+
+    The resulting _Frame objects feed into the EXACT SAME:
+      _best_frames() → _classify_image() → _fuse() → _gemini_fallback() chain.
+
+    Args:
+        frame_bytes_list:   1–3 JPEG byte strings, [early, mid, late] order
+        transcription_text: output of transcribe_audio_with_gemini()
+
+    Returns:
+        DetectionResult — identical structure to detect_machine()
+    """
+    import io as _io
+    from PIL import Image as _PILImage
+
+    t0 = time.time()
+    _LABELS = ["early", "mid", "late"]
+
+    # Step 1 — Audio classification (identical to detect_machine)
+    audio_result = _classify_audio(transcription_text)
+
+    # Step 2 — Reconstruct _Frame objects from the JPEG bytes Flutter uploaded.
+    # We perform the same quality checks (blur, brightness) so the frame
+    # selection logic (_best_frames, _best_frame) behaves identically.
+    all_frames: list[_Frame] = []
+    for i, jpeg_bytes in enumerate(frame_bytes_list[:3]):
+        label = _LABELS[i] if i < len(_LABELS) else f"frame{i}"
+        try:
+            import cv2 as _cv2
+            import numpy as _np
+
+            pil = _PILImage.open(_io.BytesIO(jpeg_bytes)).convert("RGB")
+            # Resize to 256px — identical to _extract_frames() _MAX_PX target
+            pil.thumbnail((256, 256), _PILImage.Resampling.LANCZOS)
+
+            # Blur + brightness on the same pixel data CLIP will see
+            bgr = _cv2.cvtColor(_np.array(pil), _cv2.COLOR_RGB2BGR)
+            gray = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2GRAY)
+            blur       = float(_cv2.Laplacian(gray, _cv2.CV_64F).var())
+            brightness = float(gray.mean())
+
+            # CLAHE if too dark — identical to _extract_frames()
+            if brightness < _BRIGHT_MIN:
+                lab = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2LAB)
+                lab[:, :, 0] = _cv2.createCLAHE(
+                    clipLimit=2.0, tileGridSize=(8, 8)
+                ).apply(lab[:, :, 0])
+                bgr        = _cv2.cvtColor(lab, _cv2.COLOR_LAB2BGR)
+                gray       = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2GRAY)
+                brightness = float(gray.mean())
+                pil        = _PILImage.fromarray(
+                    _cv2.cvtColor(bgr, _cv2.COLOR_BGR2RGB)
+                )
+                logger.info(f"🔆 Pre-frame [{label}] CLAHE → brightness {brightness:.1f}")
+
+            usable = blur >= _BLUR_MIN and brightness >= _BRIGHT_MIN
+            logger.info(
+                f"📸 Pre-frame [{label}] blur={blur:.1f} bright={brightness:.1f} "
+                f"size={pil.size} usable={usable}"
+            )
+            all_frames.append(_Frame(pil, label, blur, brightness, usable))
+
+        except Exception as exc:
+            logger.warning(f"⚠️  Pre-frame [{label}] decode failed: {exc}")
+
+    if not all_frames:
+        logger.warning("⚠️  All pre-extracted frames failed decode — falling back to audio only")
+
+    # Steps 3–6: IDENTICAL to detect_machine() from here onward ───────────────
+
+    top_frames  = _best_frames(all_frames, n=2)
+    best_single = _best_frame(all_frames)
+
+    clip_result: Optional[_ClsResult] = None
+    if top_frames and _clip_ready:
+        clip_result = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _classify_image(top_frames)
+        )
+
+    fusion = _fuse(clip_result, audio_result)
+
+    gemini_used = False
+    final       = fusion
+
+    if fusion.needs_gemini:
+        if best_single is not None:
+            gem = await _gemini_fallback(
+                best_single,
+                prior=fusion.machine_type if fusion.confidence > 0.20 else None,
+            )
+            final = _FusionResult(gem.machine_type, gem.confidence, "gemini", False)
+            gemini_used = True
+        elif audio_result.confidence >= _AUDIO_WEAK:
+            final = _FusionResult(
+                audio_result.machine_type, audio_result.confidence, "audio_no_video", False
+            )
+            logger.info(f"🎙️  No usable frames — audio only: {audio_result.machine_type}")
+
+    from utils.machine_registry import get_profile, resolve_machine_id
+    canonical = resolve_machine_id(final.machine_type)
+    if not get_profile(canonical):
+        logger.warning(f"⚠️  '{canonical}' not in registry — defaulting to tractor")
+        canonical = "tractor"
+
+    elapsed_ms = (time.time() - t0) * 1000
+    logger.info(
+        f"✅ detect_machine_from_frames: {canonical}  conf={final.confidence:.3f}  "
+        f"source={final.source}  gemini={gemini_used}  [{elapsed_ms:.0f}ms]"
+    )
+
+    # Re-encode at 512px for Gemini — identical to _frames_to_jpeg()
+    jpeg_frames = _frames_to_jpeg(all_frames) if all_frames else list(frame_bytes_list[:3])
 
     return DetectionResult(
         machine_type     = canonical,

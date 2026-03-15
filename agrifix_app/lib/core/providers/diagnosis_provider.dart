@@ -54,6 +54,10 @@ class StepData {
   final String? arModel;
   final String? safetyWarning;
 
+  // 🟢 INJECTED FROM V1: Part identification fields for /verify_step
+  final String requiredPart;   
+  final String areaHint;       
+
   // Inspection / observation fields
   final String? questionEn;
   final String? questionHi;
@@ -73,6 +77,9 @@ class StepData {
     this.questionEn,
     this.questionHi,
     this.options = const [],
+    // 🟢 Default fallbacks
+    this.requiredPart = 'machine_part', 
+    this.areaHint     = 'engine_compartment',
   });
 
   factory StepData.fromJson(Map<String, dynamic> json) => StepData(
@@ -91,6 +98,9 @@ class StepData {
         options: (json['options'] as List? ?? [])
             .map((o) => StepOption.fromJson(o as Map<String, dynamic>))
             .toList(),
+        // 🟢 INJECTED FROM V1: Parsing the exact part and area
+        requiredPart:  json['required_part'] as String? ?? 'machine_part',
+        areaHint:      json['area_hint']     as String? ?? 'engine_compartment',
       );
 
   String getLocalizedText(bool isHindi) =>

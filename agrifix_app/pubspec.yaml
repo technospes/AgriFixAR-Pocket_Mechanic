@@ -10,43 +10,52 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # Localization
+  # ── Localisation ────────────────────────────────────────────────────────
+  # flutter_localizations + intl must always appear together.
+  # intl is required as a companion package whenever flutter_localizations
+  # is used; removing it breaks l10n code generation (generate: true).
   flutter_localizations:
     sdk: flutter
   intl: 0.20.2
 
-  # UI
-  google_fonts: ^6.2.1
-  flutter_animate: ^4.5.0
-  flutter_svg: ^2.0.10+1
-  lottie: ^3.1.2
+  # ── UI ──────────────────────────────────────────────────────────────────
+  google_fonts: ^6.2.1         # GoogleFonts.inter() used on every screen
+  flutter_animate: ^4.5.0      # entrance/shimmer animations throughout the app
 
-  # Navigation
-  go_router: ^14.2.7
+  # ── Navigation ──────────────────────────────────────────────────────────
+  go_router: ^14.2.7            # all screen routing
 
-  # State
-  provider: ^6.1.2
+  # ── State ───────────────────────────────────────────────────────────────
+  provider: ^6.1.2              # DiagnosisProvider, LanguageProvider
 
-  # Network
-  http: ^1.2.1
+  # ── Network ─────────────────────────────────────────────────────────────
+  http: ^1.2.1                  # ApiService — all backend calls
 
-  # Storage
-  shared_preferences: ^2.3.1
+  # ── Storage ─────────────────────────────────────────────────────────────
+  shared_preferences: ^2.3.1   # language + settings persistence
 
-  # Media
-  video_player: ^2.9.1
-  image_picker: ^1.1.2
-  record: ^6.2.0
-  audioplayers: ^6.1.0
-  flutter_tts: ^4.2.0
-  permission_handler: ^11.3.1
+  # ── Media ───────────────────────────────────────────────────────────────
+  # video_thumbnail: frame extraction at correct millisecond positions
+  # (replaces video_compress which ignored the `position` param on Android)
+  video_thumbnail: ^0.5.3
+  video_player: ^2.9.1          # inline video playback on upload screen
+  image_picker: ^1.1.2          # gallery / camera picker
+  record: ^6.2.0                # audio recording (m4a) in upload screen
+  flutter_tts: ^4.2.0           # AR guide screen voice narration
+
+  # ── Camera ──────────────────────────────────────────────────────────────
+  # camera: AR live preview + frame capture for /locate_part calls.
+  # Requires minSdkVersion 21 (already set in android/app/build.gradle).
+  # veryHigh resolution used to give Gemini Vision enough pixels to
+  # distinguish small machine parts.
   camera: ^0.11.0+2
 
-  # Utilities
-  path_provider: ^2.1.4
-  path: ^1.9.0
+  # ── Permissions ─────────────────────────────────────────────────────────
+  permission_handler: ^11.3.1  # camera + microphone runtime permissions
 
-# Added flutter_launcher_icons here
+  # ── Utilities ───────────────────────────────────────────────────────────
+  path_provider: ^2.1.4        # temp directory for thumbnails + recordings
+
 dev_dependencies:
   flutter_launcher_icons: ^0.13.1
   flutter_native_splash: ^2.4.0
@@ -58,7 +67,6 @@ flutter:
     - assets/videos/
     - assets/images/app_icon.png
 
-# 👇 Configuration to generate your app logo automatically
 flutter_launcher_icons:
   android: true
   ios: true
@@ -66,7 +74,7 @@ flutter_launcher_icons:
   min_sdk_size: 21
 
 flutter_native_splash:
-  color: "#FFFFFF" # You can change this hex code to match the beige background of your logo!
+  color: "#FFFFFF"
   image: "assets/images/app_icon.png"
   android_12:
     image: "assets/images/app_icon.png"

@@ -43,7 +43,7 @@ from agent import session_manager, repair_agent
 from services.transcription_service import transcribe_audio_with_gemini
 from services.diagnosis_service import generate_diagnosis_with_gemini
 from services.verification_service import verify_step_with_gemini
-from services.machine_detection_service import detect_machine, load_clip_model
+from services.machine_detection_service import detect_machine, detect_machine_from_frames, load_clip_model
 from utils.helpers import (
     sanitize_json_text,
     generate_cache_key,
@@ -207,14 +207,24 @@ def _phash_bytes(image_bytes: bytes, hash_size: int = 8) -> str:
     """
     Average perceptual hash — 16-char hex string used in the plan cache key.
     Operates on JPEG bytes already in RAM from detection.frames. No I/O.
+
+    BUG FIX (2026-03-12): the original implementation computed a 1024-bit
+    integer (32×32 pixels) then called .to_bytes(8, "big"), which always
+    raised OverflowError — silently caught, always returning "00000000".
+    This meant every cache key ended with "|00000000", so the plan cache
+    never differentiated by visual content. Fix: take only the first 64 bits
+    of the bit string (8 bytes) — sufficient for cache differentiation across
+    the small machine/symptom space (<<2^64 unique visual states in practice).
     """
+    import struct as _struct
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("L")
         img = img.resize((hash_size * 4, hash_size * 4), Image.LANCZOS)
         pixels = list(img.getdata())
         mean = sum(pixels) / len(pixels)
         bits = "".join("1" if p >= mean else "0" for p in pixels)
-        return int(bits, 2).to_bytes(hash_size, "big").hex()
+        # Take first 64 bits only → packs cleanly into 8 bytes, no OverflowError
+        return _struct.pack(">Q", int(bits[:64], 2)).hex()
     except Exception:
         return "00000000"
 
@@ -847,6 +857,16 @@ async def diagnose_stream(
     audio: UploadFile = File(...),
     machine_type: str = Form(default=""),   # optional hint
     language: str = Form(default="en"),
+    # ── Fast-path: pre-extracted frames from Flutter (v4.3+) ─────────────────
+    # When Flutter sends frame0/frame1/frame2 as JPEG files, the backend skips
+    # all video decode (no cv2, no disk write of the .mp4) and runs CLIP directly
+    # on these three ~50 KB images. The video field is still accepted for
+    # backward-compatibility but its bytes are discarded if frames are present.
+    # Upload size drops from ~25 MB to ~350 KB → reduces Stage-0 latency by
+    # ~40–60 s on Indian rural mobile connections.
+    frame0: Optional[UploadFile] = File(default=None),
+    frame1: Optional[UploadFile] = File(default=None),
+    frame2: Optional[UploadFile] = File(default=None),
     _auth: None = Depends(verify_app_key),
 ):
     """
@@ -870,9 +890,27 @@ async def diagnose_stream(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Upload read failed: {exc}")
 
+    # ── Fast path: read pre-extracted frames (Flutter v4.3+) ─────────────────
+    # Flutter sends frame0/frame1/frame2 as individual JPEG uploads.
+    # If present, we skip video decode entirely. The video bytes are still read
+    # above (the field is required for backward-compat) but are never written
+    # to disk when frames are present.
+    pre_frames: list[bytes] = []
+    for _fup in (frame0, frame1, frame2):
+        if _fup is not None:
+            try:
+                _fb = await _fup.read()
+                if len(_fb) > 512:          # ignore empty/stub fields
+                    pre_frames.append(_fb)
+            except Exception:
+                pass
+    _using_pre_frames = len(pre_frames) > 0
+    if _using_pre_frames:
+        logger.info(f"⚡ Fast-path: {len(pre_frames)} pre-extracted frames received — skipping video decode")
+
     # ── Security: validate files BEFORE starting the stream ──────────────────
     validate_audio_upload(audio.filename or "rec.m4a", audio_bytes, ip=ip)
-    if video.filename and len(video_bytes) > 1024:
+    if not _using_pre_frames and video.filename and len(video_bytes) > 1024:
         validate_video_upload(video.filename, video_bytes, ip=ip)
 
     async def event_stream() -> AsyncIterator[str]:
@@ -898,8 +936,12 @@ async def diagnose_stream(
         video_path: Optional[Path] = None
         try:
             # ── Save files ────────────────────────────────────────────────────
+            # Audio is always saved (needed for transcription Gemini call).
+            # Video is only saved when Flutter did NOT send pre-extracted frames.
+            # When pre_frames are present the video bytes are discarded — no disk
+            # I/O, no cv2 decode, no OpenCV VideoCapture.
             audio_path.write_bytes(audio_bytes)
-            if video.filename and len(video_bytes) > 1024:
+            if not _using_pre_frames and video.filename and len(video_bytes) > 1024:
                 video_path = UPLOAD_DIR / f"{request_id}_video_{_safe_filename(video.filename, 'rec.mp4')}"
                 video_path.write_bytes(video_bytes)
 
@@ -925,6 +967,15 @@ async def diagnose_stream(
                 return "farm machine problem"
 
             async def _detect_clip() -> Any:
+                # ── Fast path: pre-extracted frames from Flutter ──────────────
+                # Uses detect_machine_from_frames() which runs the IDENTICAL
+                # CLIP → fusion → Gemini pipeline without any video file I/O.
+                if _using_pre_frames:
+                    return await detect_machine_from_frames(
+                        frame_bytes_list=pre_frames,
+                        transcription_text=None,
+                    )
+                # ── Standard path: full video decode ─────────────────────────
                 # Run CLIP-only detection first (local, fast, no Gemini).
                 # We pass transcription_text=None here so detect_machine uses
                 # only CLIP + audio keywords from the video.
@@ -954,19 +1005,35 @@ async def diagnose_stream(
             detection = detection_clip
 
             if detection_clip.confidence < 0.55:
-                # CLIP is uncertain — re-run detection WITH transcription text so
-                # the audio keyword matcher can resolve without Gemini.
-                # CRITICAL: pass video_path=None so the video is NOT re-decoded.
-                # detection_clip.frames already holds the JPEG bytes from the
-                # first decode. We copy them onto the new result after the call.
-                detection = await detect_machine(
-                    video_path=None,          # ← no re-decode
-                    transcription_text=problem_text,
-                )
-                # Restore the frames from the first (and only) CLIP decode
-                detection.frames = detection_clip.frames
-                if detection.gemini_used:
-                    record_gemini_call(ip)
+                # CLIP is uncertain — run a second pass WITH the transcription text
+                # so the audio keyword matcher can boost or correct the result.
+                #
+                # CRITICAL DIFFERENCE from the standard path:
+                # When frames were pre-extracted (fast path), we must NOT call
+                # detect_machine(video_path=None) because that builds a new
+                # DetectionResult with zero CLIP signal and overwrites the machine
+                # type with the weak audio-only result (0.155 in the logs).
+                # Instead we re-run detect_machine_from_frames with the same frames
+                # AND the transcription text — CLIP + audio fusion, not audio alone.
+                if _using_pre_frames:
+                    detection = await detect_machine_from_frames(
+                        frame_bytes_list=pre_frames,
+                        transcription_text=problem_text,
+                    )
+                    if detection.gemini_used:
+                        record_gemini_call(ip)
+                else:
+                    # Standard path: re-run with transcription text so audio keyword
+                    # matcher resolves without Gemini. CRITICAL: video_path=None so
+                    # the video is NOT re-decoded a second time.
+                    detection = await detect_machine(
+                        video_path=None,
+                        transcription_text=problem_text,
+                    )
+                    # Restore the frames from the first (and only) CLIP decode
+                    detection.frames = detection_clip.frames
+                    if detection.gemini_used:
+                        record_gemini_call(ip)
                 resolved = detection.machine_type
 
             # Client hint overrides when our detection is still uncertain
@@ -1089,6 +1156,122 @@ async def diagnose_stream(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /locate_part  — AR guidance loop
+#
+# Called by Flutter every 3s while user is in locating state.
+# Returns normalised bbox [cx,cy,w,h] + camera guidance string.
+# Never returns an arrow location if confidence < 0.72 or any reject flag set.
+# Token cost: ~573 tokens per call (~$0.00007)
+# ─────────────────────────────────────────────────────────────────────────────
+from services.locate_part_service import locate_part_with_gemini   # noqa: E402
+
+@app.post("/locate_part")
+@limiter.limit("30/minute")
+async def locate_part(
+    request: Request,
+    image: UploadFile = File(...),
+    required_part: str  = Form(...),
+    area_hint:     str  = Form(default=""),
+    machine_type:  str  = Form(default="tractor"),
+    attempt_count: int  = Form(default=1),
+    language:      str  = Form(default="en"),
+    frame_id:      int  = Form(default=0),
+    search_roi:    str  = Form(default=''),  # 'cx,cy,margin' or '' if no prior bbox
+    _auth: None = Depends(verify_app_key),
+):
+    """
+    AR part-location endpoint.
+
+    Flutter sends a single JPEG frame captured from the live camera preview.
+    Returns either:
+      { found: true,  bbox: [cx,cy,w,h], confidence: 0.85, camera_guidance: "..." }
+      { found: false, bbox: null,         confidence: 0.0,  camera_guidance: "Move to pump_body" }
+
+    Security: same guards as verify_step (rate-limit, app-key, length caps).
+    """
+    ip = request.client.host if request.client else "unknown"
+
+    # Input length caps
+    if len(required_part) > 120:
+        required_part = required_part[:120]
+    if len(area_hint) > 120:
+        area_hint = area_hint[:120]
+
+    # Prompt injection guard on user-supplied fields
+    required_part = check_prompt_injection(required_part, ip=ip, field="required_part")
+    area_hint     = check_prompt_injection(area_hint,     ip=ip, field="area_hint")
+
+    logger.info(
+        f"🎯 /locate_part part={required_part} area={area_hint} "
+        f"attempt={attempt_count} ip={ip}"
+    )
+
+    try:
+        image_bytes = await image.read()
+        if len(image_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Empty image")
+        if len(image_bytes) > 5_000_000:   # 5 MB hard cap
+            raise HTTPException(status_code=413, detail="Image too large")
+
+        if can_call_gemini(ip):
+            # Parse search_roi: 'cx,cy,margin' → (float, float, float) | None
+            _parsed_roi = None
+            if search_roi:
+                try:
+                    _parts = [float(x) for x in search_roi.split(',')]
+                    if len(_parts) == 3:
+                        _parsed_roi = tuple(_parts)
+                except (ValueError, TypeError):
+                    pass
+
+            result = await gemini_with_timeout(
+                locate_part_with_gemini(
+                    image_bytes    = image_bytes,
+                    required_part  = required_part,
+                    area_hint      = area_hint,
+                    machine_type   = machine_type,
+                    attempt_count  = attempt_count,
+                    language       = language,
+                    frame_id       = frame_id,
+                    search_roi     = _parsed_roi,
+                ),
+                fallback = None,
+                context  = "locate_part",
+            )
+            if result:
+                record_gemini_call(ip)
+            else:
+                result = {
+                    "found": False, "bbox": None, "confidence": 0.0,
+                    "camera_guidance": "Analysis timed out — please try again.",
+                    "part_description": None, "reject_flags": {},
+                }
+        else:
+            logger.warning(f"⚠️  Gemini budget exceeded [{ip}] — locate_part skipped")
+            result = {
+                "found": False, "bbox": None, "confidence": 0.0,
+                "camera_guidance": "Service busy — try again in a moment.",
+                "part_description": None, "reject_flags": {},
+            }
+
+        return JSONResponse(content=result)
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"❌ /locate_part error [{ip}]: {exc}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "found": False, "bbox": None, "confidence": 0.0,
+                "camera_guidance": "Could not analyse frame — hold still and retry.",
+                "part_description": None, "reject_flags": {},
+            },
+        )
 
 
 @app.post("/verify_step")

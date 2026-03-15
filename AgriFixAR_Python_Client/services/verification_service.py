@@ -127,8 +127,19 @@ Do NOT say "image unclear" if the part is visible but the action is missing.
 If the correct part is visible but the action is incorrect or incomplete,
 status MUST be "fail".
 
+# IDENTITY CHECK — before pass, confirm the visible component is EXACTLY:
+#   "{required_part}" located in "{area_hint}" ({area_desc})
+# If a SIMILAR but DIFFERENT component is visible (e.g. discharge pipe instead
+# of suction pipe, brake pedal instead of clutch pedal), status MUST be "fail"
+# and feedback must name the correct part the farmer needs to show.
 Find: {required_part} in {area_hint} ({area_desc}) | attempt={attempt_count}
-Only report a part if it is clearly visible in the image. Do not guess hidden parts.
+Only report a part if it is clearly visible in the image. Do not guess.
+
+# DIRTY / OBSCURED COMPONENTS:
+# If the part appears heavily dusty, muddy, or corroded but is identifiable,
+# set status="pass" and note the condition in ai_observation.
+# If obscured to the point of not being assessable → status="unclear",
+# feedback line 2 = "Clean the part slightly and retry."
 
 Focus: {obs_hint}
 Jargon→plain: {_UNIVERSAL_JARGON_MAP}
@@ -163,6 +174,32 @@ pass=part_visible+assessable(conf≥0.70); fail=wrong_area; unclear=bad_image; u
         result    = json.loads(sanitize_json_text(response.text))
         raw_status = result.get("status", "unclear")
         raw_conf   = float(result.get("confidence", 0.0))
+
+        # ── Wrong-part guard ─────────────────────────────────────────────
+        # If Gemini says pass but the detected_part description does not
+        # semantically relate to required_part, downgrade to fail.
+        # This catches "suction pipe" vs "pressure pipe" mismatches where
+        # Gemini's confidence is high but the identity is wrong.
+        detected_raw = (result.get("detected_part") or "").lower()
+        required_key = required_part.lower().replace("_", " ")
+        # Accept if any word from required_part appears in detected description
+        required_words = [w for w in required_key.split() if len(w) > 3]
+        part_words_match = any(w in detected_raw for w in required_words)
+        if raw_status == "pass" and not part_words_match and required_words:
+            raw_status = "fail"
+            raw_conf   = min(raw_conf, 0.50)  # cap conf on wrong-part fail
+            existing_fb = result.get("feedback", "")
+            result["feedback"] = (
+                f"Wrong component shown — need the {required_key}.\n"
+                f"Point camera at {area_hint.replace('_', ' ')}."
+            )
+            result["feedback_hi"] = (
+                f"गलत हिस्सा दिखाया — {required_key} दिखाएं।\n"
+                f"{area_hint.replace('_', ' ').replace(' ', ' में')} की तरफ कैमरा करें।"
+            )
+            logger.info(f"verify_step: wrong-part downgrade — detected={detected_raw!r} "
+                        f"required={required_key!r}")
+
         is_verified = raw_status == "pass" and raw_conf >= 0.70
         result["verified"]     = is_verified
         result["status"]       = "verified" if is_verified else raw_status

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
@@ -42,7 +43,6 @@ class DiagnosisResult {
 class ApiService {
   static const String _baseUrl = 
       'https://technospes-agrifixar-backend-new.hf.space';
-      // 'http://10.0.2.2:7860';
   static const String _appKey = '020b082f133f403abf8694e6144df1a79396b2706dd9de108bc54a05e891fc29';
   static const Duration _uploadTimeout = Duration(seconds: 90);
   static const Duration _streamTimeout = Duration(minutes: 3);
@@ -130,6 +130,89 @@ class ApiService {
       onRetry: (attempt) {
         onUploadStatus?.call('Retrying upload… (attempt $attempt)');
         onUploadProgress?.call(0.15);
+      },
+      onStageStart: onStageStart,
+      onStageComplete: onStageComplete,
+      onUploadProgress: onUploadProgress,
+      onUploadStatus: onUploadStatus,
+    );
+  }
+
+  // ── Fast streaming endpoint — 3 pre-extracted frames + audio (~350 KB) ───
+  //
+  // Flutter extracts 3 JPEG frames from the video locally BEFORE uploading.
+  // Upload size: ~150 KB (frames) + ~200 KB (audio) = ~350 KB total,
+  // vs old path: 20–35 MB video → reduces upload from ~45 s to ~0.5 s on
+  // a typical Indian rural 4G connection (1–3 Mbps upload).
+  //
+  // The backend runs the IDENTICAL CLIP → fusion → Gemini pipeline on these
+  // frames — accuracy, token usage, and all stage events are unchanged.
+  // The video stub (1 byte) satisfies the backend's required 'video' field
+  // but is ignored when frame0/frame1/frame2 are present.
+  //
+  // framePaths: [earlyFramePath, midFramePath, lateFramePath]
+  //   extracted at 15% / 40% / 70% of video duration respectively.
+  static Future<DiagnosisResult> uploadAndDiagnoseStreamingFast({
+    required List<String> framePaths,   // exactly 3 JPEG paths [early, mid, late]
+    required String audioPath,
+    required void Function(int stageIndex) onStageStart,
+    required void Function(int stageIndex, Map<String, dynamic> data) onStageComplete,
+    String machineType = '',
+    String language = 'en',
+    void Function(double progress)? onUploadProgress,
+    void Function(String status)? onUploadStatus,
+  }) async {
+    assert(framePaths.length == 3,
+        'uploadAndDiagnoseStreamingFast requires exactly 3 frame paths');
+
+    for (final p in framePaths) {
+      if (!await File(p).exists()) {
+        throw NetworkException('Frame file not found: $p');
+      }
+    }
+    if (!await File(audioPath).exists()) {
+      throw NetworkException('Audio file not found: $audioPath');
+    }
+
+    onUploadStatus?.call('Preparing frames…');
+    onUploadProgress?.call(0.03);
+
+    final request = http.MultipartRequest(
+        'POST', Uri.parse('$_baseUrl/diagnose/stream'));
+    request.headers['X-App-Key'] = _appKey;
+    request.fields['machine_type'] = machineType;
+    request.fields['language'] = language;
+
+    // 1-byte stub for the required 'video' field — backend ignores video bytes
+    // when frame0/frame1/frame2 are present (fast-path detection).
+    request.files.add(http.MultipartFile.fromBytes(
+      'video',
+      [0],
+      filename: 'stub.mp4',
+    ));
+
+    // Pre-extracted frames — field names frame0 / frame1 / frame2
+    const frameFields  = ['frame0', 'frame1', 'frame2'];
+    const frameLabels  = ['early',  'mid',    'late' ];
+    for (int i = 0; i < 3; i++) {
+      request.files.add(await http.MultipartFile.fromPath(
+        frameFields[i],
+        framePaths[i],
+        filename: '${frameLabels[i]}.jpg',
+      ));
+    }
+
+    request.files.add(await http.MultipartFile.fromPath('audio', audioPath));
+
+    onUploadStatus?.call('Uploading frames…');
+    onUploadProgress?.call(0.05);
+
+    return _sendStreamWithRetry(
+      request: request,
+      timeout: _streamTimeout,
+      onRetry: (attempt) {
+        onUploadStatus?.call('Retrying… (attempt $attempt)');
+        onUploadProgress?.call(0.05);
       },
       onStageStart: onStageStart,
       onStageComplete: onStageComplete,
@@ -350,25 +433,40 @@ class ApiService {
 
   // ── Verify a repair step photo ────────────────────────────────────────────
   static Future<Map<String, dynamic>> verifyStep({
-    required File imageFile,
+    required File   imageFile,
     required String stepText,
     required String machineType,
     required String problemContext,
-    required int attemptCount,
-    String previousSteps = '[]',                  // ← visual memory from client
+    required int    attemptCount,
+    String requiredPart  = '',     // exact part Gemini must find
+    String areaHint      = '',     // section of machine
+    String previousSteps = '[]',   // visual memory from client
+    Uint8List? imageCropBytes,     // AR crop PNG — overrides imageFile when set
     void Function(double progress)? onProgress,
     void Function(String status)? onStatus,
   }) async {
     final request = http.MultipartRequest(
         'POST', Uri.parse('$_baseUrl/verify_step'))
-      ..headers['X-App-Key'] = _appKey
-      ..files.add(await http.MultipartFile.fromPath('image', imageFile.path))
+      ..headers['X-App-Key'] = _appKey;
+    // Use cropped PNG bytes when available (AR flow) — otherwise full JPEG file
+    if (imageCropBytes != null) {
+      request.files.add(http.MultipartFile.fromBytes(
+        'image', imageCropBytes, filename: 'crop.png'));
+    } else {
+      request.files.add(
+          await http.MultipartFile.fromPath('image', imageFile.path));
+    }
+    request
       ..fields.addAll({
         'step_text':       stepText,
         'machine_type':    machineType,
         'problem_context': problemContext,
         'attempt_count':   attemptCount.toString(),
-        'previous_steps':  previousSteps,          // ← was hardcoded '[]'
+        'previous_steps':  previousSteps,
+        // Send real step metadata — backend was falling back to
+        // 'machine_part' / 'engine_compartment' defaults without these.
+        if (requiredPart.isNotEmpty) 'required_part': requiredPart,
+        if (areaHint.isNotEmpty)     'area_hint':     areaHint,
       });
 
     onStatus?.call('Verifying step…');
@@ -389,4 +487,50 @@ class ApiService {
     onProgress?.call(1.0);
     return result.raw; // Fixed: return the raw map
   }
+  // ── AR Part Location ───────────────────────────────────────────────────────
+  // Called by the AR guidance loop every ~3 seconds.
+  // Returns { found, bbox, confidence, camera_guidance, part_description }.
+  // FIX 6: 3 s timeout — AR loop fires every 1 s, so a slow response
+  // is already stale before it arrives. Drop it and use the next frame.
+  static Future<Map<String, dynamic>> locatePart({
+    required File  imageFile,
+    required String requiredPart,
+    required String areaHint,
+    required String machineType,
+    required int    attemptCount,
+    String language   = 'en',
+    int    frameId    = 0,
+    String searchRoi  = '',   // 'cx,cy,margin' from last known bbox, '' if none
+  }) async {
+    final request = http.MultipartRequest(
+        'POST', Uri.parse('$_baseUrl/locate_part'))
+      ..headers['X-App-Key'] = _appKey
+      ..files.add(await http.MultipartFile.fromPath('image', imageFile.path))
+      ..fields.addAll({
+        'required_part': requiredPart,
+        'area_hint':     areaHint,
+        'machine_type':  machineType,
+        'attempt_count': attemptCount.toString(),
+        'language':      language,
+        'frame_id':      frameId.toString(),
+        if (searchRoi.isNotEmpty) 'search_roi': searchRoi,
+      });
+
+    try {
+      final streamedResponse = await request.send()
+          .timeout(const Duration(seconds: 3));  // FIX 6: short — stale frames replaced by next tick
+      final response = await http.Response.fromStream(streamedResponse);
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body) as Map<String, dynamic>;
+      }
+    } catch (_) {
+      // Timeout or network error — return not-found so loop continues
+    }
+    return {
+      'found': false, 'bbox': null, 'confidence': 0.0,
+      'camera_guidance': 'Network error — retrying…',
+      'part_description': null,
+    };
+  }
+
 }

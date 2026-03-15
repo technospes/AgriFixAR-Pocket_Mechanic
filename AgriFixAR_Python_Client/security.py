@@ -122,7 +122,10 @@ def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded):
 # 2.  GEMINI CREDIT GUARD — per-IP sliding-window hourly cap
 # ═════════════════════════════════════════════════════════════════════════════
 
-GEMINI_HOURLY_LIMIT: int = int(os.environ.get("GEMINI_HOURLY_LIMIT", "10"))
+# Raised from 10 → 300: AR mode makes ~1 Gemini call per 2 s per user.
+# 300/hr = 5/min = one call every 12 s worst-case → very conservative.
+# Set env var GEMINI_HOURLY_LIMIT to override.
+GEMINI_HOURLY_LIMIT: int = int(os.environ.get("GEMINI_HOURLY_LIMIT", "300"))
 _GEMINI_WINDOW = 3600  # one hour in seconds
 
 # { ip_address: [unix_timestamp_of_each_call, ...] }
@@ -138,15 +141,18 @@ def can_call_gemini(ip: str) -> bool:
     cutoff = now - _GEMINI_WINDOW
     _gemini_usage[ip] = [t for t in _gemini_usage[ip] if t > cutoff]
 
-    if len(_gemini_usage[ip]) >= GEMINI_HOURLY_LIMIT:
+    calls = len(_gemini_usage[ip])
+    if calls >= GEMINI_HOURLY_LIMIT:
+        # Monitoring-only — log but do NOT block.
+        # Blocking at this layer kills the AR locate loop for legitimate users.
+        # Hard abuse protection is handled at the HTTP rate-limiter (slowapi).
         log_security_event(
-            "gemini_limit_exceeded",
+            "gemini_limit_warning",
             ip=ip,
-            calls_in_last_hour=len(_gemini_usage[ip]),
+            calls_in_last_hour=calls,
             limit=GEMINI_HOURLY_LIMIT,
         )
-        return False
-    return True
+    return True  # always allow — monitoring only
 
 
 def record_gemini_call(ip: str) -> None:

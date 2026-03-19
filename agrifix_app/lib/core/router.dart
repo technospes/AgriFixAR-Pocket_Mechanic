@@ -3,7 +3,7 @@ import 'package:go_router/go_router.dart';
 import '../screens/home/home_screen.dart';
 import '../screens/upload/upload_screen.dart';
 import '../../screens/solution/solution_screen.dart';
-import '../../screens/ar_guide/ar_guide_screen.dart';
+import '../../screens/ar_guide/screens/ar_guide_screen.dart';
 
 class AppRoutes {
   static const home     = '/';

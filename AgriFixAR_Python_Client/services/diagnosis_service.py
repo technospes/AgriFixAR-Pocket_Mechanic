@@ -1,29 +1,10 @@
-"""
-services/diagnosis_service.py
-Diagnosis generation — Gemini + RAG.
-
-Token budget vs previous version:
-  Removed  : verbose 'YOUR ROLE neighbour' paragraph  (~90 tok)
-  Removed  : safety_warnings_hi from prompt           (~59 tok)
-  Compressed: safety_warnings_en → compact keywords   (~62 → ~20 tok)
-  Reworked : farmer language rules block to include   (~85 → ~110 tok)
-             one concrete BAD→GOOD example + 3-sentence
-             minimum rule — recovers cost via fewer
-             confusion retries.
-  Net saving vs original: ~366 tokens per call (~31% of prompt)
-  Quality gain: steps are 3-4 sentences with WHERE+WHAT+EXPECT
-                instead of single locator lines.
-"""
-
 from __future__ import annotations
 import asyncio
 import json
 import logging
 import re
-
 import google.generativeai as genai
 from PIL import Image
-
 from utils.helpers import sanitize_json_text, generate_cache_key, get_cached_response, cache_response
 from utils.machine_registry import (
     get_profile_or_default,

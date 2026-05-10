@@ -19,19 +19,13 @@ from dotenv import load_dotenv
 load_dotenv()
 import hashlib
 from contextlib import asynccontextmanager
-
-# SlowAPI (rate limiting)
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-
-# RAG imports
 from langchain_community.vectorstores import Chroma
 from langchain_core.embeddings import Embeddings
 from typing import List as _List
-# Optimized RAG pipeline
 from rag import (
     retrieve_with_metadata_filter,
-    infer_problem_categories,
     normalize_query,
     RAG_TOP_K,
     RAG_MIN_SCORE,
@@ -40,7 +34,7 @@ from rag import (
 # ── New modular imports ───────────────────────────────────────────────────────
 from agent.models import CreateSessionRequest, CreateSessionResponse, AgentNextRequest
 from agent import session_manager, repair_agent
-from services.transcription_service import transcribe_audio_with_gemini
+from services.transcription_service import transcribe_audio_with_gemini, transcribe_audio_full
 from services.diagnosis_service import generate_diagnosis_with_gemini
 from services.verification_service import verify_step_with_gemini
 from services.machine_detection_service import detect_machine, detect_machine_from_frames, load_clip_model
@@ -187,18 +181,13 @@ def _safe_filename(raw: str, fallback: str) -> str:
 def _plan_cache_key(machine_type: str, problem_text: str,
                     visual_hash: str = "") -> str:
     """
-    Deterministic cache key: machine_type + problem cluster + visual hash.
+    Deterministic cache key: machine_type + normalized query + visual hash.
 
     The visual_hash is a perceptual hash of the best video frame (8 bytes, hex).
     This is CRITICAL for accuracy: without it, "water_pump + not_working" would
     serve the same cached plan whether the motor is dead OR water is flowing.
-    Two visually different states → two different cache keys → two correct plans.
-
-    visual_hash="" (default) is kept for callers that have no frame (e.g. the
-    non-streaming /diagnose endpoint when video is absent).
     """
-    cats = sorted(infer_problem_categories(problem_text))
-    cluster = ",".join(cats) if cats else normalize_query(problem_text)[:60]
+    cluster = normalize_query(problem_text)[:60]
     raw = f"{machine_type.lower()}|{cluster}|{visual_hash}"
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
@@ -338,18 +327,16 @@ def load_vector_db() -> bool:
 
 def retrieve_rag_context(query: str, machine_type: str, k: int = RAG_TOP_K) -> str:
     """
-    Backward-compatible wrapper for the optimized RAG pipeline.
+    Backward-compatible wrapper for the optimized v7.0 RAG pipeline.
+    Category inference has been removed in favor of pure semantic search.
     """
     if vector_db is None:
         return ""
-
-    problem_cats = infer_problem_categories(query)
 
     return retrieve_with_metadata_filter(
         vector_db=vector_db,
         query=query,
         machine_type=machine_type,
-        problem_categories=problem_cats,
         k=k,
     )
 
@@ -727,16 +714,28 @@ async def diagnose(
         # the keyword matcher then resolves the machine type locally.
         # ─────────────────────────────────────────────────────────────────────
 
-        # Build coroutines — transcription only if budget allows
+        # ── Transcription: two-stage Groq Whisper + Gemini normalisation ────────
+        # transcribe_audio_full() returns {"raw_transcript", "normalized_problem"}.
+        # raw_transcript = exact Whisper output (accent-accurate, no paraphrase).
+        # normalized_problem = Gemini text normalisation (tiny text-only call).
+        # Falls back to original Gemini audio path when GROQ_API_KEY is absent.
+        # Mutable cells — closure-safe storage for async inner functions
+        _raw_transcript_store:  list[str]  = [""]
+        _transcript_meta_store: list[dict] = [{}]  # quality_grade, gemini_used, etc.
+
         async def _transcribe_batch() -> str:
             if can_call_gemini(ip):
-                text = await gemini_with_timeout(
-                    transcribe_audio_with_gemini(audio_path),
-                    fallback="farm machine problem",
+                result = await gemini_with_timeout(
+                    transcribe_audio_full(audio_path),   # machine_hint added below
+                    fallback=None,
                     context="transcription",
                 )
                 record_gemini_call(ip)
-                return text or "farm machine problem"
+                if result and isinstance(result, dict):
+                    _raw_transcript_store[0]  = result.get("raw_transcript", "")
+                    _transcript_meta_store[0] = result
+                    return result.get("normalized_problem") or "farm machine problem"
+                return "farm machine problem"
             logger.warning(f"⚠️  Gemini budget exceeded for {ip} — using fallback transcription")
             return "farm machine problem"
 
@@ -753,6 +752,42 @@ async def diagnose(
         problem_text = check_prompt_injection(
             problem_text_raw or "", ip=ip, field="transcription"
         )
+
+        # ── Machine-context re-validation (zero extra API calls) ──────────────
+        # Now that CLIP has given us a machine_hint, validate the transcription
+        # result with the correct context. Only triggers the re-check when
+        # Gemini was skipped (fast path) — if Gemini already ran it already
+        # had access to the hint via machine_hint="".
+        # Cost: pure Python bucket check, <1 ms.
+        _clip_hint_for_transcript = detection_clip.machine_type or ""
+        _tmeta = _transcript_meta_store[0]
+        if (
+            _clip_hint_for_transcript
+            and _tmeta.get("gemini_used") == "false"    # Gemini was skipped
+            and _raw_transcript_store[0]                # we have a raw transcript
+        ):
+            from services.transcription_service import (
+                _detect_symptom_buckets, _validate_output, _light_clean_raw
+            )
+            _raw_for_check = _raw_transcript_store[0]
+            _buckets       = _detect_symptom_buckets(_raw_for_check)
+            _ok, _reason   = _validate_output(
+                _raw_for_check, problem_text, _buckets, _clip_hint_for_transcript
+            )
+            if not _ok:
+                logger.warning(
+                    f"⚠️  Post-CLIP validation failed ({_reason}) — "
+                    f"re-normalising with machine_hint={_clip_hint_for_transcript!r}"
+                )
+                if can_call_gemini(ip):
+                    from services.transcription_service import _extract_with_gemini
+                    problem_text = await _extract_with_gemini(
+                        _raw_for_check, _buckets, _clip_hint_for_transcript
+                    )
+                    record_gemini_call(ip)
+                    problem_text = check_prompt_injection(
+                        problem_text, ip=ip, field="context_revalidation"
+                    )
 
         # ── Resolve machine type without an extra Gemini call ─────────────────
         resolved  = detection_clip.machine_type
@@ -827,8 +862,15 @@ async def diagnose(
             logger.warning(f"⚠️  Gemini budget exceeded for {ip} — skipping diagnosis Gemini call")
             diagnosis = _local_fallback_diagnosis(resolved, problem_text)
 
-        diagnosis["request_id"]   = request_id
-        diagnosis["transcription"] = problem_text
+        diagnosis["request_id"]      = request_id
+        diagnosis["transcription"]    = problem_text
+        diagnosis["raw_transcript"]   = _raw_transcript_store[0] or problem_text
+        _tmeta_d = _transcript_meta_store[0]
+        diagnosis["transcription_meta"] = {
+            "quality_grade": _tmeta_d.get("quality_grade", ""),
+            "gemini_used":   _tmeta_d.get("gemini_used", ""),
+            "skip_reason":   _tmeta_d.get("skip_reason", ""),
+        }
         diagnosis["detection"] = {
             "machine_type":    resolved,
             "confidence":      detection.confidence,
@@ -953,16 +995,23 @@ async def diagnose_stream(
             yield _sse("stage_start", {"stage": 0, "label": "Identifying your machine from the video"})
             yield _sse("stage_start", {"stage": 1, "label": "Understanding your voice complaint"})
 
-            # Build coroutines — transcription only if budget allows
+            # ── Transcription: full pipeline with audio pre-processing ──────────
+            _stream_raw_store:  list[str]  = [""]
+            _stream_meta_store: list[dict] = [{}]
+
             async def _transcribe() -> str:
                 if can_call_gemini(ip):
-                    text = await gemini_with_timeout(
-                        transcribe_audio_with_gemini(audio_path),
-                        fallback="farm machine problem",
+                    result = await gemini_with_timeout(
+                        transcribe_audio_full(audio_path),
+                        fallback=None,
                         context="stream/transcription",
                     )
                     record_gemini_call(ip)
-                    return text or "farm machine problem"
+                    if result and isinstance(result, dict):
+                        _stream_raw_store[0]  = result.get("raw_transcript", "")
+                        _stream_meta_store[0] = result
+                        return result.get("normalized_problem") or "farm machine problem"
+                    return "farm machine problem"
                 logger.warning(f"⚠️  Gemini budget exceeded [{ip}] — fallback transcription")
                 return "farm machine problem"
 
@@ -993,6 +1042,37 @@ async def diagnose_stream(
             problem_text = check_prompt_injection(
                 problem_text_raw or "", ip=ip, field="stream/transcription"
             )
+
+            # ── Machine-context re-validation (zero extra API calls normally) ──
+            _clip_hint_s = detection_clip.machine_type or ""
+            _smeta       = _stream_meta_store[0]
+            if (
+                _clip_hint_s
+                and _smeta.get("gemini_used") == "false"
+                and _stream_raw_store[0]
+            ):
+                from services.transcription_service import (
+                    _detect_symptom_buckets, _validate_output, _light_clean_raw
+                )
+                _raw_s   = _stream_raw_store[0]
+                _bkts_s  = _detect_symptom_buckets(_raw_s)
+                _ok_s, _reason_s = _validate_output(
+                    _raw_s, problem_text, _bkts_s, _clip_hint_s
+                )
+                if not _ok_s:
+                    logger.warning(
+                        f"⚠️  Stream post-CLIP validation failed ({_reason_s}) "
+                        f"— re-normalising hint={_clip_hint_s!r}"
+                    )
+                    if can_call_gemini(ip):
+                        from services.transcription_service import _extract_with_gemini
+                        problem_text = await _extract_with_gemini(
+                            _raw_s, _bkts_s, _clip_hint_s
+                        )
+                        record_gemini_call(ip)
+                        problem_text = check_prompt_injection(
+                            problem_text, ip=ip, field="stream/context_revalidation"
+                        )
 
             # ── Resolve machine type (no extra Gemini call) ───────────────────
             # Priority: (1) high-confidence CLIP, (2) client hint, (3) audio
@@ -1043,9 +1123,17 @@ async def diagnose_stream(
                     logger.info(f"🔧 Using client hint {hint!r} (conf={detection.confidence:.2f})")
                     resolved = hint
 
+            _smeta_final = _stream_meta_store[0]
             yield _sse("stage_done", {
-                "stage": 1, "label": "Understanding your voice complaint",
-                "transcription": problem_text,
+                "stage":            1,
+                "label":            "Understanding your voice complaint",
+                "transcription":    problem_text,
+                "raw_transcript":   _stream_raw_store[0] or problem_text,
+                "transcription_meta": {
+                    "quality_grade": _smeta_final.get("quality_grade", ""),
+                    "gemini_used":   _smeta_final.get("gemini_used", ""),
+                    "skip_reason":   _smeta_final.get("skip_reason", ""),
+                },
             })
             yield _sse("stage_done", {
                 "stage": 0, "label": "Identifying your machine from the video",
@@ -1110,8 +1198,15 @@ async def diagnose_stream(
                 logger.warning(f"⚠️  Gemini budget exceeded [{ip}] — fallback diagnosis")
                 diagnosis = _local_fallback_diagnosis(resolved, problem_text)
 
-            diagnosis["request_id"]    = request_id
-            diagnosis["transcription"] = problem_text
+            diagnosis["request_id"]      = request_id
+            diagnosis["transcription"]    = problem_text
+            diagnosis["raw_transcript"]   = _stream_raw_store[0] or problem_text
+            _smeta_result = _stream_meta_store[0]
+            diagnosis["transcription_meta"] = {
+                "quality_grade": _smeta_result.get("quality_grade", ""),
+                "gemini_used":   _smeta_result.get("gemini_used", ""),
+                "skip_reason":   _smeta_result.get("skip_reason", ""),
+            }
             diagnosis["detection"] = {
                 "machine_type":    resolved,
                 "confidence":      detection.confidence,
@@ -1547,7 +1642,82 @@ async def delete_agent_session(
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
     return {"status": "deleted", "session_id": session_id}
 
+from pydantic import BaseModel
 
+# ─────────────────────────────────────────────────────────────────────────────
+# EVAL ENDPOINT  v2.0 — evaluate_text_rag
+# ─────────────────────────────────────────────────────────────────────────────
+# BUG FIX: Previously EvalRequest defaulted machine_type="tractor" and the
+# evaluate_rag.py harness never sent machine_type in the payload. This meant
+# ALL 8 evaluation queries (water pump, rotavator, harvester, etc.) were
+# diagnosed as tractor problems — causing catastrophic wrong-machine
+# hallucinations (TC_018: water pump → tractor cooling system diagnosis).
+#
+# FIX:
+#   1. EvalRequest.machine_type now has NO default — the caller MUST send it.
+#   2. If not sent (legacy clients), we infer machine_type from the query text
+#      via a keyword map rather than blindly defaulting to "tractor".
+#   3. evaluate_rag.py v2.0 now always sends machine_type inferred from
+#      eval_dataset.json items or the _infer_machine_type() helper.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EVAL ENDPOINT  v2.0 — evaluate_text_rag
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EVAL_MACHINE_KEYWORDS = {
+    "submersible_pump": ["submersible", "borewell", "deep well", "tube well"],
+    "water_pump":       ["centrifugal pump", "water pump", "suction pipe", "foot valve",
+                         "volute", "priming", "centrifugal"],
+    "electric_motor":   ["electric motor", "motor winding", "capacitor", "relay", "mcb"],
+    "harvester":        ["harvester", "combine", "header", "threshing drum", "chaff"],
+    "thresher":         ["thresher", "threshing", "feed inlet", "concave"],
+    "rotavator":        ["rotavator", "rotary tiller", "tine", "shear bolt", "pto"],
+    "chaff_cutter":     ["chaff cutter", "fodder cutter"],
+    "power_tiller":     ["power tiller", "walk-behind"],
+    "diesel_engine":    ["diesel engine", "stationary engine"],
+    "generator":        ["generator", "genset", "avr", "alternator"],
+    "sprayer":          ["sprayer", "spray pump", "nozzle", "chemical spray", "power sprayer"], # FIXED NAME
+    "drone":            ["drone", "uav", "agri drone"],
+    "tractor":          ["tractor"],
+}
+
+def _infer_machine_type_from_query(query: str) -> str:
+    """Keyword-score the query using regex word boundaries."""
+    q = query.lower()
+    scores: dict = {}
+    for machine, keywords in _EVAL_MACHINE_KEYWORDS.items():
+        score = sum(1 for kw in keywords if re.search(rf'\b{re.escape(kw)}\b', q))
+        if score:
+            scores[machine] = score
+    if not scores:
+        return "tractor"
+    return max(scores, key=lambda m: scores[m])
+
+class EvalRequest(BaseModel):
+    query: str
+    machine_type: str = ""   # empty = will be inferred from query text
+
+@app.post("/evaluate_text_rag")
+async def evaluate_text_rag(req: EvalRequest):
+    """
+    Evaluation endpoint for RAG accuracy testing without audio/video.
+    Always requires machine_type — infers from query if not provided.
+    """
+    resolved_machine = req.machine_type.strip() or _infer_machine_type_from_query(req.query)
+    logger.info(f"📊 Eval: machine={resolved_machine} | query={req.query[:60]}")
+
+    rag_context = retrieve_rag_context(req.query, resolved_machine)
+    knowledge   = load_knowledge_base(resolved_machine)
+
+    diagnosis = await generate_diagnosis_with_gemini(
+        machine_type=resolved_machine,
+        problem_text=req.query,
+        language="en",
+        rag_context=rag_context,
+        knowledge_base=knowledge,
+        visual_frames=[],   # text-only evaluation
+    )
+    return JSONResponse(content=diagnosis)
 # ============================================================================
 # MAIN
 # ============================================================================

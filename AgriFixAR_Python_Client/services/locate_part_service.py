@@ -253,7 +253,7 @@ Return ONLY this JSON (no markdown, no preamble):
             logger.info(f"locate_part: rejected — visibility={vis_pct}% < 60%")
 
         raw_found = raw.get("found", False) and not any_rejected
-        raw_conf  = float(raw.get("confidence", 0.0))
+        raw_conf  = float(raw.get("confidence") or 0.0)
 
         # Second gate: confidence below threshold → not found
         if raw_conf < _CONF_THRESHOLD:
@@ -277,18 +277,26 @@ Return ONLY this JSON (no markdown, no preamble):
                 # Area threshold lowered 0.02 → 0.009:
                 # clutch_pedal w=0.10 h=0.18 area=0.018 was rejected.
                 # Individual w/h >= 0.03 already prevent degenerate boxes.
-                size_ok   = (0.03 <= w <= 0.60 and 0.03 <= h <= 0.60
-                             and 0.009 <= area_frac <= 0.60)
+                # Per-axis upper limit REMOVED — any single-axis width is valid.
+                # Reason: air_filter housing fills 90% of frame height (h=0.90),
+                # clutch_pedal fills 65–70% of width — both are real detections.
+                # A per-axis cap causes false rejections for large parts.
+                # Area max raised 0.60 → 0.70: covers w=0.70 h=0.90 (area=0.63).
+                # Full-image hallucinations (area > 0.70) are still blocked.
+                size_ok   = (0.03 <= w and 0.03 <= h
+                             and 0.009 <= area_frac <= 0.70)
 
                 # Bbox must not spill outside image AND not touch the edge
                 # (edge-touching bbox usually means part is cut off or machine
                 # is partially out of frame → unreliable detection)
-                _edge_margin = 0.01  # 1% buffer from edge
+                # Strict bounds: bbox must stay within 0.0–1.0 (no margin).
+                # A 0.01 edge margin was rejecting parts that touch the frame
+                # edge — the UX 'move back' hint handles these cases instead.
                 bounds_ok = (
-                    cx - w / 2 >= _edge_margin and
-                    cx + w / 2 <= 1.0 - _edge_margin and
-                    cy - h / 2 >= _edge_margin and
-                    cy + h / 2 <= 1.0 - _edge_margin
+                    cx - w / 2 >= 0.0 and
+                    cx + w / 2 <= 1.0 and
+                    cy - h / 2 >= 0.0 and
+                    cy + h / 2 <= 1.0
                 )
 
                 if coords_ok and size_ok and bounds_ok:

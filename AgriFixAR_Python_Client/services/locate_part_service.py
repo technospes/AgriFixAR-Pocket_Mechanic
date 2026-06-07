@@ -1,34 +1,11 @@
-"""
-services/locate_part_service.py
-AR Part Location — Gemini Vision returns normalised bbox.
-
-Called by /locate_part endpoint (NEW) for the AR guidance loop.
-This is SEPARATE from verify_step_with_gemini (which checks correctness).
-This service answers ONE question: "Where is this part in the image?"
-
-Token budget per call:
-  Input:  ~493 tokens (image 258 + prompt ~235)
-  Output: ~80  tokens (JSON only)
-  Total:  ~573 tokens ≈ $0.00007
-
-Anti-hallucination design:
-  - 4 reject flags (boolean). If ANY is true → found=false → no arrow shown.
-  - Gemini must CONFIRM the part before returning bbox.
-  - confidence < 0.72 → caller treats as not found.
-  - If Gemini contradicts itself (found=true + reject flag=true) →
-    backend forces found=false before returning to Flutter.
-"""
-
 from __future__ import annotations
 import asyncio
 import json
 import logging
 import io
 from typing import Optional
-
 import google.generativeai as genai
 from PIL import Image
-
 import time as _time
 from utils.helpers import sanitize_json_text
 from utils.machine_registry import get_area_farmer_description, get_profile

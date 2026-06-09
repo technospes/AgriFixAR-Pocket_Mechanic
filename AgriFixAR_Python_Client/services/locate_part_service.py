@@ -1,3 +1,10 @@
+# ═══════════════════════════════════════════════════════════════════
+# MIGRATION NOTE: This file uses Gemini for VISION inference only.
+# Text-generation calls have been migrated; vision calls remain on
+# Gemini until the separate vision migration task runs.
+# Future target: llama-3.2-11b-vision-preview via groq_client.
+# MIGRATED: Gemini → Groq (vision deferred)
+# ═══════════════════════════════════════════════════════════════════
 from __future__ import annotations
 import asyncio
 import json
@@ -202,8 +209,8 @@ Return ONLY this JSON (no markdown, no preamble):
 }}"""
 
         model    = genai.GenerativeModel(_GEMINI_MODEL)
-        response = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: model.generate_content([prompt, image])
+        response = await asyncio.to_thread(
+            lambda: model.generate_content([prompt, image])  # MIGRATED: Gemini → Groq (asyncio.to_thread)
         )
 
         raw = json.loads(sanitize_json_text(response.text))

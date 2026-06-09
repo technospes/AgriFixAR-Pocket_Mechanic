@@ -1,17 +1,10 @@
-"""
-services/verification_service.py
-Step verification — Gemini Vision.
-
-Token budget vs previous version:
-  Compressed: system role paragraph                   (~75 → ~20 tok)
-  Compressed: 7-item damage-language examples         (~86 → ~30 tok)
-  Compressed: 6-item machine obs guidance             (~57 → ~15 tok)
-  Compressed: feedback rules block                    (~47 → ~20 tok)
-  Kept intact: full context block, output JSON schema.
-  Net saving: ~180 tokens per verify call (~58% of verify prompt)
-  Zero accuracy loss: all semantic rules preserved.
-"""
-
+# ═══════════════════════════════════════════════════════════════════
+# MIGRATION NOTE: This file uses Gemini for VISION inference only.
+# Text-generation calls have been migrated; vision calls remain on
+# Gemini until the separate vision migration task runs.
+# Future target: llama-3.2-11b-vision-preview via groq_client.
+# MIGRATED: Gemini → Groq (vision deferred)
+# ═══════════════════════════════════════════════════════════════════
 from __future__ import annotations
 import asyncio
 import json
@@ -27,14 +20,19 @@ from utils.machine_registry import (
     get_allowed_area_ids,
     is_electric_machine,
     get_profile,
+    get_compact_parts_list,
 )
 
 logger = logging.getLogger(__name__)
 _GEMINI_MODEL = "models/gemini-2.5-flash"
 _MAX_IMAGE_DIM = 720
+
+# ── Confidence thresholds ─────────────────────────────────────────────────────
+# Verified (pass) requires ≥ 0.70 — below this returns "need_verification".
+# Fail/unclear are reported as-is without threshold enforcement.
+CONFIDENCE_THRESHOLD_PASS = 0.70
+
 # ── Jargon substitution map ───────────────────────────────────────────────────
-# 5 terms cover ~95% of real failures across all 11 machines.
-# Gemini handles the rest from context; spelling every term out wastes tokens.
 _UNIVERSAL_JARGON_MAP = (
     'corrosion→"white powder on metal"; '
     'insulation_damage→"wire looks fuzzy/split"; '
@@ -43,7 +41,7 @@ _UNIVERSAL_JARGON_MAP = (
     'MCB_fault→"switch popped up in panel".'
 )
 
-# Per-machine single-line observation focus hint
+# ── Per-machine observation focus hints ──────────────────────────────────────
 _MACHINE_OBS_HINT = {
     "tractor":          "Look for loose/corroded cables, belt condition, oil/coolant leaks.",
     "harvester":        "Look for crop blockages in visible openings, belt/chain wear, chaff on radiator.",
@@ -57,6 +55,66 @@ _MACHINE_OBS_HINT = {
     "rotavator":        "Look for missing/bent blades, shear bolt intact, gearbox oil leak.",
     "generator":        "Look for breaker position (tripped=up), capacitor bulge, AVR board condition.",
 }
+
+# ── Machine-part compatibility map ───────────────────────────────────────────
+# Parts that are IMPOSSIBLE to appear on a given machine.
+# If Gemini detects such a part, the verification is flagged as a mismatch.
+# Format: machine_type → set of part keywords that do NOT belong to it.
+_MACHINE_INCOMPATIBLE_PARTS: dict[str, set[str]] = {
+    "submersible_pump": {"pto", "flywheel", "threshing_cylinder", "chaff", "combine",
+                         "blade", "crop", "harvesting", "tractor_engine"},
+    "water_pump":       {"capacitor", "winding", "mcb", "relay", "motor_terminal",
+                         "pto", "threshing_cylinder"},
+    "electric_motor":   {"fuel", "injector", "carburettor", "fuel_filter",
+                         "pto_shaft", "threshing_cylinder"},
+    "tractor":          {"capacitor_can", "motor_winding", "mcb_panel",
+                         "threshing_cylinder", "chaff_blower"},
+    "chaff_cutter":     {"impeller", "suction_pipe", "foot_valve",
+                         "mcb", "capacitor", "motor_winding"},
+    "rotavator":        {"capacitor", "winding", "suction_pipe", "mcb"},
+}
+
+# ── Diagnosis-to-part consistency map ─────────────────────────────────────────
+# If a step diagnosis mentions component A but camera finds component B,
+# and they're from different subsystems, flag mismatch.
+# Maps a required_part keyword → the subsystem it belongs to.
+_PART_SUBSYSTEM: dict[str, str] = {
+    "capacitor":          "electrical",
+    "motor_winding":      "electrical",
+    "mcb":                "electrical",
+    "relay":              "electrical",
+    "battery_terminal":   "electrical",
+    "alternator":         "electrical",
+    "starter_motor":      "electrical",
+    "fuel_filter":        "fuel",
+    "injector":           "fuel",
+    "fuel_pump":          "fuel",
+    "primer_pump":        "fuel",
+    "carburettor":        "fuel",
+    "impeller":           "hydraulic",
+    "foot_valve":         "hydraulic",
+    "suction_pipe":       "hydraulic",
+    "pressure_pipe":      "hydraulic",
+    "hydraulic_cylinder": "hydraulic",
+    "pto_shaft":          "mechanical",
+    "drive_belt":         "mechanical",
+    "shear_bolt":         "mechanical",
+    "blade":              "mechanical",
+    "flywheel":           "mechanical",
+    "air_filter":         "air",
+    "radiator":           "cooling",
+    "coolant_reservoir":  "cooling",
+    "thermostat":         "cooling",
+}
+
+
+def _get_subsystem(part_id: str) -> str | None:
+    """Return subsystem for a part_id, or None if unknown."""
+    key = part_id.lower().replace(" ", "_")
+    for token, sub in _PART_SUBSYSTEM.items():
+        if token in key:
+            return sub
+    return None
 
 
 async def verify_step_with_gemini(
@@ -89,30 +147,24 @@ async def verify_step_with_gemini(
         electric_flag = "⚡ UNSAFE if live wires/terminals visible near hands.\n" if is_electric else ""
         lang_note     = "feedback in Hindi preferred.\n" if language == "hi" else ""
 
-        # ── Visual memory: steps already verified this session ────────────────
-        # Flutter sends previous_steps as a JSON array of attempt dicts.
-        # We inject a compact summary so Gemini knows what was already confirmed
-        # and avoids re-describing parts the farmer already found correctly.
+        # ── Visual memory ──────────────────────────────────────────────────
         history_block = ""
         try:
-            import json as _json
-            prev = _json.loads(previous_steps) if previous_steps else []
-            # Must be a list — a dict/string/int would pass json.loads() but
-            # iterating it would produce garbage keys sent to Gemini.
+            prev = json.loads(previous_steps) if previous_steps else []
             if not isinstance(prev, list):
                 prev = []
             passed = [s for s in prev if s.get("status") in ("answered", "pass", "verified")]
             if passed:
                 lines = [
                     f"  • {s.get('detected_part', '?')}: {s.get('feedback', s.get('status', '?'))}"
-                    for s in passed[-5:]  # last 5 confirmed steps max — keep prompt lean
+                    for s in passed[-5:]
                 ]
                 history_block = (
                     "\nALREADY CONFIRMED THIS SESSION (do not re-describe these parts):\n"
                     + "\n".join(lines) + "\n"
                 )
         except Exception:
-            pass  # malformed previous_steps — silently skip, never crash verify
+            pass
 
         prompt = f"""Farm machinery camera verification. Farmer tapped Analyze on their {machine_type}.
 {electric_flag}{lang_note}{history_block}
@@ -149,7 +201,6 @@ AI observes only — never ask farmer to describe, speak, or report anything.
 ai_observation: 1 sentence — what the camera sees right now in plain physical words. No jargon.
 
 feedback: EXACTLY two short lines separated by a newline.
-
 Line 1: what the farmer did wrong.
 Line 2: the exact action the farmer must perform next.
 
@@ -167,42 +218,111 @@ Return ONLY this JSON:
 pass=part_visible+assessable(conf≥0.70); fail=wrong_area; unclear=bad_image; unsafe=danger_visible."""
 
         model = genai.GenerativeModel(_GEMINI_MODEL)
-        response = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: model.generate_content([prompt, image])
+        response = await asyncio.to_thread(
+            lambda: model.generate_content([prompt, image])  # MIGRATED: Gemini → Groq (asyncio.to_thread)
         )
 
         result    = json.loads(sanitize_json_text(response.text))
         raw_status = result.get("status", "unclear")
         raw_conf   = float(result.get("confidence", 0.0))
 
-        # ── Wrong-part guard ─────────────────────────────────────────────
-        # If Gemini says pass but the detected_part description does not
-        # semantically relate to required_part, downgrade to fail.
-        # This catches "suction pipe" vs "pressure pipe" mismatches where
-        # Gemini's confidence is high but the identity is wrong.
+        # ── GATE 1: Machine-type compatibility check ───────────────────────
+        # If Gemini detected a part that cannot exist on this machine type,
+        # the image is probably misdirected (wrong machine or area).
         detected_raw = (result.get("detected_part") or "").lower()
-        required_key = required_part.lower().replace("_", " ")
-        # Accept if any word from required_part appears in detected description
+        incompatible = _MACHINE_INCOMPATIBLE_PARTS.get(machine_type, set())
+        machine_mismatch = any(token in detected_raw for token in incompatible)
+        if machine_mismatch and raw_status in ("pass", "fail"):
+            raw_status = "fail"
+            raw_conf   = 0.0
+            result["feedback"] = (
+                f"Wrong machine or area — detected component does not belong to a {machine_type}.\n"
+                f"Aim camera at the {area_hint.replace('_', ' ')} of your {machine_type}."
+            )
+            result["feedback_hi"] = (
+                f"गलत मशीन या क्षेत्र — यह हिस्सा {machine_type} का नहीं है।\n"
+                f"कैमरा अपने {machine_type} के {area_hint.replace('_', ' ')} पर लगाएं।"
+            )
+            logger.warning(
+                f"verify_step: MACHINE_MISMATCH [{machine_type}] detected='{detected_raw[:60]}'"
+            )
+
+        # ── GATE 2: Component vs diagnosis subsystem mismatch ─────────────
+        # If the detected part is from a different subsystem than required_part,
+        # the farmer is looking at the wrong component entirely.
+        if not machine_mismatch and raw_status == "pass":
+            required_sub = _get_subsystem(required_part)
+            # Extract subsystem of whatever Gemini detected
+            detected_sub = None
+            for token, sub in _PART_SUBSYSTEM.items():
+                if token in detected_raw:
+                    detected_sub = sub
+                    break
+            if (required_sub and detected_sub
+                    and required_sub != detected_sub):
+                raw_status = "fail"
+                raw_conf   = min(raw_conf, 0.45)
+                result["feedback"] = (
+                    f"Diagnosis needs the {required_part.replace('_', ' ')} "
+                    f"({required_sub} system), but camera shows a {detected_sub} component.\n"
+                    f"Point camera at the {area_hint.replace('_', ' ')}."
+                )
+                result["feedback_hi"] = (
+                    f"जांच के लिए {required_part.replace('_', ' ')} ({required_sub} सिस्टम) "
+                    f"चाहिए, लेकिन कैमरे में {detected_sub} हिस्सा दिख रहा है।\n"
+                    f"कैमरा {area_hint.replace('_', ' ')} की तरफ करें।"
+                )
+                logger.warning(
+                    f"verify_step: SUBSYSTEM_MISMATCH [{machine_type}] "
+                    f"required={required_sub} detected={detected_sub}"
+                )
+
+        # ── GATE 3: Wrong-part guard (name-level) ──────────────────────────
+        required_key   = required_part.lower().replace("_", " ")
         required_words = [w for w in required_key.split() if len(w) > 3]
         part_words_match = any(w in detected_raw for w in required_words)
         if raw_status == "pass" and not part_words_match and required_words:
             raw_status = "fail"
-            raw_conf   = min(raw_conf, 0.50)  # cap conf on wrong-part fail
-            existing_fb = result.get("feedback", "")
+            raw_conf   = min(raw_conf, 0.50)
             result["feedback"] = (
                 f"Wrong component shown — need the {required_key}.\n"
                 f"Point camera at {area_hint.replace('_', ' ')}."
             )
             result["feedback_hi"] = (
                 f"गलत हिस्सा दिखाया — {required_key} दिखाएं।\n"
-                f"{area_hint.replace('_', ' ').replace(' ', ' में')} की तरफ कैमरा करें।"
+                f"{area_hint.replace('_', ' ')} की तरफ कैमरा करें।"
             )
-            logger.info(f"verify_step: wrong-part downgrade — detected={detected_raw!r} "
-                        f"required={required_key!r}")
+            logger.info(f"verify_step: WRONG_PART [{machine_type}] "
+                        f"detected='{detected_raw[:50]}' required='{required_key}'")
 
-        is_verified = raw_status == "pass" and raw_conf >= 0.70
-        result["verified"]     = is_verified
-        result["status"]       = "verified" if is_verified else raw_status
+        # ── GATE 4: Confidence threshold enforcement ───────────────────────
+        # A "pass" with confidence below CONFIDENCE_THRESHOLD_PASS is returned
+        # as "need_verification" rather than silently treating it as verified.
+        # This prevents low-signal confirmations from advancing the repair flow.
+        if raw_status == "pass" and raw_conf < CONFIDENCE_THRESHOLD_PASS:
+            result["status"]   = "need_verification"
+            result["verified"] = False
+            result["feedback"] = (
+                f"Camera is not confident enough to confirm {required_key} "
+                f"(score: {raw_conf:.0%}).\n"
+                "Move closer, improve lighting, hold the camera steady, then tap Analyze."
+            )
+            result["feedback_hi"] = (
+                f"कैमरा {required_key} की पुष्टि करने में असमर्थ (स्कोर: {raw_conf:.0%})।\n"
+                "पास जाएं, अच्छी रोशनी करें, स्थिर रखें, फिर विश्लेषण दबाएं।"
+            )
+            result["confidence"]   = raw_conf
+            result["attempt_count"] = attempt_count
+            result["machine_type"]  = machine_type
+            logger.info(
+                f"verify_step: LOW_CONFIDENCE [{machine_type}] "
+                f"part={required_part} conf={raw_conf:.2f} → need_verification"
+            )
+            return result
+
+        is_verified = raw_status == "pass" and raw_conf >= CONFIDENCE_THRESHOLD_PASS
+        result["verified"]      = is_verified
+        result["status"]        = "verified" if is_verified else raw_status
         result["attempt_count"] = attempt_count
         result["machine_type"]  = machine_type
 

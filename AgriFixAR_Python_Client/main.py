@@ -12,7 +12,9 @@ from datetime import datetime
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Request, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import google.generativeai as genai
+import google.generativeai as genai  # kept for embeddings only — DO NOT REMOVE
+from utils.groq_client import groq_client, TEXT_MODEL, JSON_CONFIG  # MIGRATED: Gemini → Groq
+from utils.json_repair import repair_json
 from PIL import Image
 import io
 from dotenv import load_dotenv
@@ -21,7 +23,7 @@ import hashlib
 from contextlib import asynccontextmanager
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_core.embeddings import Embeddings
 from typing import List as _List
 from rag import (
@@ -30,7 +32,8 @@ from rag import (
     RAG_TOP_K,
     RAG_MIN_SCORE,
 )
-
+from pipeline_orchestrator import run_full_pipeline, resolve_machine_from_query
+from db_lock import LOCK_SCORE_THRESHOLD
 # ── New modular imports ───────────────────────────────────────────────────────
 from agent.models import CreateSessionRequest, CreateSessionResponse, AgentNextRequest
 from agent import session_manager, repair_agent
@@ -257,12 +260,15 @@ async def lifespan(app: FastAPI):
     KB_DIR.mkdir(exist_ok=True)
 
     # Load CLIP once at startup — shared across all requests (workers=1)
-    clip_ok = await asyncio.get_event_loop().run_in_executor(None, load_clip_model)
+    clip_ok = await asyncio.to_thread(load_clip_model)
     logger.info(
         "🔮 CLIP detector: ACTIVE" if clip_ok
         else "⚠️  CLIP detector: DISABLED — audio keywords + Gemini fallback only"
     )
-
+    from crossencoder_reranker import _RERANKER
+    await asyncio.to_thread(_RERANKER._load)
+    logger.info("✅ CrossEncoder pre-loaded")
+    
     rag_ok = load_vector_db()
     logger.info("🔍 RAG pipeline: ACTIVE" if rag_ok else "⚠️  RAG pipeline: DISABLED — Gemini-only mode")
     yield
@@ -314,16 +320,28 @@ def load_vector_db() -> bool:
         logger.warning("⚠️  chroma_db/ not found — RAG disabled")
         return False
     try:
-        embeddings = GoogleEmbeddingsV1(model="models/gemini-embedding-001", google_api_key=GOOGLE_AI_API_KEY)
-        vector_db = Chroma(persist_directory=str(CHROMA_DIR), embedding_function=embeddings)
+        from langchain_huggingface import HuggingFaceEmbeddings
+        embeddings = HuggingFaceEmbeddings(
+            model_name="BAAI/bge-m3",
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+
+        vector_db = Chroma(
+            persist_directory=str(CHROMA_DIR),
+            embedding_function=embeddings,
+        )
+        # NEW: load machine aliases + symptoms into router
+        from query_router import load_machine_registry
+        load_machine_registry(vector_db)
+        from rag import load_dynamic_compat_map
+        load_dynamic_compat_map(vector_db)
         stored_ids = vector_db.get()["ids"]
         logger.info(f"✅ Chroma DB loaded — {len(stored_ids)} chunks")
         return True
     except Exception as exc:
         logger.error(f"❌ Failed to load Chroma DB: {exc}")
-        vector_db = None
         return False
-
 
 def retrieve_rag_context(query: str, machine_type: str, k: int = RAG_TOP_K) -> str:
     """
@@ -388,11 +406,13 @@ Return ONLY this JSON:
 If ANY hazard is detected, set safe to false immediately. Do not wait for certainty.
 Return ONLY JSON, no markdown."""
 
+        # VISION CALL — kept on Gemini until vision migration task  # MIGRATED: Gemini → Groq (pending)
+        # Future: swap to llama-3.2-11b-vision-preview when visual migration runs.
         model = genai.GenerativeModel("models/gemini-2.5-flash")
-        response = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: model.generate_content([prompt, image])
+        response = await asyncio.to_thread(
+            lambda: model.generate_content([prompt, image])
         )
-        result = json.loads(sanitize_json_text(response.text))
+        result = repair_json(response.text)  # MIGRATED: Gemini → Groq (repair_json replaces json.loads+sanitize)
         if not result.get("safe"):
             logger.warning(f"⚠️ Safety hazard: {result.get('hazard_detected')}")
         return result
@@ -474,6 +494,8 @@ async def health(request: Request):
             "chunks": rag_chunks,
             "top_k": RAG_TOP_K,
             "min_score": RAG_MIN_SCORE,
+            "lock_threshold": LOCK_SCORE_THRESHOLD,
+            "pipeline_version": "v10.1+phases123",
         },
         "active_sessions": len(session_manager.list_sessions()),
         "your_gemini_calls_this_hour": get_gemini_usage(ip),
@@ -819,10 +841,6 @@ async def diagnose(
             f"src={detection.source} gemini={detection.gemini_used})"
         )
 
-        # ── RAG: fully local, zero Gemini calls ───────────────────────────────
-        rag_context = retrieve_rag_context(problem_text, resolved)
-        knowledge   = load_knowledge_base(resolved)
-
         # ── Reuse frames already decoded by CLIP — zero extra video I/O ──────
         # detection.frames holds the same early/mid/late JPEG bytes that CLIP
         # quality-scored and used for classification. No re-open, no re-decode.
@@ -835,6 +853,38 @@ async def diagnose(
         plan_cache_key = _plan_cache_key(resolved, problem_text, visual_hash)
         cached_plan    = _plan_cache_get(plan_cache_key)
 
+        # ── Phase 1–3 Pipeline: router → DB lock → visual gate ────────────────
+        # Phase 1 (router) is skipped here because machine type is already
+        # resolved above via CLIP + transcription. We pass machine_type_override
+        # so the pipeline goes straight to Phase 2 (DB lock) and Phase 3 (visual gate).
+        pipeline = await run_full_pipeline(
+            query=problem_text,
+            vector_db=vector_db,
+            frame_bytes=mid_frame,              # best mid-frame for visual gate
+            language=language,
+            machine_type_override=resolved,     # already resolved by CLIP
+        )
+
+        if pipeline.blocked:
+            # Phase 2 (no DB match) or Phase 3 (visual gate failed) — no LLM call
+            logger.info(f"🔒 /diagnose pipeline blocked: {pipeline.block_reason}")
+            block_response = pipeline.response
+            block_response["request_id"]   = request_id
+            block_response["transcription"] = problem_text
+            block_response["detection"]     = {
+                "machine_type":     resolved,
+                "confidence":       detection.confidence,
+                "source":           detection.source,
+                "clip_confidence":  detection.clip_confidence,
+                "audio_confidence": detection.audio_confidence,
+                "gemini_used":      detection.gemini_used,
+            }
+            return JSONResponse(content=block_response)
+
+        # All gates passed — safe to proceed with LLM diagnosis
+        rag_context = pipeline.rag_context
+        knowledge   = load_knowledge_base(pipeline.machine_type)
+
         # ── Diagnosis: ONE Gemini reasoning call (now multimodal 3-frame) ─────
         if cached_plan is not None:
             diagnosis = cached_plan
@@ -843,7 +893,7 @@ async def diagnose(
         elif can_call_gemini(ip):
             diagnosis = await gemini_with_timeout(
                 generate_diagnosis_with_gemini(
-                    machine_type=resolved,
+                    machine_type=pipeline.machine_type,
                     problem_text=problem_text,
                     language=language,
                     rag_context=rag_context,
@@ -855,6 +905,11 @@ async def diagnose(
             )
             if diagnosis:
                 record_gemini_call(ip)
+                # Enrich with visual gate findings before caching
+                if pipeline.gate:
+                    diagnosis["confirmed_part"]     = pipeline.gate.part_id
+                    diagnosis["visual_observation"] = pipeline.gate.fault_description
+                    diagnosis["rag_score"]          = round(pipeline.lock.score, 3)
                 _plan_cache_set(plan_cache_key, diagnosis)
             else:
                 diagnosis = _local_fallback_diagnosis(resolved, problem_text)
@@ -1142,24 +1197,62 @@ async def diagnose_stream(
                 "detection_source":     detection.source,
             })
 
-            # ── Stage 2: RAG — fully local, zero Gemini calls ─────────────────
-            yield _sse("stage_start", {"stage": 2, "label": "Searching repair manuals for your issue"})
-            rag_context = retrieve_rag_context(problem_text, resolved)
-            rag_chunks  = len(rag_context.split("---")) if rag_context else 0
-
-            # ── Reuse frames already decoded by CLIP — zero extra video I/O ────
+            # ── Stage 2: Pipeline (Phase 1–3) — RAG + DB lock + visual gate ────
+            # Reuse frames already decoded by CLIP — zero extra video I/O.
             # detection.frames holds the early/mid/late JPEG bytes that CLIP
             # quality-scored during Stage 0. No re-open, no re-decode, no cv2.
-            # 3 frames give Gemini temporal context: all 3 show water flowing →
-            # machine RUNNING; frame 3 still but 1-2 had motion → cut out mid-run.
             clip_frames  = detection.frames
             mid_frame    = clip_frames[len(clip_frames) // 2] if clip_frames else None
             visual_hash  = _phash_bytes(mid_frame) if mid_frame else ""
             logger.info(f"📸 Frames from CLIP cache: {len(clip_frames)}/3  phash={visual_hash or 'none'}")
 
+            yield _sse("stage_start", {"stage": 2, "label": "Searching repair manuals for your issue"})
+
+            # Phase 1 router is skipped — machine already resolved via CLIP.
+            # Pipeline runs Phase 2 (DB lock) and Phase 3 (visual gate).
+            pipeline = await run_full_pipeline(
+                query=problem_text,
+                vector_db=vector_db,
+                frame_bytes=mid_frame,          # mid frame for visual gate
+                language=language,
+                machine_type_override=resolved, # already resolved by CLIP
+            )
+
+            if pipeline.blocked:
+                logger.info(f"🔒 /diagnose/stream pipeline blocked: {pipeline.block_reason}")
+                block_response = pipeline.response
+                block_response["request_id"]    = request_id
+                block_response["transcription"] = problem_text
+                block_response["detection"]     = {
+                    "machine_type":     resolved,
+                    "confidence":       detection.confidence,
+                    "source":           detection.source,
+                    "clip_confidence":  detection.clip_confidence,
+                    "audio_confidence": detection.audio_confidence,
+                    "gemini_used":      detection.gemini_used,
+                }
+                yield _sse("stage_done", {
+                    "stage": 2, "label": "Searching repair manuals for your issue",
+                    "rag_chunks": 0, "rag_active": False,
+                    "pipeline_blocked": True,
+                    "block_reason": pipeline.block_reason,
+                })
+                yield _sse("stage_done", {
+                    "stage": 3, "label": "Preparing your step-by-step repair guide",
+                    "result": block_response,
+                    "cache_hit": False,
+                })
+                yield _sse("done", {})
+                return
+
+            rag_context = pipeline.rag_context
+            rag_chunks  = len(rag_context.split("---")) if rag_context else 0
+
             yield _sse("stage_done", {
                 "stage": 2, "label": "Searching repair manuals for your issue",
                 "rag_chunks": rag_chunks, "rag_active": rag_chunks > 0,
+                "pipeline_blocked": False,
+                "rag_score": round(pipeline.lock.score, 3) if pipeline.lock else 0,
             })
 
             # ── Stage 3: Diagnosis — ONE Gemini call, multimodal 3-frame ─────
@@ -1167,9 +1260,9 @@ async def diagnose_stream(
             # symptom cluster but different visual state → different cache entry.
             # "water flowing" and "pump completely dead" get separate cached plans.
             yield _sse("stage_start", {"stage": 3, "label": "Preparing your step-by-step repair guide"})
-            knowledge = load_knowledge_base(resolved)
+            knowledge = load_knowledge_base(pipeline.machine_type)
 
-            plan_cache_key = _plan_cache_key(resolved, problem_text, visual_hash)
+            plan_cache_key = _plan_cache_key(pipeline.machine_type, problem_text, visual_hash)
             cached_plan    = _plan_cache_get(plan_cache_key)
 
             if cached_plan is not None:
@@ -1179,7 +1272,7 @@ async def diagnose_stream(
             elif can_call_gemini(ip):
                 diagnosis = await gemini_with_timeout(
                     generate_diagnosis_with_gemini(
-                        machine_type=resolved,
+                        machine_type=pipeline.machine_type,
                         problem_text=problem_text,
                         language=language,
                         rag_context=rag_context,
@@ -1191,6 +1284,11 @@ async def diagnose_stream(
                 )
                 if diagnosis:
                     record_gemini_call(ip)
+                    # Enrich with visual gate findings before caching
+                    if pipeline.gate:
+                        diagnosis["confirmed_part"]     = pipeline.gate.part_id
+                        diagnosis["visual_observation"] = pipeline.gate.fault_description
+                        diagnosis["rag_score"]          = round(pipeline.lock.score, 3)
                     _plan_cache_set(plan_cache_key, diagnosis)
                 else:
                     diagnosis = _local_fallback_diagnosis(resolved, problem_text)
@@ -1562,9 +1660,36 @@ async def submit_feedback(
 async def create_agent_session(request: CreateSessionRequest):
     """
     Create a new stateful repair session for ANY supported farm machine.
+    If machine_type is not provided (or empty), Phase 1 router auto-detects
+    it from the problem_description using a lightweight LLM call.
     """
-    # Normalise alias → canonical machine ID
-    canonical_type = resolve_machine_id(request.machine_type)
+    # ── Phase 1: Dynamic machine-type resolution ──────────────────────────────
+    if request.machine_type and request.machine_type.strip():
+        # Caller supplied a machine_type — normalise alias → canonical ID
+        canonical_type = resolve_machine_id(request.machine_type)
+        if not canonical_type:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown machine type: '{request.machine_type}'. Call GET /machines for the full list.",
+            )
+    else:
+        # No machine_type provided — use Phase 1 router to extract from problem description
+        router_result = await resolve_machine_from_query(request.problem_description)
+        logger.info(
+            f"🔍 Router auto-detected machine: {router_result.machine_type} "
+            f"(conf={router_result.confidence:.2f}) from: '{request.problem_description[:60]}'"
+        )
+        if router_result.machine_type == "unknown" or not router_result.router_ok:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Could not identify the machine type from your description. "
+                    "Please mention the machine name (e.g. 'water pump', 'tractor', 'harvester') "
+                    "or pass machine_type explicitly."
+                ),
+            )
+        canonical_type = router_result.machine_type
+
     profile = get_profile(canonical_type)
     machine_label = profile.label_en if profile else canonical_type
 
@@ -1682,16 +1807,32 @@ _EVAL_MACHINE_KEYWORDS = {
 }
 
 def _infer_machine_type_from_query(query: str) -> str:
-    """Keyword-score the query using regex word boundaries."""
+    """Keyword-score the query using regex word boundaries.
+
+    BUG 10 FIX: When the local keyword table has no match, delegate to
+    route_query() (which uses KNOWN_MACHINE_IDS / _MACHINE_ALIAS_MAP from
+    query_router.py) instead of blindly returning "tractor".
+    """
     q = query.lower()
     scores: dict = {}
     for machine, keywords in _EVAL_MACHINE_KEYWORDS.items():
         score = sum(1 for kw in keywords if re.search(rf'\b{re.escape(kw)}\b', q))
         if score:
             scores[machine] = score
-    if not scores:
-        return "tractor"
-    return max(scores, key=lambda m: scores[m])
+    if scores:
+        return max(scores, key=lambda m: scores[m])
+
+    # BUG 10 FIX: fall back to the canonical router instead of hard-coding "tractor"
+    try:
+        from query_router import route_query
+        routed = route_query(query)
+        if routed and routed.machine_type and routed.machine_type != "unknown":
+            return routed.machine_type
+    except Exception:
+        pass  # query_router unavailable — degrade gracefully
+
+    logger.warning("_infer_machine_type_from_query: no match for query='%s', defaulting to unknown", query[:60])
+    return "unknown"
 
 class EvalRequest(BaseModel):
     query: str
@@ -1701,22 +1842,55 @@ class EvalRequest(BaseModel):
 async def evaluate_text_rag(req: EvalRequest):
     """
     Evaluation endpoint for RAG accuracy testing without audio/video.
-    Always requires machine_type — infers from query if not provided.
+    Runs the full Phase 1–3 pipeline (Phase 3 visual gate is auto-skipped
+    when no frame is provided — correct behaviour for text-only eval).
     """
-    resolved_machine = req.machine_type.strip() or _infer_machine_type_from_query(req.query)
-    logger.info(f"📊 Eval: machine={resolved_machine} | query={req.query[:60]}")
+    logger.info(f"📊 Eval: machine={req.machine_type!r} | query={req.query[:60]}")
 
-    rag_context = retrieve_rag_context(req.query, resolved_machine)
-    knowledge   = load_knowledge_base(resolved_machine)
+    from rag import _detect_language          # add at top of file
+    pipeline = await run_full_pipeline(
+        query=req.query,
+        vector_db=vector_db,
+        frame_bytes=None,
+        language=_detect_language(req.query),  # ← auto-detect Hindi/English
+        machine_type_override=req.machine_type.strip() or None,
+    )
 
+    if pipeline.blocked:
+        # FIX 3: Handle OOD guard specifically with category logging
+        if pipeline.phase_reached == "ood_guard":
+            logger.info("📊 Eval blocked: ood_guard (category=%s)",
+                        pipeline.response.get("ood_category", "unknown"))
+        else:
+            logger.info(f"📊 Eval blocked: {pipeline.block_reason}")
+        response = pipeline.response
+        # P0 FIX: Include rag_score in blocked eval responses so test suite can read it
+        if pipeline.lock and pipeline.lock.score is not None:
+            response["rag_score"] = round(pipeline.lock.score, 3)
+        return JSONResponse(content=response)
+
+    resolved_machine = pipeline.machine_type
+    rag_score = round(pipeline.lock.score, 3) if pipeline.lock else 0.0
+    logger.info(f"📊 Eval pipeline passed: machine={resolved_machine} rag_score={rag_score:.3f}")
+
+    knowledge = load_knowledge_base(resolved_machine)
     diagnosis = await generate_diagnosis_with_gemini(
         machine_type=resolved_machine,
         problem_text=req.query,
         language="en",
-        rag_context=rag_context,
+        rag_context=pipeline.rag_context,
         knowledge_base=knowledge,
         visual_frames=[],   # text-only evaluation
     )
+
+    # MIGRATED: Groq format normalization — ensure top-level lowercase status
+    from services.diagnosis_service import _normalize_status  # MIGRATED: Groq format normalization
+    diagnosis = _normalize_status(diagnosis)  # MIGRATED: Groq format normalization
+
+    # P0 FIX: Inject pipeline scores into diagnosis response for test suite
+    diagnosis["rag_score"] = rag_score  # MIGRATED: Groq format normalization (preserved)
+    diagnosis["machine_type"] = resolved_machine  # MIGRATED: Groq format normalization (preserved)
+
     return JSONResponse(content=diagnosis)
 # ============================================================================
 # MAIN

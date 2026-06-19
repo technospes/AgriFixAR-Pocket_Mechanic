@@ -14,9 +14,11 @@ import 'package:record/record.dart';
 import 'package:video_player/video_player.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
 import 'widgets/analysis_bottom_sheet.dart';
+import 'widgets/safety_gate.dart';
 import '../../core/theme.dart';
 import '../../core/router.dart';
 import '../../core/providers/diagnosis_provider.dart';
+import '../../core/providers/language_provider.dart';
 import '../../services/api_service.dart';
 import '../../l10n/app_localizations.dart';
 
@@ -318,8 +320,18 @@ class _UploadScreenState extends State<UploadScreen>
 
   Future<void> _onFindSolution() async {
     if (!_bothSelected) return;
+
+    // ── Mandatory safety gate ─────────────────────────────────────────────────
+    // Show before clearing state so the farmer confirms safety before any work
+    // begins. Uses language from LanguageProvider. Zero Gemini calls.
+    final langCode = context.read<LanguageProvider>().languageCode;
+    final safetyOk = await showSafetyGate(context, languageCode: langCode);
+    if (!safetyOk || !mounted) return;
+
     final diagProv = context.read<DiagnosisProvider>();
     diagProv.clear();
+    // Record that safety was confirmed so AR screen can verify it.
+    diagProv.confirmSafety();
 
     await showAnalysisSheet(
       context,

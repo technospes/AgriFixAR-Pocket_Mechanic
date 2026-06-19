@@ -20,12 +20,9 @@ class RepairSession(BaseModel):
     verified_observations: Dict[str, str] = Field(default_factory=dict)
     # ↑ Gemini's actual visual finding per part, e.g.:
     #   {"battery_terminal": "white powder visible on both clamps — corrosion confirmed"}
-    #   Gives the agent richer context than just "ok"/"damaged" labels.
     diagnostic_path: List[str] = Field(default_factory=list)
     generated_steps: List[str] = Field(default_factory=list)
     # ↑ Step IDs + part from the diagnosis plan, e.g. ["s1:battery_terminal:visual", ...]
-    #   Populated when the session is linked to a /diagnose plan so the agent
-    #   never re-generates a step the plan already covers, and never skips one it marked critical.
     current_stage: int = 0
     attempt_count: int = 0
     last_verification: Optional[Dict] = None
@@ -42,18 +39,42 @@ class AgentNextRequest(BaseModel):
 
 
 class NextStepDetail(BaseModel):
+    # ── Core instruction (bilingual) ─────────────────────────────────────────
     text: str
     text_en: str
     text_hi: str
+
+    # ── AR / visual anchoring ────────────────────────────────────────────────
     visual_cue: str
     ar_model: str
     required_part: str
     area_hint: str
+
+    # ── Safety ──────────────────────────────────────────────────────────────
     safety_warning: Optional[str] = None
+
+    # ── Structured repair output fields ──────────────────────────────────────
+    # What the farmer should observe when the step succeeds (physical)
+    expected_result: str = ""
+    expected_result_hi: str = ""
+
+    # Most likely cause if the step fails + single corrective action
+    if_failed: str = ""
+    if_failed_hi: str = ""
+
+    # Concrete condition that means STOP and call a mechanic
+    escalate_if: str = ""
+    escalate_if_hi: str = ""
+
+    # Tool from the machine-specific allowed list, or null for visual-only steps
+    required_tool: Optional[str] = None
 
 
 class UpdatedMemory(BaseModel):
-    verified_parts: Dict[str, str]
+    verified_parts: Dict[
+        str,
+        Literal["ok", "damaged", "unclear"]
+    ]
     diagnostic_path: List[str]
 
 
@@ -75,8 +96,6 @@ class CreateSessionRequest(BaseModel):
     diagnosis_steps: List[Dict] = Field(default_factory=list)
     # ↑ Optional: pass the steps array from /diagnose response so the agent
     #   knows exactly which parts the plan covers and in what order.
-    #   Each item should be a step dict with at least step_id, required_part, step_type.
-    #   When provided, session.generated_steps is populated at creation time.
 
 
 class CreateSessionResponse(BaseModel):

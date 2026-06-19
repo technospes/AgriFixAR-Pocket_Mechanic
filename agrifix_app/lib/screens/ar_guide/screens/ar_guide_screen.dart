@@ -15,10 +15,12 @@
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 
 import '../../../core/providers/diagnosis_provider.dart';
 import '../../../core/providers/language_provider.dart';
+import '../../../screens/upload/widgets/safety_gate.dart';
 import '../controllers/ar_controller.dart';
 import '../models/ar_state.dart';
 import '../widgets/ar_overlay.dart';
@@ -95,12 +97,43 @@ class _ARGuideScreenState extends State<ARGuideScreen>
     _ctrl.toastSlide    = _toastSlide;
     _ctrl.toastFade     = _toastFade;
 
-    _ctrl.initCamera();
+    // ── Safety gate guard ─────────────────────────────────────────────────
+    // If safety was not confirmed (e.g. user navigated to AR directly without
+    // completing the safety gate on the upload screen), show the gate now
+    // before initialising the camera. Uses addPostFrameCallback so context
+    // is fully ready when the sheet is shown.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final prov     = context.read<DiagnosisProvider>();
+      final langCode = context.read<LanguageProvider>().languageCode;
+      if (prov.safetyConfirmed) {
+        // Already confirmed on upload screen — proceed immediately.
+        _ctrl.initCamera();
+      } else {
+        // Not confirmed yet — show gate first, then init camera.
+        _showSafetyGateAndInit(langCode);
+      }
+    });
+  }
+
+  // ── Safety gate: shown only when AR is entered without prior confirmation ──
+  // This covers edge cases like deep-linking directly to the AR screen or
+  // navigating back/forward without going through the upload flow.
+  Future<void> _showSafetyGateAndInit(String langCode) async {
+    if (!mounted) return;
+    final confirmed = await showSafetyGate(context, languageCode: langCode);
+    if (!mounted) return;
+    if (confirmed) {
+      context.read<DiagnosisProvider>().confirmSafety();
+      _ctrl.initCamera();
+    } else {
+      // User cancelled — pop back to wherever they came from.
+      Navigator.of(context).pop();
+    }
   }
 
   @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
+  void didChangeDependencies() {    super.didChangeDependencies();
     final langCode = context.read<LanguageProvider>().languageCode;
     _ctrl.initTts(langCode);
   }
@@ -192,11 +225,10 @@ class _ARGuideScreenState extends State<ARGuideScreen>
             if (!_ctrl.cameraPermDenied)
               BlurSurround(boxRect: boxRect, cornerRadius: 20),
 
-            // 3. AR Arrow overlay
             if ((_ctrl.arState == ARState.guiding || _ctrl.bboxLocked) &&
                 _ctrl.tracking.smoothBbox != null)
               ARArrowOverlay(
-                bbox:      _ctrl.tracking.smoothBbox!,
+                bbox:      _ctrl.tracking.smoothBbox,
                 fadeAnim:  _bboxFadeAnim,
                 pulseCtrl: _arrowPulseCtrl,
                 partLabel: _ctrl.partDescription.isNotEmpty
@@ -205,6 +237,8 @@ class _ARGuideScreenState extends State<ARGuideScreen>
                 isHindi:   isHindi,
                 previewW:  previewW,
                 previewH:  previewH,
+                showOffScreenArrow:  _ctrl.showOffScreenArrow,
+                cloudGuidanceVector: _ctrl.cloudGuidanceVector,
               ),
 
             // 3b. Camera guidance chip
@@ -220,6 +254,16 @@ class _ARGuideScreenState extends State<ARGuideScreen>
 
             // 4. Gradient tint
             GradientOverlay(arState: _ctrl.arState),
+
+            // 4b. Unsafe scene warning banner (non-blocking, dismisses itself)
+            // Shown when backend detected evidence of unsafe conditions from
+            // already-computed frame/transcript analysis (no extra Gemini call).
+            if (prov.unsafeSceneSuspected)
+              _UnsafeSceneBanner(
+                message: prov.unsafeSceneMessage,
+                isHindi: isHindi,
+                topOffset: safePad.top + 66,
+              ),
 
             // 5. Panel scrim
             if (_ctrl.panelExpanded)
@@ -342,6 +386,66 @@ class _ARGuideScreenState extends State<ARGuideScreen>
                       () => _ctrl.inspectionPanelVisible = false),
                 ),
               ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ── Unsafe scene warning banner ───────────────────────────────────────────────
+// Non-blocking amber chip shown at the top of the AR screen when the backend
+// detected evidence of unsafe conditions (machine running, person too close,
+// dangerous wording in transcript).
+// Derived from already-computed diagnosis context — zero additional Gemini calls.
+class _UnsafeSceneBanner extends StatelessWidget {
+  final String message;
+  final bool   isHindi;
+  final double topOffset;
+
+  const _UnsafeSceneBanner({
+    required this.message,
+    required this.isHindi,
+    required this.topOffset,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final text = message.isNotEmpty
+        ? message
+        : (isHindi
+            ? 'असुरक्षित दृश्य संदिग्ध — आगे बढ़ने से पहले फिर से जांचें।'
+            : 'Unsafe scene suspected. Recheck before proceeding.');
+    return Positioned(
+      top: topOffset, left: 16, right: 16,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: const Color(0xF01E1E1E),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+              color: const Color(0xFFF59E0B).withOpacity(0.60), width: 1.2),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Padding(
+              padding: EdgeInsets.only(top: 1),
+              child: Icon(Icons.warning_amber_rounded,
+                  color: Color(0xFFF59E0B), size: 18),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                text,
+                style: GoogleFonts.inter(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                  color: const Color(0xFFFBBF24),
+                  height: 1.4,
+                ),
+              ),
+            ),
           ],
         ),
       ),

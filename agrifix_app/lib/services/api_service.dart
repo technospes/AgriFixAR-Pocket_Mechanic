@@ -41,7 +41,7 @@ class DiagnosisResult {
 // ApiService
 // ─────────────────────────────────────────────────────────────────────────────
 class ApiService {
-  static const String _baseUrl = 
+  static const String _baseUrl = //'http://10.0.2.2:7860';
       'https://technospes-agrifixar-backend-new.hf.space';
   static const String _appKey = '020b082f133f403abf8694e6144df1a79396b2706dd9de108bc54a05e891fc29';
   static const Duration _uploadTimeout = Duration(seconds: 90);
@@ -438,12 +438,13 @@ class ApiService {
     required String machineType,
     required String problemContext,
     required int    attemptCount,
-    String requiredPart  = '',     // exact part Gemini must find
-    String areaHint      = '',     // section of machine
-    String previousSteps = '[]',   // visual memory from client
-    Uint8List? imageCropBytes,     // AR crop PNG — overrides imageFile when set
+    String requiredPart  = '',
+    String areaHint      = '',
+    String previousSteps = '[]',
+    Uint8List? imageCropBytes,
     void Function(double progress)? onProgress,
     void Function(String status)? onStatus,
+    bool isBlindSearch = false, // ADDED: isBlindSearch parameter
   }) async {
     final request = http.MultipartRequest(
         'POST', Uri.parse('$_baseUrl/verify_step'))
@@ -463,6 +464,7 @@ class ApiService {
         'problem_context': problemContext,
         'attempt_count':   attemptCount.toString(),
         'previous_steps':  previousSteps,
+        'is_blind_search': isBlindSearch.toString(), // ADDED: sending blind search flag to API
         // Send real step metadata — backend was falling back to
         // 'machine_part' / 'engine_compartment' defaults without these.
         if (requiredPart.isNotEmpty) 'required_part': requiredPart,
@@ -480,13 +482,14 @@ class ApiService {
         onStatus?.call('Retrying verification… (attempt $attempt)');
         onProgress?.call(0.5);
       },
-      onSuccess: (json) => DiagnosisResult(json), // Fixed: return DiagnosisResult
+      onSuccess: (json) => DiagnosisResult(json), 
     );
 
     onStatus?.call('Verification complete');
     onProgress?.call(1.0);
-    return result.raw; // Fixed: return the raw map
+    return result.raw; 
   }
+
   // ── AR Part Location ───────────────────────────────────────────────────────
   // Called by the AR guidance loop every ~3 seconds.
   // Returns { found, bbox, confidence, camera_guidance, part_description }.

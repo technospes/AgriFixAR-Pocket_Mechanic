@@ -196,10 +196,14 @@ class ARController {
   int    _frameId        = 0;
   int    _netFailCount      = 0;  // consecutive network errors
   int    _consecutiveMisses = 0;  // found=False streak during LOCATING
-  // Only reset stableFrameCount after _kMissesTolerance consecutive misses.
   // One blurry/occluded frame should not wipe stability progress.
   static const _kMissesTolerance = 2;
-
+  String cloudGuidanceVector = '';
+  bool showOffScreenArrow = false;
+  bool _isInBlindSearch = true;      // Phase 1: haven't found part yet
+  Timer? _stabilityTimer;
+  bool _reticleSteady = false;
+  DateTime? _reticleSteadyStart;
   // ── Tracking timer ────────────────────────────────────────────────────────
   Timer?    _trackingTimer;
   bool      _trackingEnabled = false;
@@ -315,11 +319,7 @@ class ARController {
     guidance.setLanguage(langCode);
   }
 
-  // ══════════════════════════════════════════════════════════════════════════
-  // LOCATE LOOP
-  // ══════════════════════════════════════════════════════════════════════════
-
-  void maybeStartLocateLoop() {
+void maybeStartLocateLoop() {
     final ctx   = getContext();
     final prov  = ctx.read<DiagnosisProvider>();
     final steps = prov.solution?.steps ?? demoSteps;
@@ -337,12 +337,28 @@ class ARController {
     _lastCorrectionSent = null;
     guidance.resetForNewSession();
     _consecutiveMisses  = 0;
+    _isInBlindSearch = true;
+    cloudGuidanceVector = '';
+    showOffScreenArrow = false;
 
-    if (isMounted()) setState(() => arState = ARState.locating);
+    // Start reticle stability check timer (runs at 10fps to check if hand is steady)
+    _stabilityTimer?.cancel();
+    _stabilityTimer = Timer.periodic(
+      const Duration(milliseconds: 100),
+      (_) => _checkReticleSteady(),
+    );
 
-    final loopMs = _everDetected ? _kLocateIntervalGuidedMs : _kLocateIntervalMs;
-    _locateTimer = Timer.periodic(Duration(milliseconds: loopMs), (_) => _locateTick());
-    _locateTick();
+    // Speak pre-detection hint immediately
+    unawaited(guidance.speakPreDetectionHint(
+      step.requiredPart.isNotEmpty ? step.requiredPart : (step.visualCue ?? ''),
+      step.areaHint,
+      isHindi: ctx.read<LanguageProvider>().languageCode == 'hi',
+    ));
+
+    if (isMounted()) setState(() => arState = ARState.scanning); // Start in scanning, not locating!
+
+    // We do NOT start the 1-second locateTimer here anymore. 
+    // The _checkReticleSteady timer will trigger the cloud call when the user holds still!
   }
 
   void _stopLocateLoop() {
@@ -394,7 +410,7 @@ class ARController {
   // ══════════════════════════════════════════════════════════════════════════
   // LOCATE TICK — core detection pipeline
   // ══════════════════════════════════════════════════════════════════════════
-
+// ignore : unsed_element
   Future<void> _locateTick() async {
     if (_locateRunning) return;
     if (!isMounted()) return;
@@ -670,6 +686,123 @@ class ARController {
       }
     } finally {
       _locateRunning = false;
+    }
+  }
+  /// Called every frame when in blind search mode.
+  /// If camera is steady for 2.5s, triggers a cloud call to check what's visible.
+  void _checkReticleSteady() {
+    if (!_isInBlindSearch) return;
+    if (!isMounted()) return;
+    
+    final tracking = this.tracking;
+    
+    // Widen the threshold slightly to 0.05 for budget device sensor noise.
+    final isSteady = tracking.velCx.abs() < 0.05 && tracking.velCy.abs() < 0.05;
+    
+    if (isSteady && !_reticleSteady) {
+      // User just stopped moving — start the stability countdown
+      _reticleSteady = true;
+      _reticleSteadyStart = DateTime.now();
+      setState(() => cameraGuidance = 'Hold steady — analyzing...');
+    } else if (isSteady && _reticleSteady) {
+      // Check if 2.5 seconds have passed
+      final elapsed = DateTime.now().difference(_reticleSteadyStart!).inMilliseconds;
+      if (elapsed >= 2500) {
+        // Trigger a cloud call!
+        _reticleSteady = false;
+        _reticleSteadyStart = null;
+        _triggerBlindSearchCloudCall();
+      }
+    } else if (!isSteady) {
+      // User is moving — reset countdown
+      _reticleSteady = false;
+      _reticleSteadyStart = null;
+    }
+  }
+
+  /// Fires ONE cloud call to check what the user is looking at.
+  /// VLM returns: verified, detected_part, guidance_vector (if wrong part)
+  Future<void> _triggerBlindSearchCloudCall() async {
+    if (!isMounted()) return;
+    
+    final ctx = getContext();
+    final prov = ctx.read<DiagnosisProvider>();
+    final steps = prov.solution?.steps ?? demoSteps;
+    final step = currentStep < steps.length ? steps[currentStep] : null;
+    if (step == null) return;
+    
+    final machine = prov.solution?.machineType ?? 'water_pump';
+    final isHindi = ctx.read<LanguageProvider>().languageCode == 'hi';
+    
+    setState(() => arState = ARState.analyzing);
+    
+    try {
+      final frame = await captureFrame();
+      final bytes = await frame.readAsBytes();
+      
+      // Quality check first
+      final qResult = await ARQualityGate.check(bytes);
+      if (!qResult.ok) {
+        setState(() => cameraGuidance = qResult.message);
+        transitionTo(ARState.scanning);
+        return;
+      }
+      
+    final result = await ApiService.verifyStep(
+      imageFile: frame, 
+      stepText: step.getLocalizedText(isHindi),
+      requiredPart: step.requiredPart,
+      areaHint: step.areaHint,
+      machineType: machine,
+      problemContext: '',
+      attemptCount: 1,
+      isBlindSearch: true,
+    );
+      
+      final verified = result['verified'] == true;
+      
+      if (verified) {
+        // Phase 3: Part found! Activate Kalman lock
+        _isInBlindSearch = false;
+        cloudGuidanceVector = '';
+        setState(() => showOffScreenArrow = false);
+        
+        // Initialize Kalman with VLM's bbox
+        final bbox = result['bbox'];
+        if (bbox != null && bbox.length == 4) {
+          tracking.update(
+            cx: (bbox[0] + bbox[2]) / 2,
+            cy: (bbox[1] + bbox[3]) / 2,
+            bw: (bbox[2] - bbox[0]),
+            bh: (bbox[3] - bbox[1]),
+            confidence: result['confidence'] ?? 0.85,
+          );
+          transitionTo(ARState.guiding);
+          HapticFeedback.mediumImpact();
+        }
+      } else {
+        // Phase 2: Wrong part — use VLM's directional guidance
+        cloudGuidanceVector = result['guidance_vector'] as String? ?? '';
+        showOffScreenArrow = cloudGuidanceVector.isNotEmpty;
+        
+        final feedback = isHindi
+            ? (result['feedback_hi'] as String? ?? 'गलत भाग — पुनः प्रयास करें')
+            : (result['feedback_en'] as String? ?? 'Wrong part — try again');
+            
+        setState(() {
+          dynamicFeedback = feedback;
+          cameraGuidance = feedback;
+        });
+        
+        // Speak the correction
+        await tts.stop();
+        await tts.speak(isHindi ? result['feedback_hi'] ?? feedback : result['feedback_en'] ?? feedback);
+        
+        transitionTo(ARState.scanning);
+      }
+    } catch (e) {
+      debugPrint('Blind search cloud call failed: $e');
+      transitionTo(ARState.scanning);
     }
   }
 

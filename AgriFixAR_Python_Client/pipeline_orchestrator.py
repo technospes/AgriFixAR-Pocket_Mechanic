@@ -1,11 +1,3 @@
-"""
-Integration points in main.py:
-  • /diagnose endpoint        → run_full_pipeline()
-  • /evaluate_text_rag        → run_full_pipeline(frame_bytes=None)
-  • /agent/session            → resolve_machine_from_query()
-  • /agent/next               → visual gate inside verify_step_with_gemini()
-"""
-
 from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
@@ -194,43 +186,48 @@ async def run_full_pipeline(
 
     lock = check_db_lock_from_rag(rag_result, machine_type=resolved_machine, query=enriched_query)
 
-    # ── FIX 5: Vagueness pre-check — short/symptomless queries with 0 chunks ──
+    # ── FIX 5: Strong Vagueness Pre-Check (Independent of chunks) ────────────
+    # A single-word query like "Pump" might return chunks simply through 
+    # frequency matching, but it lacks actionable diagnostic intent.
     query_tokens = query.lower().split()
     _content_tokens = [t for t in query_tokens if t not in _STOP_WORDS]
-    is_vague = len(_content_tokens) < 3 or not router.symptoms
+    is_vague = len(_content_tokens) < 3 and not router.symptoms
 
-    if n_chunks == 0 and is_vague and resolved_machine != "unknown":
-        logger.info(
-            "FIX 5 vagueness pre-check: tokens=%d symptoms=%s machine=%s → "
-            "clarification_needed instead of no_data",
-            len(_content_tokens), router.symptoms, resolved_machine,
-        )
-        clarification = await _clarification_engine.get_clarification(
-            machine_type  = resolved_machine,
-            symptoms      = [],
-            rag_context   = "",
-            confidence    = 0.0,
-            round_number  = clarification_round,
-        )
-        if clarification.needs_clarification:
-            clar_response = clarification.api_response()
-            clar_response["clarification_round"] = clarification_round
-            clar_response["rag_score"] = 0.0
-            clar_response["machine_type"] = resolved_machine
-            return PipelineResult(
-                phase_reached="clarification",
-                blocked=True,
-                block_reason="clarification_needed",
-                response=clar_response,
-                router=router,
-                lock=lock,
-                gate=None,
-                rag_context="",
-                machine_type=resolved_machine,
-                language=language,
-                rag_score=0.0,
-                n_chunks=0,
+    if is_vague and resolved_machine != "unknown":
+        # Only allow 1-2 word queries to bypass clarification IF they hit an incredibly
+        # strong, unambiguous exact match in the DB (e.g. >= 0.80).
+        if score < 0.80: 
+            logger.info(
+                "Vagueness override: tokens=%d symptoms=%s score=%.3f machine=%s → "
+                "forcing clarification_needed",
+                len(_content_tokens), router.symptoms, score, resolved_machine,
             )
+            clarification = await _clarification_engine.get_clarification(
+                machine_type  = resolved_machine,
+                symptoms      = [],
+                rag_context   = "",
+                confidence    = score,
+                round_number  = clarification_round,
+            )
+            if clarification.needs_clarification:
+                clar_response = clarification.api_response()
+                clar_response["clarification_round"] = clarification_round
+                clar_response["rag_score"] = score
+                clar_response["machine_type"] = resolved_machine
+                return PipelineResult(
+                    phase_reached="clarification",
+                    blocked=True,
+                    block_reason="clarification_needed",
+                    response=clar_response,
+                    router=router,
+                    lock=lock,
+                    gate=None,
+                    rag_context="",
+                    machine_type=resolved_machine,
+                    language=language,
+                    rag_score=score,
+                    n_chunks=n_chunks,
+                )
 
     if lock.locked:
         return PipelineResult(

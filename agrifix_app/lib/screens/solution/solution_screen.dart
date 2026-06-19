@@ -305,6 +305,18 @@ class _SolutionScreenState extends State<SolutionScreen>
                               duration: 380.ms, delay: 80.ms,
                               curve: Curves.easeOutCubic),
 
+                  // ── Unsafe scene warning (non-blocking) ───────────────
+                  // Shown only when backend detected unsafe-scene evidence
+                  // from existing frame/transcript analysis (no extra Gemini
+                  // call). Farmer sees this before reading repair steps.
+                  if (prov.unsafeSceneSuspected) ...[
+                    const SizedBox(height: 12),
+                    _UnsafeSceneCard(
+                      message: prov.unsafeSceneMessage,
+                      isHindi: isHindi,
+                    ).animate().fadeIn(duration: 340.ms, delay: 120.ms),
+                  ],
+
                   const SizedBox(height: 20),
 
                   if (steps.isEmpty)
@@ -963,4 +975,73 @@ abstract class _SC {
 abstract class _SS {
   static const double outer   = 24;
   static const double cardPad = 20;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// _UnsafeSceneCard  — amber warning shown when backend flags unsafe scene
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Displayed between _SolutionCard and the step list on the solution screen.
+// Non-blocking: the farmer can still read steps and start AR — the card
+// just makes the warning visible before they begin physical inspection.
+// Derived from backend pipeline, no extra Gemini call.
+class _UnsafeSceneCard extends StatelessWidget {
+  final String message;
+  final bool   isHindi;
+  const _UnsafeSceneCard({required this.message, required this.isHindi});
+
+  @override
+  Widget build(BuildContext context) {
+    final text = message.isNotEmpty
+        ? message
+        : (isHindi
+            ? 'असुरक्षित दृश्य संदिग्ध — आगे बढ़ने से पहले दोबारा जांचें कि मशीन पूरी तरह बंद है।'
+            : 'Unsafe scene suspected. Recheck that the machine is fully stopped before proceeding.');
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFFBEB),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFFF59E0B).withOpacity(0.50), width: 1.2),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(top: 1),
+            child: Icon(Icons.warning_amber_rounded,
+                color: Color(0xFFF59E0B), size: 20),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  isHindi ? 'सावधान' : 'CAUTION',
+                  style: GoogleFonts.inter(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.0,
+                    color: const Color(0xFFD97706),
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  text,
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w500,
+                    color: const Color(0xFF92400E),
+                    height: 1.45,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }

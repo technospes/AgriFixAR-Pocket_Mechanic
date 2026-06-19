@@ -1482,6 +1482,7 @@ async def verify_step(
     previous_steps: str = Form(default="[]"),
     language: str = Form(default="en"),
     include_hindi: str = Form(default="false"),
+    is_blind_search: bool = Form(default=False),
     _auth: None = Depends(verify_app_key),
 ):
     """Step verification endpoint — unchanged interface, delegates to verification_service.
@@ -1529,22 +1530,51 @@ async def verify_step(
 
         # Gemini vision call — guarded
         if can_call_gemini(ip):
-            result = await gemini_with_timeout(
-                verify_step_with_gemini(
-                    image_bytes=image_bytes,
-                    step_text=step_text,
-                    required_part=required_part,
-                    area_hint=area_hint,
-                    machine_type=machine_type,
-                    problem_context=problem_context,
-                    attempt_count=attempt_count,
-                    language=language,
-                    include_hindi=(include_hindi.lower() == "true"),
-                    previous_steps=previous_steps,  # ← semantic memory wiring
-                ),
-                fallback=None,
-                context="verify_step",
-            )
+            if is_blind_search:
+                # ── PHASE 1: BLIND SEARCH PROMPT ──
+                prompt = f"""You are guiding a farmer to find {required_part} on a {machine_type}.
+The farmer is pointing their camera at SOMETHING on the machine, but you need to identify what they're looking at.
+
+1. Identify what component is visible in this image.
+2. If it's the {required_part}: return verified=true with bbox.
+3. If it's a DIFFERENT component: return verified=false, tell them what they found, 
+   and give a guidance_vector (left/right/up/down) toward the {required_part}.
+   Also describe WHERE the {required_part} is relative to what they're seeing.
+
+Return ONLY JSON:
+{{"verified": true/false, "detected_part": "what you see", 
+  "guidance_vector": "left/right/up/down or empty", 
+  "feedback_en": "guidance", "feedback_hi": "Hindi guidance",
+  "bbox": [ymin,xmin,ymax,xmax]}}"""
+                
+                # Use the new resilient vision_call helper!
+                from utils.vision_client import vision_call
+                from utils.json_repair import repair_json
+                try:
+                    raw_resp = await vision_call(prompt, image_bytes)
+                    result = repair_json(raw_resp)
+                except Exception as e:
+                    logger.error(f"Blind search vision_call error: {e}")
+                    result = None
+            else:
+                # ── STANDARD VERIFY STEP ──
+                result = await gemini_with_timeout(
+                    verify_step_with_gemini(
+                        image_bytes=image_bytes,
+                        step_text=step_text,
+                        required_part=required_part,
+                        area_hint=area_hint,
+                        machine_type=machine_type,
+                        problem_context=problem_context,
+                        attempt_count=attempt_count,
+                        language=language,
+                        include_hindi=(include_hindi.lower() == "true"),
+                        previous_steps=previous_steps,  # ← semantic memory wiring
+                    ),
+                    fallback=None,
+                    context="verify_step",
+                )
+                
             if result:
                 record_gemini_call(ip)
             else:
@@ -1580,6 +1610,83 @@ async def verify_step(
         logger.error(f"❌ Verification failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
+@app.post("/verify_fix")
+@limiter.limit("20/minute")
+async def verify_fix(
+    request: Request,
+    image: UploadFile = File(...),
+    instruction: str = Form(...),
+    expected_result: str = Form(...),
+    machine_type: str = Form(default="water_pump"),
+    language: str = Form(default="en"),
+    _auth: None = Depends(verify_app_key),
+):
+    ip = request.client.host if request.client else "unknown"
+    
+    if len(instruction) > 500:
+        instruction = instruction[:500]
+    if len(expected_result) > 500:
+        expected_result = expected_result[:500]
+    
+    instruction = check_prompt_injection(instruction, ip=ip, field="instruction")
+    expected_result = check_prompt_injection(expected_result, ip=ip, field="expected_result")
+    
+    logger.info(f"🔧 /verify_fix machine={machine_type} instruction='{instruction[:60]}...'")
+    
+    try:
+        image_bytes = await image.read()
+        if len(image_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Empty image")
+        if len(image_bytes) > 5_000_000:
+            raise HTTPException(status_code=413, detail="Image too large")
+        
+        prompt = f"""You are an expert agricultural mechanic inspector for Indian farmers.
+You are inspecting whether a repair action was completed correctly.
+
+MACHINE: {machine_type}
+INSTRUCTION GIVEN TO FARMER: "{instruction}"
+EXPECTED RESULT IF DONE CORRECTLY: "{expected_result}"
+
+Look at this image carefully. Has the farmer completed the repair correctly?
+Check for: correct part used, proper installation, remaining damage (rust/cracks/burns), 
+loose connections, safety concerns.
+
+Be strict but fair. If something small is wrong, tell them exactly what to fix.
+
+Return ONLY this JSON (no markdown):
+{{"verified": true/false, "repair_quality": "good/partial/failed", 
+  "feedback_en": "specific guidance in simple English", 
+  "feedback_hi": "same guidance in simple Hindi for rural farmer",
+  "issues_found": ["list of remaining issues, empty if verified"]}}"""
+        
+        # Use the vision client with automatic failover
+        from utils.vision_client import vision_call
+        from utils.json_repair import repair_json
+        
+        raw_response = await vision_call(prompt, image_bytes, max_tokens=400, temperature=0.1)
+        result = repair_json(raw_response)
+        
+        result["request_id"] = hashlib.md5(
+            f"{datetime.now()}{instruction}".encode()
+        ).hexdigest()[:8]
+        
+        logger.info(f"✅ /verify_fix verified={result.get('verified')} quality={result.get('repair_quality')}")
+        return JSONResponse(content=result)
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"❌ /verify_fix failed: {exc}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "verified": False,
+                "repair_quality": "error",
+                "feedback_en": "Could not analyze the image. Please try again.",
+                "feedback_hi": "छवि का विश्लेषण नहीं कर सका। कृपया पुनः प्रयास करें।",
+                "issues_found": [str(exc)[:100]]
+            }
+        )
 
 @app.post("/safety_check")
 async def safety_check(image: UploadFile = File(...)):

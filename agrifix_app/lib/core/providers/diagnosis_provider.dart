@@ -180,14 +180,46 @@ class DiagnosisProvider extends ChangeNotifier {
   bool          _isLoading = false;
   String?       _error;
 
-  SolutionData? get solution           => _solution;
-  String?       get problemDescription => _problemDescription;
-  bool          get isLoading          => _isLoading;
-  String?       get error              => _error;
-  bool          get hasSolution        => _solution != null;
+  // ── Safety gate state ─────────────────────────────────────────────────────
+  //
+  // safetyConfirmed: true after the user has ticked all 4 safety checks.
+  //   Checked by AR screen before allowing guidance to start.
+  //   Reset on clear() so each new session requires a fresh confirmation.
+  //
+  // unsafeSceneSuspected: true when the backend pipeline detects evidence of
+  //   an unsafe scene in the uploaded frames/transcript (no extra Gemini call —
+  //   derived from already-computed diagnosis context in diagnosis_service.py).
+  //   Shown as a non-blocking warning banner on the solution screen.
+  bool _safetyConfirmed       = false;
+  bool _unsafeSceneSuspected  = false;
+  String _unsafeSceneMessage  = '';
+
+  SolutionData? get solution              => _solution;
+  String?       get problemDescription    => _problemDescription;
+  bool          get isLoading             => _isLoading;
+  String?       get error                 => _error;
+  bool          get hasSolution           => _solution != null;
+
+  // Safety getters
+  bool   get safetyConfirmed      => _safetyConfirmed;
+  bool   get unsafeSceneSuspected => _unsafeSceneSuspected;
+  String get unsafeSceneMessage   => _unsafeSceneMessage;
 
   void setLoading(bool loading) {
     _isLoading = loading;
+    notifyListeners();
+  }
+
+  // Called by safety gate widget after user confirms all 4 checks
+  void confirmSafety() {
+    _safetyConfirmed = true;
+    notifyListeners();
+  }
+
+  // Called if user goes back through the flow without re-confirming
+  // (e.g., uploads new media after a prior session)
+  void resetSafety() {
+    _safetyConfirmed = false;
     notifyListeners();
   }
 
@@ -196,6 +228,16 @@ class DiagnosisProvider extends ChangeNotifier {
     _problemDescription  = json['problem_description'];
     _error               = null;
     _isLoading           = false;
+
+    // ── Parse backend unsafe-scene hint (no extra Gemini call) ──────────────
+    // The backend derives this from existing frame/transcript analysis inside
+    // diagnosis_service.py and appends it to the response JSON.
+    // If the field is absent (e.g., cached plan or older backend) we default
+    // to false — never blocking the user based on missing data.
+    final raw = json['unsafe_scene_suspected'];
+    _unsafeSceneSuspected = raw == true;
+    _unsafeSceneMessage   = json['unsafe_scene_message'] as String? ?? '';
+
     notifyListeners();
   }
 
@@ -206,8 +248,12 @@ class DiagnosisProvider extends ChangeNotifier {
   }
 
   void clear() {
-    _solution = null;
-    _error    = null;
+    _solution            = null;
+    _error               = null;
+    // Reset safety on clear so each upload session re-confirms
+    _safetyConfirmed     = false;
+    _unsafeSceneSuspected = false;
+    _unsafeSceneMessage   = '';
     notifyListeners();
   }
 }

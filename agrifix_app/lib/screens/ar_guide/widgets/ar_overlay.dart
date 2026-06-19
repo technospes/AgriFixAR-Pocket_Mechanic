@@ -25,13 +25,17 @@ import 'ar_arrow_painter.dart';
 
 // ── AR arrow overlay ───────────────────────────────────────────────────────
 class ARArrowOverlay extends StatelessWidget {
-  final NormBbox             bbox;
-  final Animation<double>    fadeAnim;
-  final AnimationController  pulseCtrl;
-  final String               partLabel;
-  final bool                 isHindi;
-  final double               previewW;
-  final double               previewH;
+  final NormBbox?             bbox; // <--- Make sure this is nullable (NormBbox?)
+  final Animation<double>     fadeAnim;
+  final AnimationController   pulseCtrl;
+  final String                partLabel;
+  final bool                  isHindi;
+  final double                previewW;
+  final double                previewH;
+  
+  // NEW: Off-screen guidance properties
+  final bool                  showOffScreenArrow;
+  final String                cloudGuidanceVector;
 
   const ARArrowOverlay({
     required this.bbox,
@@ -41,6 +45,8 @@ class ARArrowOverlay extends StatelessWidget {
     required this.isHindi,
     required this.previewW,
     required this.previewH,
+    this.showOffScreenArrow = false,
+    this.cloudGuidanceVector = '',
   });
 
   @override
@@ -52,12 +58,14 @@ class ARArrowOverlay extends StatelessWidget {
           animation: pulseCtrl,
           builder: (_, __) => CustomPaint(
             painter: ARArrowPainter(
-              bbox:       bbox,
-              previewW:   previewW,
-              previewH:   previewH,
-              pulseValue: pulseCtrl.value,
-              partLabel:  partLabel,
-              isHindi:    isHindi,
+              bbox:                bbox,
+              previewW:            previewW,
+              previewH:            previewH,
+              pulseValue:          pulseCtrl.value,
+              partLabel:           partLabel,
+              isHindi:             isHindi,
+              showOffScreenArrow:  showOffScreenArrow,
+              cloudGuidanceVector: cloudGuidanceVector,
             ),
           ),
         ),

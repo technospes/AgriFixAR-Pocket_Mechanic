@@ -1,45 +1,23 @@
-# ═══════════════════════════════════════════════════════════════════
-# MIGRATION NOTE: This file uses Gemini for VISION inference only.
-# Text-generation calls have been migrated; vision calls remain on
-# Gemini until the separate vision migration task runs.
-# Future target: llama-3.2-11b-vision-preview via groq_client.
-# MIGRATED: Gemini → Groq (vision deferred)
-# ═══════════════════════════════════════════════════════════════════
 from __future__ import annotations
 import asyncio
 import json
 import logging
 import io
 from typing import Optional
-import google.generativeai as genai
 from PIL import Image
 import time as _time
 from utils.helpers import sanitize_json_text
+from utils.vision_client import vision_call
 from utils.machine_registry import get_area_farmer_description, get_profile
-
-# ── Server-side bbox cache ────────────────────────────────────────────────────
-# Keyed by (machine_type, required_part, area_hint, ip).
-# Stores the last valid detection result + timestamp.
-# If age < _BBOX_CACHE_TTL_S, the cached result is returned without calling Gemini.
-# This is the primary Gemini-call reducer: ~80-90% of locate requests
-# arrive within 1.5 s of the previous identical request from the same user.
-# TTL set to 0.8 s (not 1.5 s): at a 1 s polling interval this means only
-# the IMMEDIATE next tick after a detection hits the cache. Any call arriving
-# > 0.8 s later — e.g. after the farmer moves the phone — calls Gemini fresh.
-# A 1.5 s TTL would cache across two ticks and return a stale bbox position
-# when the camera has moved significantly between them.
 _BBOX_CACHE_TTL_S: float = 0.8
 _bbox_cache: dict = {}   # key → {result, ts, hits}
 
 logger = logging.getLogger(__name__)
 
-_GEMINI_MODEL    = "models/gemini-2.5-flash"
 _CONF_THRESHOLD  = 0.82          # FIX 2: raised from 0.72 — LLM bboxes need higher bar
 _MAX_IMAGE_PX    = 512           # Resize before sending — keeps tokens low
 _MAX_IMAGE_DIM   = _MAX_IMAGE_PX
 
-# ── Area-side hints — tell Gemini WHERE to look if not visible ────────────────
-# Maps area_hint → short human direction.  Used in camera_guidance generation.
 _AREA_DIRECTIONS: dict[str, str] = {
     "suction_side":     "the inlet/suction side of the pump",
     "discharge_side":   "the outlet/discharge side of the pump",
@@ -57,11 +35,6 @@ _AREA_DIRECTIONS: dict[str, str] = {
     "underside":        "the bottom of the machine",
 }
 
-
-# ── Similar-part exclusion map ────────────────────────────────────────────
-# When Gemini is asked to find part X, it must NOT accept these visually
-# similar but functionally different parts. Adding a part here adds one
-# sentence of context to the prompt — zero extra token cost at inference.
 _SIMILAR_PARTS_MAP: dict[str, list[str]] = {
     "suction_pipe_joint":   ["discharge pipe joint", "pressure pipe", "outlet hose",
                              "return line", "random hose"],
@@ -137,7 +110,6 @@ async def locate_part_with_gemini(
 
     try:
         resized_bytes = await _resize_image(image_bytes)
-        image = Image.open(io.BytesIO(resized_bytes))
 
         area_desc      = get_area_farmer_description(machine_type, area_hint, language)
         area_direction = _AREA_DIRECTIONS.get(area_hint, f"the {area_hint.replace('_', ' ')}")
@@ -164,6 +136,16 @@ async def locate_part_with_gemini(
         prompt = f"""\
 Machine: {machine_type}. Find ONLY: "{part_readable}" in {area_hint} ({area_desc}).
 {lang_note}{roi_block}{excl_block}
+BBOX RULES (CRITICAL):
+  • bbox = [cx, cy, w, h]
+  • ALL values MUST be normalised strictly between 0.0 and 1.0.
+  • cx = horizontal centre (0.0=left, 1.0=right).
+  • cy = vertical centre (0.0=top, 1.0=bottom).
+  • DO NOT return pixel coordinates (e.g., no values like 545.0).
+  • If the value is > 1.0, it is a calculation error. Divide by image dimensions first.
+  • bbox edges must not touch image boundary (all of cx±w/2, cy±h/2 must be in (0,1)).
+  • part_visibility_pct: integer 0–100 estimating how much of the part is unobstructed.
+
 IDENTITY CHECK — before setting found=true, confirm ALL of these:
   a. The visible part matches "{part_readable}" in shape, position and function.
   b. It is located in {area_hint} — not in a different section of the machine.
@@ -177,11 +159,6 @@ REJECT FLAGS — set true if any apply, and force found=false:
   wrong_part_detected  — a SIMILAR but DIFFERENT part is visible (not "{part_readable}")
   glare_detected       — metal glare / reflection covers >15% of the visible part area
   part_occluded        — part visibility < 60% (blocked by another component or hand)
-
-BBOX RULES:
-  • bbox = [cx, cy, w, h] normalised 0.0–1.0, cx/cy = centre of part.
-  • bbox edges must not touch image boundary (all of cx±w/2, cy±h/2 must be in (0,1)).
-  • part_visibility_pct: integer 0–100 estimating how much of the part is unobstructed.
 
 CAMERA GUIDANCE — one short imperative (<12 words) for the farmer:
   • Wrong area  → "Point camera at {area_direction}"
@@ -208,12 +185,14 @@ Return ONLY this JSON (no markdown, no preamble):
   "part_occluded": true|false
 }}"""
 
-        model    = genai.GenerativeModel(_GEMINI_MODEL)
-        response = await asyncio.to_thread(
-            lambda: model.generate_content([prompt, image])  # MIGRATED: Gemini → Groq (asyncio.to_thread)
+        response_text = await vision_call(
+            prompt=prompt,
+            image_bytes=resized_bytes,
+            max_tokens=400,
+            temperature=0.1,
         )
 
-        raw = json.loads(sanitize_json_text(response.text))
+        raw = json.loads(sanitize_json_text(response_text))
 
         # ── Anti-hallucination gate ───────────────────────────────────────────
         # If ANY reject flag is true, force found=false regardless of what
@@ -351,6 +330,7 @@ def _default_guidance(
     lang: str,
 ) -> str:
     """Deterministic fallback guidance — never empty, never hallucinates."""
+    lang = lang or "en"
     part_r = part.replace("_", " ")
     area_r = _AREA_DIRECTIONS.get(area_hint, area_hint.replace("_", " "))
 

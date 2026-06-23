@@ -1347,7 +1347,7 @@ class KnowledgeBaseBuilder:
 
 if __name__ == "__main__":
     builder = KnowledgeBaseBuilder(
-        knowledge_dir=".",
+        knowledge_dir=r"D:\AgriFix_Workspace\AgriFixAR_Python_Client\database_creation\water_pump_pdfs",
         db_dir="./chroma_db"
     )
     import sys

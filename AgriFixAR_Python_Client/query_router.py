@@ -204,13 +204,14 @@ def _build_router_prompt(query: str) -> str:
         )
 
     return f"""\
-You are a machinery symptom extractor AND search query expander.
+You are an expert diagnostic router for agricultural machinery.
 Read the user's query (may be Hindi, English, or mixed Hinglish).
 Return ONLY valid JSON — no markdown, no preamble.
 
 TASK 1 — EXTRACT:
   {machine_instruction}
-  symptoms: List of SHORT English phrases (max 5). Translate Hindi → English.
+  symptoms: List of SHORT English phrases (max 5). 
+  CRITICAL: If the user query is in Hindi or Hinglish (e.g. "paani nahi de raha", "awaaz karta hai"), you MUST translate the symptoms into standard English mechanical terms (e.g. "no water discharge", "making noise"). Do not return Hindi words in the symptoms array.
   confidence: Float 0.0–1.0 for machine_type certainty.
   language: "hi" | "en" | "mixed"
 
@@ -560,7 +561,6 @@ def build_enriched_query(router_output: RouterOutput) -> str:
     parts = []
     if router_output.machine_type != "unknown":
         parts.append(router_output.machine_type.replace("_", " "))
-    parts.extend(router_output.symptoms)
-    if len(parts) <= 1:          # only machine name, no symptoms
-         return router_output.raw_query
+    if router_output.symptoms:
+        parts.extend(router_output.symptoms)
     return " ".join(parts)

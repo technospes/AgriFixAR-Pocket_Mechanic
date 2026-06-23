@@ -61,7 +61,7 @@ if not API_KEY:
     raise ValueError("GOOGLE_AI_API_KEY not found in .env")
 
 client = genai.Client(api_key=API_KEY)
-_FLASH_MODEL = "gemini-2.5-flash"
+_FLASH_MODEL = "models/gemini-3.1-flash-lite"
 
 # ── Shared Gemini rate limiter ────────────────────────────────────────────────
 # Fix 5: Replace per-function time.sleep(4) with a thread-safe shared limiter.
@@ -2881,6 +2881,6 @@ def process_directory(directory_path: str, output_filename: str) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    TARGET_FOLDER = "./water_pump_pdfs"
-    OUTPUT_FILE   = "Master_Electric_Motors_DB.json"
+    TARGET_FOLDER = r"D:\AgriFix_Workspace\AgriFixAR_Python_Client\database_creation\mahindra_pdfs"
+    OUTPUT_FILE   = "Master_Tractors_DB.json"
     process_directory(TARGET_FOLDER, OUTPUT_FILE)

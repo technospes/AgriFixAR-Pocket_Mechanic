@@ -12,8 +12,8 @@ from datetime import datetime
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Request, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import google.generativeai as genai  # kept for embeddings only — DO NOT REMOVE
-from utils.groq_client import groq_client, TEXT_MODEL, JSON_CONFIG  # MIGRATED: Gemini → Groq
+import google.generativeai as genai
+from utils.groq_client import groq_client, TEXT_MODEL, JSON_CONFIG
 from utils.json_repair import repair_json
 from PIL import Image
 import io
@@ -34,7 +34,6 @@ from rag import (
 )
 from pipeline_orchestrator import run_full_pipeline, resolve_machine_from_query
 from db_lock import LOCK_SCORE_THRESHOLD
-# ── New modular imports ───────────────────────────────────────────────────────
 from agent.models import CreateSessionRequest, CreateSessionResponse, AgentNextRequest
 from agent import session_manager, repair_agent
 from services.transcription_service import transcribe_audio_with_gemini, transcribe_audio_full

@@ -1,9 +1,9 @@
 # ═══════════════════════════════════════════════════════════════════
-# MIGRATION NOTE: This file uses Gemini for VISION inference only.
-# Text-generation calls have been migrated; vision calls remain on
-# Gemini until the separate vision migration task runs.
+# MIGRATION NOTE: Vision calls migrated from deprecated google.generativeai
+# to vision_call() from utils.vision_client (new google.genai SDK with
+# automatic API key rotation across 4 Gemini keys).
 # Future target: llama-3.2-11b-vision-preview via groq_client.
-# MIGRATED: Gemini → Groq (vision deferred)
+# MIGRATED: google.generativeai → utils.vision_client (vision_call)
 # ═══════════════════════════════════════════════════════════════════
 from __future__ import annotations
 import asyncio
@@ -11,10 +11,10 @@ import json
 import logging
 import io
 
-import google.generativeai as genai
 from PIL import Image
 
 from utils.helpers import sanitize_json_text
+from utils.vision_client import vision_call
 from utils.machine_registry import (
     get_area_farmer_description,
     get_allowed_area_ids,
@@ -24,7 +24,6 @@ from utils.machine_registry import (
 )
 
 logger = logging.getLogger(__name__)
-_GEMINI_MODEL = "models/gemini-2.5-flash"
 _MAX_IMAGE_DIM = 720
 
 # ── Confidence thresholds ─────────────────────────────────────────────────────
@@ -136,7 +135,7 @@ async def verify_step_with_gemini(
     )
 
     try:
-        image = Image.open(io.BytesIO(await _resize_image(image_bytes)))
+        resized_bytes = await _resize_image(image_bytes)
 
         area_desc   = get_area_farmer_description(machine_type, area_hint, language)
         is_electric = is_electric_machine(machine_type)
@@ -217,12 +216,14 @@ Return ONLY this JSON:
 }}
 pass=part_visible+assessable(conf≥0.70); fail=wrong_area; unclear=bad_image; unsafe=danger_visible."""
 
-        model = genai.GenerativeModel(_GEMINI_MODEL)
-        response = await asyncio.to_thread(
-            lambda: model.generate_content([prompt, image])  # MIGRATED: Gemini → Groq (asyncio.to_thread)
+        response_text = await vision_call(
+            prompt=prompt,
+            image_bytes=resized_bytes,
+            max_tokens=400,
+            temperature=0.1,
         )
 
-        result    = json.loads(sanitize_json_text(response.text))
+        result    = json.loads(sanitize_json_text(response_text))
         raw_status = result.get("status", "unclear")
         raw_conf   = float(result.get("confidence", 0.0))
 

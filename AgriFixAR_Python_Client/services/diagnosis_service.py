@@ -93,7 +93,7 @@ water pump:
   2. Use the exact term "foot valve" as written in the manual.
 """
 
-def _build_strict_grounding_prompt(machine_type, machine_label, problem_text, rag_context, allowed_areas, parts_list, safety_keywords, language, has_visual_frames, context_quality, top_score) -> str:
+def _build_strict_grounding_prompt(machine_type, machine_label, problem_text, rag_context, allowed_areas, parts_list, safety_keywords, language, has_visual_frames, context_quality, top_score, router_symptoms: Optional[List[str]] = None) -> str:
     visual_note = ""
     visual_text_present = _has_visual_context_text(problem_text)
     visual_snippet = _extract_visual_snippet(problem_text) if visual_text_present else ""
@@ -115,6 +115,7 @@ def _build_strict_grounding_prompt(machine_type, machine_label, problem_text, ra
     else:
         rag_block = f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚠️ NO MANUAL EXTRACTS AVAILABLE — HALLUCINATION TRAP ACTIVE\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nThe RAG retrieval system found NO chunks above the relevance threshold.\nYOU MUST OUTPUT AN ESCALATION RESPONSE. Set steps = [] (empty array).\nDO NOT generate steps, intervals, oil grades, or any procedure from your\nown training knowledge — that is a CRITICAL FAILURE regardless of how\nhelpful it would be to the user.\n\nCASE A — Machine type matches {machine_type} AND query describes a real\nmechanical part or maintenance task:\n  → status = \"escalate\", steps = []\n  → technical_analysis = \"This procedure is not covered in the {machine_label} service manual.\"\n  → safety_warnings_en[0] = \"This specific procedure is not in our repair manual for the {machine_label}. Please consult the manufacturer's user guide or a certified mechanic.\"\n\nCASE B — Out-of-scope or unknown fault:\n  → status = \"escalate\", steps = []\n  → technical_analysis = \"Insufficient knowledge base coverage for this symptom.\"\n  → safety_warnings_en[0] = \"Automatic diagnosis unavailable: symptom outside knowledge base. Consult a certified mechanic.\""
 
+    target_symptoms = ", ".join(router_symptoms) if router_symptoms else problem_text
     grounding_rules = f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {_GROUNDING_RULE}
@@ -134,16 +135,13 @@ STRICT GROUNDING RULES — ZERO-HALLUCINATION PROTOCOL
    For EVERY chunk in the Manual Extracts, copy the PROBLEM: field verbatim.
    Format: "Chunk [ID]: PROBLEM: [exact problem text from chunk]"
    
-   Example output:
-     "Chunk c8f4c72cf014_steps_95: PROBLEM: Pump Connector Unit Joint — Water leaking"
-     "Chunk c8f4c72cf014_steps_94: PROBLEM: Pump Connector Unit Joint — Water leaking"
+   The user's extracted symptoms are: {target_symptoms}
    
-   After listing ALL chunks with their PROBLEM fields, answer this question:
-   "Do ANY of these PROBLEM fields mention: not starting, humming, MCB, breaker, fuse,
-   capacitor, control box, power supply, wiring, terminal, electrical, starter, or switch?"
-   
-   If YES → proceed to DIAGNOSE in Step 3. Name which chunk and which keyword matched.
-   If NO → escalate with "no chunk covers this symptom".
+   After listing ALL chunks, rank them by SYMPTOM OVERLAP:
+   • A chunk matches if its PROBLEM field contains the SAME mechanical symptom.
+   • Prefer chunks where MULTIPLE user symptoms appear in the SAME chunk.
+   • The chunk with the highest symptom overlap is your PRIMARY DIAGNOSIS SOURCE.
+   • State which chunk best matches the symptoms. If NO chunk has any symptom overlap, state "no chunk covers this symptom".
    
    ⛔ YOU MUST INCLUDE THE CHUNK CONTENT. "A safety chunk applies" = GROUNDING FAILURE.
 
@@ -155,17 +153,10 @@ STRICT GROUNDING RULES — ZERO-HALLUCINATION PROTOCOL
      • "ESCALATE — Routine maintenance, no active fault (Chunk [ID])."
      • "SUCCESS/REASSURE — Chunk [ID] explicitly confirms symptom is normal."
      • "SUCCESS/FIRE_EXT — Chunk 3b informational query, ESCALATE_IF says DO NOT escalate."
-     • "DIAGNOSE — Chunk [ID] PROBLEM field mentions [keyword] which is relevant to this symptom."
-     
-   IMPORTANT: "DIAGNOSE" should be chosen when chunk content covers the same SYSTEM
-   (electrical, mechanical, hydraulic, fuel) as the user's problem, even if the exact
-   symptom string doesn't match. Example: "not starting" + chunks about "MCB/fuse/capacitor"
-   → DIAGNOSE because these are all electrical starting components.
+     • "DIAGNOSE — Chunk [ID] PROBLEM field provides the exact fix for this symptom."
 
    STEP 4 — [Faithfulness Verification]:
-   Read your planned steps. Are you about to output any tool, part, or action that is NOT
-   explicitly written in the matched chunk? If yes, delete it immediately. Your output must
-   be a 1:1 reflection of the manual.
+   Read your planned steps. Are you about to output any tool, part, or action that is NOT explicitly written in the matched chunk? If yes, delete it immediately. Your output must be a 1:1 reflection of the manual.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 1 — UNIVERSAL SAFETY MASTER (ABSOLUTE HIGHEST PRIORITY)
@@ -204,19 +195,11 @@ If the query is a maintenance schedule with no active fault:
 
 RULE 5 — HALLUCINATION TRAP (Strict Failsafe)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If STEP 2 result is "No chunk match found":
+If STEP 2 result is "no chunk covers this symptom":
   → status = "escalate", steps = []
   → DO NOT generate steps, estimates, or procedures from training knowledge.
 
-If chunks WERE found in STEP 2 but they address a DIFFERENT symptom (e.g. chunks about
-"impeller wear" when the user asks about "not starting"), then escalate.
-
-HOWEVER — if the chunks cover the SAME SYSTEM or COMPONENT CLASS as the user's problem
-(e.g. user asks about "not starting" and chunks cover "MCB", "fuse", "control box",
-"capacitor", "power supply", "wiring", "terminal block" — which are ALL electrical
-starting components), then PROCEED TO DIAGNOSE. These chunks ARE relevant to the fault.
-
-KEY PRINCIPLE: Match at the COMPONENT/SYSTEM level, not at the exact-symptom-string level.
+If the chunks cover the SAME SYSTEM or COMPONENT CLASS as the user's problem, PROCEED TO DIAGNOSE. Match at the COMPONENT/SYSTEM level, taking the chunk with the highest symptom overlap as your single source of truth.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 6 — COPY-PASTE MANDATE (Universal — No Exceptions)
@@ -1071,14 +1054,8 @@ async def generate_diagnosis_with_gemini(
         has_visual_frames = bool(visual_frames),
         context_quality   = context_quality,
         top_score         = top_score,
+        router_symptoms   = symptoms,
     )
-
-    # MIGRATED: Gemini → Groq — Groq text API; visual_frames skipped (text-only mode)
-    # Vision migration (llama-3.2-11b-vision-preview) is a separate future task.
-    # visual_frames are retained in session memory but not forwarded to Groq here.
-
-    # Retry with exponential backoff for transient Groq errors (429, 503).  # MIGRATED: Gemini → Groq
-    # Groq free tier: 30 RPM / 14,400 RPD — far more headroom than Gemini.
     _MAX_RETRIES  = 3  # MIGRATED: Gemini → Groq
     _RETRY_DELAYS = [2, 5, 10]   # MIGRATED: Gemini → Groq — Groq recovers faster than Gemini
 

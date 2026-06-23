@@ -1,6 +1,5 @@
 """Vision client — Gemini 3.1 Flash Lite with key rotation (500 req/day per key)."""
 import os
-import base64
 import asyncio
 import logging
 import random
@@ -8,8 +7,9 @@ from PIL import Image
 import io as io_module
 
 logger = logging.getLogger(__name__)
+from dotenv import load_dotenv
+load_dotenv()
 
-# All Gemini API keys — 500 requests/day per key on gemini-3.1-flash-lite
 _GEMINI_KEYS = [
     k for k in [
         os.environ.get("GOOGLE_AI_API_KEY", ""),
@@ -22,7 +22,6 @@ _GEMINI_KEYS = [
 if not _GEMINI_KEYS:
     raise ValueError("No GOOGLE_AI_API_KEY keys configured")
 
-# Use Gemini 3.1 Flash Lite — 500 RPD, 15 RPM, vision-capable
 VISION_MODEL = "models/gemini-3.1-flash-lite"
 
 async def vision_call(
@@ -31,20 +30,28 @@ async def vision_call(
     max_tokens: int = 400,
     temperature: float = 0.1,
 ) -> str:
-    """Vision call with automatic Gemini key rotation — 500 req/day per key."""
-    import google.generativeai as genai
+    """Vision call with automatic Gemini key rotation."""
+    from google import genai
+    from google.genai import types
     
     keys = _GEMINI_KEYS.copy()
     random.shuffle(keys)
     
+    image = Image.open(io_module.BytesIO(image_bytes))
+    
     for key in keys:
         try:
-            genai.configure(api_key=key)
-            model = genai.GenerativeModel(VISION_MODEL)
-            image = Image.open(io_module.BytesIO(image_bytes))
+            client = genai.Client(api_key=key)
             
             response = await asyncio.to_thread(
-                lambda: model.generate_content([prompt, image])
+                lambda: client.models.generate_content(
+                    model=VISION_MODEL,
+                    contents=[prompt, image],
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=max_tokens,
+                        temperature=temperature,
+                    ),
+                )
             )
             return response.text
             

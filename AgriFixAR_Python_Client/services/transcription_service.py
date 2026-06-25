@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 # ── Constants ─────────────────────────────────────────────────────────────────
 MAX_AUDIO_SIZE  = 10 * 1024 * 1024   # 10 MB
 GROQ_MODEL      = "whisper-large-v3-turbo"
-GEMINI_MODEL    = "models/gemini-2.5-flash"
+GEMINI_MODEL    = "gemini-2.5-flash-lite"
 _GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
 
 # Thresholds for the "skip Gemini" decision

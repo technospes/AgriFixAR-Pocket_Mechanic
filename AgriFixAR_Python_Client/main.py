@@ -407,7 +407,7 @@ Return ONLY JSON, no markdown."""
 
         # VISION CALL — kept on Gemini until vision migration task  # MIGRATED: Gemini → Groq (pending)
         # Future: swap to llama-3.2-11b-vision-preview when visual migration runs.
-        model = genai.GenerativeModel("models/gemini-2.5-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash-lite")
         response = await asyncio.to_thread(
             lambda: model.generate_content([prompt, image])
         )

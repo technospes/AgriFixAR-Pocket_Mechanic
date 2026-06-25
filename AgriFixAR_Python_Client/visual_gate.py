@@ -11,7 +11,7 @@ import io
 
 logger = logging.getLogger(__name__)
 
-_VISION_MODEL = "models/gemini-2.5-flash"
+_VISION_MODEL = "gemini-2.5-flash-lite"
 VISION_CONFIDENCE_THRESHOLD = 0.65
 
 # ── Visual Part Normalization Map ──

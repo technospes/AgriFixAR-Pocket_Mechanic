@@ -728,7 +728,7 @@ async def _gemini_fallback(frame: _Frame, prior: Optional[str] = None) -> _ClsRe
             f'Return ONLY this JSON: {{"machine_type": "<label>"}} '
             f'where <label> is exactly one of: {labels}'
         )
-        model    = genai.GenerativeModel("models/gemini-2.5-flash")
+        model    = genai.GenerativeModel("gemini-2.5-flash-lite")
         response = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: model.generate_content([prompt, frame.image]),

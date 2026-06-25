@@ -22,7 +22,7 @@ _GEMINI_KEYS = [
 if not _GEMINI_KEYS:
     raise ValueError("No GOOGLE_AI_API_KEY keys configured")
 
-VISION_MODEL = "models/gemini-3.1-flash-lite"
+VISION_MODEL = "gemini-3.1-flash-lite"
 
 async def vision_call(
     prompt: str,

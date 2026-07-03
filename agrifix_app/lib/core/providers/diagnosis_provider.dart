@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-
+import '../utils/step_formatter.dart';
 // ── Step option for inspection / observation panels ──────────────────────────
 class StepOption {
   final String id;
@@ -48,6 +48,7 @@ class StepData {
   final String text;
   final String textEn;
   final String textHi;
+  final String action;
   final String stepTitleEn;
   final String stepTitleHi;
   final String? visualCue;
@@ -69,6 +70,7 @@ class StepData {
     required this.text,
     required this.textEn,
     required this.textHi,
+    required this.action,
     required this.stepTitleEn,
     required this.stepTitleHi,
     this.visualCue,
@@ -101,6 +103,7 @@ class StepData {
         // 🟢 INJECTED FROM V1: Parsing the exact part and area
         requiredPart:  json['required_part'] as String? ?? 'machine_part',
         areaHint:      json['area_hint']     as String? ?? 'engine_compartment',
+        action: json['action'] as String? ?? '',
       );
 
   String getLocalizedText(bool isHindi) =>
@@ -119,6 +122,22 @@ class StepData {
 
   /// True when this step is a manual action (just a Done button)
   bool get isActionStep => stepType == StepType.action;
+
+  /// Human-readable action label for UI display
+  String get displayAction {
+    if (action.isNotEmpty) return StepFormatter.title(action);
+    if (visualCue != null && visualCue!.isNotEmpty) return StepFormatter.title(visualCue!);
+    if (requiredPart.isNotEmpty) return StepFormatter.title(requiredPart);
+    return '';
+  }
+  
+  /// Human-readable part label for scanner display
+  String get displayPart {
+    if (visualCue != null && visualCue!.isNotEmpty) return StepFormatter.part(visualCue!);
+    if (requiredPart.isNotEmpty) return StepFormatter.part(requiredPart);
+    return '';
+  }
+
 }
 
 class SolutionData {
@@ -130,6 +149,7 @@ class SolutionData {
   final List<StepData> steps;
   final List<String> safetyWarnings;
   final List<String> toolsNeeded;
+  final String status;
 
   SolutionData({
     required this.machineType,
@@ -140,6 +160,7 @@ class SolutionData {
     required this.steps,
     required this.safetyWarnings,
     required this.toolsNeeded,
+    this.status = 'success',
   });
 
   factory SolutionData.fromJson(Map<String, dynamic> json) => SolutionData(
@@ -154,6 +175,7 @@ class SolutionData {
             .toList(),
         safetyWarnings: List<String>.from(json['safety_warnings_en'] as List? ?? []),
         toolsNeeded:    List<String>.from(json['tools_needed']        as List? ?? []),
+        status: json['status'] as String? ?? 'success',
       );
 
   String getLocalizedProblem(bool isHindi) =>
@@ -224,16 +246,12 @@ class DiagnosisProvider extends ChangeNotifier {
   }
 
   void setDiagnosis(Map<String, dynamic> json) {
-    _solution            = SolutionData.fromJson(json['solution'] ?? json);
+    final solutionJson = Map<String, dynamic>.from(json['solution'] ?? json);
+    _solution = SolutionData.fromJson(solutionJson);
     _problemDescription  = json['problem_description'];
     _error               = null;
     _isLoading           = false;
 
-    // ── Parse backend unsafe-scene hint (no extra Gemini call) ──────────────
-    // The backend derives this from existing frame/transcript analysis inside
-    // diagnosis_service.py and appends it to the response JSON.
-    // If the field is absent (e.g., cached plan or older backend) we default
-    // to false — never blocking the user based on missing data.
     final raw = json['unsafe_scene_suspected'];
     _unsafeSceneSuspected = raw == true;
     _unsafeSceneMessage   = json['unsafe_scene_message'] as String? ?? '';

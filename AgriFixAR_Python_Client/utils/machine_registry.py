@@ -1048,6 +1048,98 @@ def get_profile_or_default(machine_type: str) -> MachineProfile:
     """
     return get_profile(machine_type) or _ID_INDEX["tractor"]
 
+def get_shutdown_instruction(machine_type: str) -> dict:
+    """
+    Return the correct shutdown instruction for any machine type.
+    Derives this from the machine profile's category and properties.
+    Never hardcodes machine names — uses category-based logic.
+    """
+    profile = get_profile_or_default(machine_type)
+    category = profile.category.lower() if profile else ""
+    machine_id = machine_type.lower()
+    
+    # Category-based rules — works for ANY machine in that category
+    if "electric" in category or "motor" in category or machine_id in _ELECTRIC_MACHINES:
+        return {
+            "action": "power_off",
+            "instruction_en": (
+                "Switch off the MCB / main breaker and verify all indicator "
+                "lights are OFF. Wait 60 seconds for capacitors to discharge "
+                "before touching any terminals."
+            ),
+            "instruction_hi": (
+                "MCB / main switch band karein aur ensure karein ki saare "
+                "indicator lights band ho jaayein. Capacitor discharge ke "
+                "liye 60 second rukein."
+            ),
+            "required_part": "main_switch",
+            "area_hint": "control_panel",
+        }
+    
+    if "diesel" in category or "engine" in category or machine_id in _DIESEL_MACHINES:
+        return {
+            "action": "engine_off",
+            "instruction_en": (
+                "Turn off the engine and remove the ignition key. Engage "
+                "the parking brake and wait for all moving parts to stop completely."
+            ),
+            "instruction_hi": (
+                "Engine band karein aur ignition key nikaal lein. Parking "
+                "brake lagayein aur saare parts band hone tak wait karein."
+            ),
+            "required_part": "ignition_key",
+            "area_hint": "operator_cab",
+        }
+    
+    if "hydraulic" in category or "pump" in machine_id:
+        return {
+            "action": "depressurise",
+            "instruction_en": (
+                "Lower all hydraulic implements to the ground and turn off "
+                "the engine. Open the hydraulic pressure relief valve to "
+                "depressurise the system."
+            ),
+            "instruction_hi": (
+                "Saare hydraulic implements zameen par lower karein aur engine "
+                "band karein. Hydraulic pressure relief valve khol ke system "
+                "ko depressurise karein."
+            ),
+            "required_part": "hydraulic_relief_valve",
+            "area_hint": "hydraulic_panel",
+        }
+    
+    # Default: generic shutdown for any machine
+    return {
+        "action": "engine_off",
+        "instruction_en": (
+            "Ensure the machine is completely shut down and isolated from "
+            "its power source before proceeding with any inspection or repair."
+        ),
+        "instruction_hi": (
+            "Koi bhi kaam shuru karne se pehle machine ko power source se "
+            "bilkul alag karein."
+        ),
+        "required_part": "ignition_key",
+        "area_hint": "operator_cab",
+    }
+
+
+# Category membership — derived from machine registry, not hardcoded
+_ELECTRIC_MACHINES: set = set()
+_DIESEL_MACHINES: set = set()
+
+def _init_machine_categories():
+    """Populate category sets from the machine registry at startup."""
+    global _ELECTRIC_MACHINES, _DIESEL_MACHINES
+    from utils.machine_registry import list_supported_machines
+    for m in list_supported_machines():
+        mid = m["machine_id"]
+        cat = m.get("category", "").lower()
+        if "electric" in cat or "motor" in cat:
+            _ELECTRIC_MACHINES.add(mid)
+        if "diesel" in cat or "engine" in cat or "tractor" in cat or "harvester" in cat:
+            _DIESEL_MACHINES.add(mid)
+
 
 def resolve_machine_id(machine_type: str) -> str:
     """

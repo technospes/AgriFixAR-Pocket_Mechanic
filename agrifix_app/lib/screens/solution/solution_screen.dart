@@ -9,7 +9,7 @@ import 'package:go_router/go_router.dart';                  // AR nav
 import '../../core/providers/diagnosis_provider.dart';
 import '../../core/providers/language_provider.dart';
 import '../../core/router.dart';                      // AppRoutes
-
+import '../../core/providers/agent_session_provider.dart';
 // ═══════════════════════════════════════════════════════════════════════════
 // SolutionScreen  —  "AI Repair Guide"  (Text Solution Scene)
 //
@@ -159,51 +159,14 @@ class _SolutionScreenState extends State<SolutionScreen>
   String _stepTitle(StepData step) {
     final isHindi = context.read<LanguageProvider>().languageCode == 'hi';
 
-    // 1. Prefer the server-supplied localized title (step_title_hi / step_title_en)
+    // 1. Prefer the server-supplied localized title
     final serverTitle = step.getLocalizedTitle(isHindi);
     if (serverTitle.isNotEmpty) return serverTitle;
-
-    // 2. Fall back to a static lookup map — bilingual
-    const partTitlesEn = {
-      'ignition_key':        'Check the ignition key',
-      'battery_terminal':    'Inspect battery terminals',
-      'fuel_cap':            'Check the fuel cap',
-      'fan_belt':            'Examine the fan belt',
-      'clutch_pedal':        'Inspect the clutch pedal',
-      'clutch_cable':        'Check the clutch cable',
-      'gear_lever':          'Check the gear lever',
-      'air_filter':          'Examine the air filter',
-      'spark_plug':          'Check the spark plug',
-      'radiator_cap':        'Inspect the radiator cap',
-      'engine_oil_dipstick': 'Check engine oil level',
-      'wiring_harness':      'Inspect the wiring',
-      'hydraulic_pump':      'Check the hydraulic pump',
-      'fuel_filter':         'Locate the fuel filter',
-      'drain_plug':          'Unscrew the drain plug carefully',
-    };
-    const partTitlesHi = {
-      'ignition_key':        'इग्निशन चाबी जांचें',
-      'battery_terminal':    'बैटरी टर्मिनल जांचें',
-      'fuel_cap':            'ईंधन टोपी जांचें',
-      'fan_belt':            'फैन बेल्ट देखें',
-      'clutch_pedal':        'क्लच पेडल जांचें',
-      'clutch_cable':        'क्लच केबल जांचें',
-      'gear_lever':          'गियर लीवर जांचें',
-      'air_filter':          'एयर फ़िल्टर देखें',
-      'spark_plug':          'स्पार्क प्लग जांचें',
-      'radiator_cap':        'रेडिएटर कैप जांचें',
-      'engine_oil_dipstick': 'इंजन ऑयल लेवल जांचें',
-      'wiring_harness':      'वायरिंग जांचें',
-      'hydraulic_pump':      'हाइड्रोलिक पंप जांचें',
-      'fuel_filter':         'ईंधन फ़िल्टर ढूंढें',
-      'drain_plug':          'ड्रेन प्लग खोलें',
-    };
-
-    final part = step.visualCue ?? '';
-    final map  = isHindi ? partTitlesHi : partTitlesEn;
-    if (map.containsKey(part)) return map[part]!;
-
-    // 3. Last resort: truncate the step body
+    if (step.action.isNotEmpty) {
+      return step.displayAction;
+    }
+    
+    // 4. Last resort: truncate the step body
     final body = _stepBody(step);
     if (body.isEmpty) return isHindi ? 'निरीक्षण करें' : 'Perform inspection';
     final cut = body.lastIndexOf(' ', 44);
@@ -319,8 +282,15 @@ class _SolutionScreenState extends State<SolutionScreen>
 
                   const SizedBox(height: 20),
 
-                  if (steps.isEmpty)
-                    _EmptyState(isHindi: isHindi)
+                                  if (steps.isEmpty)
+                    if (prov.solution?.status == 'escalate')
+                      _EscalationCard(
+                        isHindi: isHindi,
+                        problem: prov.solution?.problemIdentifiedEn ?? problem,
+                        safetyWarnings: prov.solution?.safetyWarnings ?? [],
+                      )
+                    else
+                      _EmptyState(isHindi: isHindi)
                   else
                     ...List.generate(steps.length, (i) {
                       return Padding(
@@ -357,7 +327,32 @@ class _SolutionScreenState extends State<SolutionScreen>
               isHindi:     isHindi,
               onPrev: () => _jumpTo(_currentStep - 1, steps),
               onNext: () => _jumpTo(_currentStep + 1, steps),
-              onAR: () => context.push(AppRoutes.arGuide, extra: _currentStep),
+              onAR: () async {
+              final prov = context.read<DiagnosisProvider>();
+              final agentProv = context.read<AgentSessionProvider>();
+              final steps = prov.solution?.steps ?? [];
+              
+              // Convert StepData to raw dicts for the backend
+              final diagnosisSteps = steps.map((s) => {
+                  'step_id': s.stepId,
+                  'action': s.textEn.isNotEmpty ? s.textEn : s.text,
+                  'description': s.textEn.isNotEmpty ? s.textEn : s.text,
+                  'required_part': s.requiredPart.isNotEmpty ? s.requiredPart : 'unknown',
+                  'area_hint': s.areaHint.isNotEmpty ? s.areaHint : 'engine_compartment',
+                  'step_type': s.stepType == StepType.visual ? 'verification' : s.stepType.name,
+              }).toList();
+              
+              await agentProv.startSession(
+                machineType: prov.solution?.machineType ?? 'water_pump',
+                problemDescription: prov.problemDescription ?? '',
+                language: context.read<LanguageProvider>().languageCode,
+                diagnosisSteps: diagnosisSteps,
+              );
+              
+              if (agentProv.sessionId != null && mounted) {
+                context.push(AppRoutes.arGuide);  // no initialStep param
+              }
+            },
             )
             .animate()
             .slideY(begin: 1.0, end: 0,
@@ -962,7 +957,88 @@ class _EmptyState extends StatelessWidget {
     );
   }
 }
+class _EscalationCard extends StatelessWidget {
+  final bool isHindi;
+  final String problem;
+  final List<String> safetyWarnings;
+  
+  const _EscalationCard({
+    required this.isHindi,
+    required this.problem,
+    required this.safetyWarnings,
+  });
 
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFFBEB),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: const Color(0xFFF59E0B).withOpacity(0.5)),
+      ),
+      child: Column(
+        children: [
+          const Icon(Icons.engineering_rounded, size: 48, color: Color(0xFFF59E0B)),
+          const SizedBox(height: 16),
+          Text(
+            isHindi ? 'प्रमाणित मैकेनिक आवश्यक' : 'Professional Mechanic Required',
+            style: GoogleFonts.inter(
+              fontSize: 18, fontWeight: FontWeight.w700,
+              color: const Color(0xFF92400E)),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            problem,
+            textAlign: TextAlign.center,
+            style: GoogleFonts.inter(
+              fontSize: 14, color: const Color(0xFF92400E), height: 1.5),
+          ),
+                    if (safetyWarnings.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            for (final w in safetyWarnings)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.warning_amber_rounded, size: 16, color: Color(0xFFF59E0B)),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        w,
+                        style: GoogleFonts.inter(
+                          fontSize: 13,
+                          color: const Color(0xFF92400E),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+          const SizedBox(height: 20),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton(
+              onPressed: () => Navigator.of(context).pop(),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFFF59E0B),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              ),
+              child: Text(
+                isHindi ? 'दूसरी समस्या आज़माएं' : 'Try Another Problem',
+                style: GoogleFonts.inter(fontSize: 16, fontWeight: FontWeight.w600),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
 // ═══════════════════════════════════════════════════════════════════════════
 // Design tokens
 // ═══════════════════════════════════════════════════════════════════════════

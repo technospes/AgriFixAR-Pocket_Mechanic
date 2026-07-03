@@ -3,8 +3,19 @@
 import 'package:flutter/material.dart';
 
 // ── AR phase state machine ─────────────────────────────────────────────────
-enum ARState  { scanning, locating, guiding, analyzing, unclear, verified, danger }
-enum ToastKind { analyzing, sent, analyzed, resultOk, resultWarn, error }
+enum ARState {
+  scanning,
+  locating,
+  guiding,
+  verifying,    // NEW: Part verification in progress
+  inspecting,   // NEW: Frozen-frame damage inspection
+  repairing,    // NEW: AR-guided repair steps
+  analyzing,
+  unclear,
+  verified,
+  danger,
+}
+enum ToastKind { analyzing, sent, analyzed, resultOk, resultWarn, error, verifying, inspecting }
 
 // ── Layout dimensions ──────────────────────────────────────────────────────
 const double kPanelHeight = 240.0;

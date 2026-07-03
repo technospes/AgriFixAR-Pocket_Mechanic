@@ -25,6 +25,9 @@ import '../controllers/ar_controller.dart';
 import '../models/ar_state.dart';
 import '../widgets/ar_overlay.dart';
 import '../widgets/scanning_indicator.dart';
+import '../widgets/inspection_overlay.dart';
+import '../../../core/models/agent_models.dart';
+import '../../../core/providers/agent_session_provider.dart';
 
 // ── Public entry point ────────────────────────────────────────────────────
 class ARGuideScreen extends StatefulWidget {
@@ -152,19 +155,27 @@ class _ARGuideScreenState extends State<ARGuideScreen>
   // ── Build ─────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
-    final prov     = context.watch<DiagnosisProvider>();
-    final steps    = prov.solution?.steps ?? demoSteps;
-    final step     = _ctrl.currentStep < steps.length ? steps[_ctrl.currentStep] : null;
-    final total    = steps.length;
-    final nextStep = (_ctrl.currentStep + 1) < steps.length
-        ? steps[_ctrl.currentStep + 1] : null;
+    final agentProv = context.watch<AgentSessionProvider>();
+    final agentStep = agentProv.current?.nextStep;
+    final prov = context.watch<DiagnosisProvider>();
+    // Use agent's step for part labels and guidance
+    // BottomPanel/InspectionPanel still need StepData — use a fallback
+    final steps = prov.solution?.steps ?? demoSteps;
+    final step  = _ctrl.currentStep < steps.length ? steps[_ctrl.currentStep] : null;
+    // Total step count isn't known ahead of time — the agent generates steps
+    // dynamically based on what it observes. Show turns-so-far as a running
+    // counter rather than a fabricated fraction of the (unrelated) local list.
+    final total = agentProv.turnsSoFar;
+    // The agent's own response IS the "next step" preview — no separate lookup needed.
+    final nextStep   = agentProv.current?.nextStep;
+    final isResolved = agentProv.current?.status == AgentStatus.resolved;
     final screenH  = MediaQuery.of(context).size.height;
     final screenW  = MediaQuery.of(context).size.width;
     final safePad  = MediaQuery.of(context).padding;
     final isHindi  = context.watch<LanguageProvider>().languageCode == 'hi';
 
     // Auto-trigger panel for non-visual steps
-    _ctrl.maybeShowInspectionPanel(step);
+    _ctrl.checkAgentPanel();
 
     // ── Orientation change → reset bbox ─────────────────────────────────
     final curOrientation = MediaQuery.of(context).orientation;
@@ -233,7 +244,7 @@ class _ARGuideScreenState extends State<ARGuideScreen>
                 pulseCtrl: _arrowPulseCtrl,
                 partLabel: _ctrl.partDescription.isNotEmpty
                     ? _ctrl.partDescription
-                    : (step?.visualCue ?? '').replaceAll('_', ' '),
+                    : (step?.displayPart ?? agentStep?.displayPart ?? ''),
                 isHindi:   isHindi,
                 previewW:  previewW,
                 previewH:  previewH,
@@ -346,6 +357,8 @@ class _ARGuideScreenState extends State<ARGuideScreen>
               child: BottomPanel(
                 step:        step,
                 nextStep:    nextStep,
+                isResolved:  isResolved,
+                completedInteractionType: _ctrl.lastCompletedInteractionType,
                 stepIndex:   _ctrl.currentStep,
                 total:       total,
                 arState:     _ctrl.arState,
@@ -372,16 +385,53 @@ class _ARGuideScreenState extends State<ARGuideScreen>
                   },
                 ),
               ),
+                        // ── Inspection overlay (frozen frame + damage review) ──────────
+            if (_ctrl.arState == ARState.inspecting && _ctrl.inspectionSnapshot != null)
+              Positioned.fill(
+                child: InspectionOverlay(
+                  snapshot: _ctrl.inspectionSnapshot!,
+                  pulseCtrl: _arrowPulseCtrl,
+                  isHindi: isHindi,
+                  onContinue: () async {
+                    final agentProv = context.read<AgentSessionProvider>();
+                    // This was a camera inspection (damage found, farmer chose to
+                    // continue anyway). Recorded for accuracy even though this path
+                    // currently transitions to ARState.scanning, not .verified, so
+                    // BottomPanel's badge doesn't read it today — keeps the field
+                    // correct if that transition ever changes.
+                    _ctrl.lastCompletedInteractionType = InteractionType.camera;
+                    await agentProv.advance({
+                        'status': 'inspected',
+                        'outcome': _ctrl.inspectionSnapshot!.outcome.name,
+                      });
+                    
+                    _ctrl.handleAgentStatus(agentProv.current?.status);
+                    
+                    if (agentProv.current?.status == AgentStatus.continueFlow) {
+                      _ctrl.inspectionSnapshot = null;
+                      await _ctrl.resumeCamera();
+                      _ctrl.transitionTo(ARState.scanning);
+                      _ctrl.maybeStartLocateLoop();
+                    }
+                  },
+                  onRetake: () {
+                    _ctrl.inspectionSnapshot = null;
+                    _ctrl.transitionTo(ARState.locating);
+                    _ctrl.resumeCamera();
+                    _ctrl.maybeStartLocateLoop();
+                  },
+                ),
+              ),
 
-            // 12. Inspection panel
-            if (_ctrl.inspectionPanelVisible && step != null)
+            // 12. Inspection panel — agent-driven
+            if (_ctrl.inspectionPanelVisible && _ctrl.agentPanelModel != null)
               Positioned(
                 left: 0, right: 0, bottom: 0,
                 child: InspectionPanel(
-                  step:      step,
-                  isHindi:   isHindi,
-                  onAnswer:  (opt) => _ctrl.onInspectionAnswer(opt, steps),
-                  onDone:    _ctrl.onActionDone,
+                  model: _ctrl.agentPanelModel!,
+                  isHindi: isHindi,
+                  onAnswer: (opt) => _ctrl.onInspectionAnswer(opt, steps),
+                  onDone: _ctrl.onActionDone,
                   onDismiss: () => setState(
                       () => _ctrl.inspectionPanelVisible = false),
                 ),

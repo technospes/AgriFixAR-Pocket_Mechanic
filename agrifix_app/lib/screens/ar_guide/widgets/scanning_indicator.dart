@@ -21,9 +21,10 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
-
+import '../models/inspection_panel_model.dart';
 import '../../../core/providers/diagnosis_provider.dart';
 import '../../../core/providers/language_provider.dart';
+import '../../../core/models/agent_models.dart';
 import '../models/ar_state.dart';
 
 // ── Top bar ───────────────────────────────────────────────────────────────
@@ -224,8 +225,8 @@ class ToastCard extends StatelessWidget {
             ),
           ),
         );
-        message = isHindi ? 'AI को विश्लेषण के लिए छवि भेज रहा है…'
-                          : 'Sending image to AI for analysis…';
+        message = isHindi ? 'AI के साथ संसाधित किया जा रहा है…'
+                          : 'Processing with AI…'; 
         break;
       case ToastKind.sent:
         accent      = C.primary;
@@ -260,6 +261,41 @@ class ToastCard extends StatelessWidget {
             ? 'कनेक्शन त्रुटि — इंटरनेट जांचें और दोबारा प्रयास करें'
             : 'Connection error — please check your internet and try again';
         break;
+
+      case ToastKind.verifying:
+        accent = C.arrowBlue;
+        leadingIcon = SizedBox(
+          width: 22, height: 22,
+          child: AnimatedBuilder(
+            animation: spinnerCtrl,
+            builder: (_, __) => Transform.rotate(
+              angle: spinnerCtrl.value * 2 * math.pi,
+              child: const CircularProgressIndicator(
+                strokeWidth: 2.5,
+                valueColor: AlwaysStoppedAnimation(C.arrowBlue)),
+            ),
+          ),
+        );
+        message = isHindi ? 'भाग की पुष्टि हो रही है…' : 'Verifying part…';
+        break;
+
+      case ToastKind.inspecting:
+        accent = C.gold;
+        leadingIcon = SizedBox(
+          width: 22, height: 22,
+          child: AnimatedBuilder(
+            animation: spinnerCtrl,
+            builder: (_, __) => Transform.rotate(
+              angle: spinnerCtrl.value * 2 * math.pi,
+              child: const CircularProgressIndicator(
+                strokeWidth: 2.5,
+                valueColor: AlwaysStoppedAnimation(C.gold)),
+            ),
+          ),
+        );
+        message = isHindi ? 'क्षति का निरीक्षण हो रहा है…' : 'Inspecting for damage…';
+        break;
+
     }
 
     return Container(
@@ -356,9 +392,29 @@ class _NextPartButtonState extends State<NextPartButton> {
 }
 
 // ── Bottom panel ──────────────────────────────────────────────────────────
+// Completion badge copy depends on what was actually verified. Only a
+// camera step ran an AI vision damage check — everything else (boolean
+// confirmation, numeric measurement, multiple-choice observation) was a
+// farmer self-report and must say so, not borrow camera-inspection language.
+String _verifiedBadgeText(InteractionType? type, bool isHindi) {
+  switch (type) {
+    case InteractionType.camera:
+      return isHindi ? 'घटक सत्यापित — कोई क्षति नहीं' : 'Component Verified — No Damage Detected';
+    case InteractionType.number:
+      return isHindi ? 'माप दर्ज किया गया' : 'Measurement Recorded';
+    case InteractionType.choice:
+      return isHindi ? 'उत्तर दर्ज किया गया' : 'Response Recorded';
+    case InteractionType.boolean:
+    case InteractionType.none:
+    default:
+      return isHindi ? 'चरण पूर्ण — पुष्टि की गई' : 'Step Confirmed Complete';
+  }
+}
+
 class BottomPanel extends StatelessWidget {
-  final StepData?    step;
-  final StepData?    nextStep;
+  final StepData?       step;
+  final NextStepDetail? nextStep;   // agent's real upcoming step — null only while loading
+  final bool             isResolved; // true only when the agent actually returned status=resolved
   final int          stepIndex;
   final int          total;
   final ARState      arState;
@@ -367,13 +423,19 @@ class BottomPanel extends StatelessWidget {
   final String       feedbackMsg;
   final VoidCallback onToggle;
   final bool         isHindi;
+  // Which interaction produced the current 'verified' state — null while
+  // loading. Drives the completion badge copy below; must never be assumed
+  // to be camera just because a step was completed.
+  final InteractionType? completedInteractionType;
 
   const BottomPanel({
     required this.step,       required this.nextStep,
+    this.isResolved = false,
     required this.stepIndex,  required this.total,
     required this.arState,    required this.expanded,
     required this.screenH,    required this.onToggle,
     this.feedbackMsg = '',    this.isHindi = false,
+    this.completedInteractionType,
   });
 
   @override
@@ -421,7 +483,7 @@ class BottomPanel extends StatelessWidget {
                 if (!isVerified)
                   Flexible(
                     child: Text(
-                      (step?.visualCue ?? 'COMPONENT').toUpperCase().replaceAll('_', ' '),
+                      (step?.displayPart ?? 'COMPONENT').toUpperCase(),
                       style: GoogleFonts.inter(
                         fontSize: 12, fontWeight: FontWeight.w600,
                         letterSpacing: 1.0, color: C.textMuted)),
@@ -446,7 +508,7 @@ class BottomPanel extends StatelessWidget {
                     borderRadius: BorderRadius.circular(20),
                     border: Border.all(color: C.primary.withOpacity(0.30), width: 1)),
                   child: Text(
-                    isHindi ? 'घटक सत्यापित — कोई क्षति नहीं' : 'Component Verified — No Damage Detected',
+                    _verifiedBadgeText(completedInteractionType, isHindi),
                     style: GoogleFonts.inter(
                       fontSize: 12, fontWeight: FontWeight.w600, color: C.primary)),
                 ),
@@ -455,7 +517,8 @@ class BottomPanel extends StatelessWidget {
               GestureDetector(
                 onTap: onToggle,
                 child: InstructionHeading(
-                    step: step, nextStep: nextStep, verified: isVerified),
+                    step: step, nextStep: nextStep,
+                    verified: isVerified, isResolved: isResolved),
               ),
               if (arState == ARState.unclear) ...[
                 const SizedBox(height: 10),
@@ -622,10 +685,14 @@ class StepBadge extends StatelessWidget {
 
 // ── Instruction heading ───────────────────────────────────────────────────
 class InstructionHeading extends StatelessWidget {
-  final StepData? step;
-  final StepData? nextStep;
-  final bool      verified;
-  const InstructionHeading({required this.step, required this.nextStep, required this.verified});
+  final StepData?       step;
+  final NextStepDetail? nextStep;   // agent's real upcoming step
+  final bool            verified;
+  final bool            isResolved; // true only when the agent actually finished
+  const InstructionHeading({
+    required this.step, required this.nextStep,
+    required this.verified, this.isResolved = false,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -637,7 +704,7 @@ class InstructionHeading extends StatelessWidget {
           fontSize: 19, fontWeight: FontWeight.w700, color: C.textPrimary, height: 1.3));
     }
     final full    = verified ? _nextInstruction(isHindi) : step!.getLocalizedText(isHindi);
-    final keyword = verified ? (nextStep?.visualCue ?? '').replaceAll('_', ' ')
+    final keyword = verified ? (nextStep?.displayPart ?? '').replaceAll('_', ' ')
                              : (step!.visualCue ?? '').replaceAll('_', ' ');
 
     if (keyword.isEmpty || !full.contains(keyword)) {
@@ -666,9 +733,12 @@ class InstructionHeading extends StatelessWidget {
   }
 
   String _nextInstruction(bool isHindi) {
-    if (nextStep == null) return isHindi ? 'सभी चरण पूर्ण!' : 'All steps complete!';
-    final vc   = nextStep!.visualCue ?? '';
-    final body = nextStep!.getLocalizedText(isHindi);
+    if (isResolved) return isHindi ? 'सभी चरण पूर्ण!' : 'All steps complete!';
+    if (nextStep == null) {
+      return isHindi ? 'अगला चरण लोड हो रहा है…' : 'Loading next step…';
+    }
+    final vc   = nextStep!.displayPart;
+    final body = nextStep!.localizedText(isHindi);
     if (vc.isNotEmpty) {
       final partName = vc.replaceAll('_', ' ');
       return isHindi ? 'शानदार। अब $partName ढूंढें।' : 'Excellent. Now locate the $partName.';
@@ -698,14 +768,17 @@ class ProgressBar extends StatelessWidget {
 
 // ── Inspection panel ──────────────────────────────────────────────────────
 class InspectionPanel extends StatefulWidget {
-  final StepData  step;
+  final InspectionPanelModel model;
   final bool      isHindi;
   final void Function(StepOption) onAnswer;
   final VoidCallback               onDone;
   final VoidCallback               onDismiss;
   const InspectionPanel({
-    required this.step, required this.isHindi,
-    required this.onAnswer, required this.onDone, required this.onDismiss,
+    required this.model,
+    required this.isHindi,
+    required this.onAnswer,
+    required this.onDone,
+    required this.onDismiss,
   });
 
   @override
@@ -748,9 +821,9 @@ class _InspectionPanelState extends State<InspectionPanel>
 
   @override
   Widget build(BuildContext context) {
-    final step     = widget.step;
+    final step     = widget.model;
     final isHindi  = widget.isHindi;
-    final isAction = step.isActionStep;
+    final isAction = step.showDoneButton;
 
     final (typeIcon, typeLabel) = switch (step.stepType) {
       StepType.inspection  => (Icons.touch_app_rounded, isHindi ? 'निरीक्षण' : 'INSPECTION'),
@@ -822,7 +895,7 @@ class _InspectionPanelState extends State<InspectionPanel>
                     ),
                 ]),
                 const SizedBox(height: 14),
-                Text(step.getLocalizedText(isHindi),
+                Text(step.description,
                   style: GoogleFonts.inter(
                     fontSize: 15, color: C.textSoft,
                     fontWeight: FontWeight.w500, height: 1.5)),
@@ -859,8 +932,8 @@ class _InspectionPanelState extends State<InspectionPanel>
                     onTap:   widget.onDone,
                   ),
                 ] else ...[
-                  if (step.getLocalizedQuestion(isHindi) != null) ...[
-                    Text(step.getLocalizedQuestion(isHindi)!,
+                  if (step.question != null && step.question!.isNotEmpty) ...[
+                    Text(step.question!,
                       style: GoogleFonts.inter(
                         fontSize: 16, fontWeight: FontWeight.w700,
                         color: C.textPrimary, height: 1.3)),

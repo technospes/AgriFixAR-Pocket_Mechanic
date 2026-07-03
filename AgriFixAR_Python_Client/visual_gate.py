@@ -102,20 +102,78 @@ class GateResult:
         return {}
 
 
+# Stopwords that should never be treated as part names
+_PART_STOPWORDS: frozenset = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "not", "no", "nor", "so",
+    "yet", "both", "either", "each", "more", "most", "other", "some",
+    "such", "than", "that", "this", "these", "those", "it", "its",
+    "my", "your", "his", "her", "our", "their", "i", "we", "you",
+    "he", "she", "they", "what", "which", "who", "when", "where",
+    "how", "if", "as", "up", "out", "about", "into", "through",
+    "during", "before", "after", "above", "below", "between",
+    "there", "here", "then", "any", "all", "and", "or", "but",
+    "in", "on", "at", "to", "for", "of", "with", "by", "from",
+    "also", "very", "just", "now", "only", "too", "really", "still",
+    "may", "needed", "need", "must", "can", "could", "should",
+    "will", "would", "shall", "might", "has", "had", "having",
+    "does", "did", "doing", "been", "being", "get", "got", "gotten",
+    "put", "set", "see", "saw", "seen", "use", "used", "using",
+    "one", "two", "three", "first", "second", "last", "next",
+    "new", "old", "good", "bad", "high", "low", "big", "small",
+})
+
+# Valid part ID pattern: snake_case with at least one underscore OR
+# a known compound word from the registry
+_VALID_PART_PATTERN = re.compile(
+    r'\b(?:[a-z]+_[a-z][a-z0-9_]+)\b'  # snake_case with underscore
+)
+
 def extract_target_parts(rag_context: str, max_parts: int = 3) -> List[str]:
-    parts_match = re.findall(r'PARTS[:\s]+([^\n]+)', rag_context, re.IGNORECASE)
-    found = []
-    for match in parts_match: found.extend(re.findall(r'\b[a-z][a-z0-9_]{2,}\b', match.lower()))
+    """
+    Extract target part IDs from RAG context.
     
+    Only extracts valid snake_case identifiers (containing underscores)
+    or JSON field values. Filters out English stopwords that regex
+    incorrectly captures.
+    """
+    found: List[str] = []
+    
+    # Method 1: Extract from JSON fields (most reliable)
     cue_match = re.findall(r'"(?:visual_cue|required_part)"\s*:\s*"([^"]+)"', rag_context)
     found.extend(cue_match)
+    
+    # Method 2: Extract snake_case part IDs from structured text
+    parts_match = re.findall(r'PARTS?[:\s]+([^\n]+)', rag_context, re.IGNORECASE)
+    for match in parts_match:
+        # Only extract valid snake_case identifiers
+        valid_parts = _VALID_PART_PATTERN.findall(match.lower())
+        found.extend(valid_parts)
 
-    seen, unique = set(), []
+    # Dedup and filter: remove stopwords, invalid entries
+    seen: set = set()
+    unique: List[str] = []
     for p in found:
         p = p.strip().lower()
-        if p and p not in seen and p not in ("unknown", "none", "null"):
+        # Skip stopwords
+        if p in _PART_STOPWORDS:
+            continue
+        # Skip invalid entries
+        if p in ("unknown", "none", "null", ""):
+            continue
+        # Skip single-character or very short tokens
+        if len(p) < 3:
+            continue
+        # Skip tokens without underscores (likely noise unless from JSON)
+        if "_" not in p and p not in {"relay", "capacitor"}:  # known single-word parts
+            continue
+        if p not in seen:
             seen.add(p)
             unique.append(p)
+    
+    logger.debug("extract_target_parts: %d found → %d valid: %s",
+                 len(found), len(unique), unique[:max_parts])
     return unique[:max_parts]
 
 

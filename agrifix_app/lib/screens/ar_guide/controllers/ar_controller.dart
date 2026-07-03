@@ -15,7 +15,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
-
+import '../models/inspection_panel_model.dart';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -30,6 +30,9 @@ import '../models/bbox.dart';
 import '../services/tracking_service.dart';
 import '../services/guidance_service.dart';
 import '../services/tts_service.dart';
+import '../../../core/models/agent_models.dart';
+import '../../../core/providers/agent_session_provider.dart';
+import '../../../core/models/inspection_snapshot.dart';
 
 // ── Frame quality gate ─────────────────────────────────────────────────────
 // Pure-Dart blur+brightness check. Runs before every Gemini call.
@@ -183,11 +186,22 @@ class ARController {
   bool      bboxLocked      = false;
   ToastKind toastKind       = ToastKind.analyzing;
 
+  // Which interaction type produced the current ARState.verified — set right
+  // before advance() on every completion path (camera / choice / boolean).
+  // The completion badge/copy in BottomPanel must vary on this: a plain
+  // yes/no or numeric confirmation was never inspected for "damage", so it
+  // must not carry the same vision-verification copy as an actual camera
+  // check. Without this, every step — safety, measurement, manual action,
+  // or camera — showed the identical "Component Verified — No Damage
+  // Detected" badge regardless of what was actually verified.
+  InteractionType? lastCompletedInteractionType;
+
   final List<Map<String, dynamic>> attemptResults = [];
 
   // ── AR pipeline state ─────────────────────────────────────────────────────
   Timer? _locateTimer;
   bool   _locateRunning  = false;
+  bool _captureInProgress = false;
   int    _locateAttempts = 0;
   bool   _partLocked     = false;
   bool   _everDetected   = false;
@@ -217,6 +231,10 @@ class ARController {
 
   // ── Panel state ───────────────────────────────────────────────────────────
   bool inspectionPanelVisible = false;
+  InspectionPanelModel? agentPanelModel;
+
+  // ── Inspection state ───────────────────────────────────────────────────────
+  InspectionSnapshot? inspectionSnapshot;
 
   // ── Step navigation ───────────────────────────────────────────────────────
   late int currentStep;
@@ -280,6 +298,7 @@ class ARController {
       if (isMounted()) {
         setState(() => cameraReady = true);
         maybeStartLocateLoop();
+        checkAgentPanel();
       }
     } catch (e) {
       debugPrint('ARGuide: camera init failed — $e');
@@ -292,10 +311,26 @@ class ARController {
   Future<void> resumeCamera() async {
     if (cameraReady) await cameraController?.resumePreview();
   }
-  Future<File> captureFrame() async {
-    final xFile = await cameraController!.takePicture();
-    return File(xFile.path);
+Future<File?> captureFrame() async {
+  if (_captureInProgress) return null;
+
+  final controller = cameraController;
+  if (controller == null || !controller.value.isInitialized) {
+    return null;
   }
+
+  _captureInProgress = true;
+
+  try {
+    final xFile = await controller.takePicture();
+    return File(xFile.path);
+  } catch (e) {
+    debugPrint("captureFrame failed: $e");
+    return null;
+  } finally {
+    _captureInProgress = false;
+  }
+}
 
   // ══════════════════════════════════════════════════════════════════════════
   // TTS
@@ -320,51 +355,47 @@ class ARController {
   }
 
 void maybeStartLocateLoop() {
-    final ctx   = getContext();
-    final prov  = ctx.read<DiagnosisProvider>();
-    final steps = prov.solution?.steps ?? demoSteps;
-    final step  = currentStep < steps.length ? steps[currentStep] : null;
-    if (step == null) return;
-    if (step.requiresDecisionPanel || step.isActionStep) return;
-    if (step.requiredPart.isEmpty && (step.visualCue ?? '').isEmpty) return;
+    final ctx = getContext();
+    final agentStep = ctx.read<AgentSessionProvider>().current?.nextStep;
+    if (agentStep == null) return;
+    
+    // FIX: Remove the "interaction.type != camera" block. 
+    // If there is a visual cue or required part, we MUST start the camera loop!
+    if (agentStep.requiredPart.isEmpty && agentStep.visualCue.isEmpty) return;
     if (arState == ARState.verified) return;
 
     _stopLocateLoop();
     _locateAttempts = 0;
     tracking.reset();
     tracking.resetKalman();
-    _partLocked         = false;
+    _partLocked = false;
     _lastCorrectionSent = null;
     guidance.resetForNewSession();
-    _consecutiveMisses  = 0;
+    _consecutiveMisses = 0;
     _isInBlindSearch = true;
     cloudGuidanceVector = '';
     showOffScreenArrow = false;
 
-    // Start reticle stability check timer (runs at 10fps to check if hand is steady)
     _stabilityTimer?.cancel();
     _stabilityTimer = Timer.periodic(
       const Duration(milliseconds: 100),
       (_) => _checkReticleSteady(),
     );
 
-    // Speak pre-detection hint immediately
     unawaited(guidance.speakPreDetectionHint(
-      step.requiredPart.isNotEmpty ? step.requiredPart : (step.visualCue ?? ''),
-      step.areaHint,
+      agentStep.requiredPart.isNotEmpty ? agentStep.requiredPart : (agentStep.visualCue),
+      agentStep.areaHint,
       isHindi: ctx.read<LanguageProvider>().languageCode == 'hi',
     ));
 
-    if (isMounted()) setState(() => arState = ARState.scanning); // Start in scanning, not locating!
-
-    // We do NOT start the 1-second locateTimer here anymore. 
-    // The _checkReticleSteady timer will trigger the cloud call when the user holds still!
+    if (isMounted()) setState(() => arState = ARState.scanning);
   }
 
   void _stopLocateLoop() {
     _locateTimer?.cancel();
     _locateTimer   = null;
     _locateRunning = false;
+    _stabilityTimer?.cancel();
     _stopTrackingTimer();
   }
 
@@ -410,20 +441,21 @@ void maybeStartLocateLoop() {
   // ══════════════════════════════════════════════════════════════════════════
   // LOCATE TICK — core detection pipeline
   // ══════════════════════════════════════════════════════════════════════════
-// ignore : unsed_element
+    // ignore : unsed_element
   Future<void> _locateTick() async {
     if (_locateRunning) return;
     if (!isMounted()) return;
     if (bboxLocked) return;
     if (!cameraReady || cameraController == null) return;
     if (arState == ARState.verified || arState == ARState.analyzing) return;
-    final ctx      = getContext();
-    final prov     = ctx.read<DiagnosisProvider>();
-    final steps    = prov.solution?.steps ?? demoSteps;
-    final step     = currentStep < steps.length ? steps[currentStep] : null;
-    if (step == null) { _locateRunning = false; return; }
-    final langCode = ctx.read<LanguageProvider>().languageCode;
-    final machine  = prov.solution?.machineType ?? 'tractor';
+    final ctx       = getContext();
+    final agentProv = ctx.read<AgentSessionProvider>();
+    final agentStep = agentProv.current?.nextStep;
+    if (agentStep == null) { _locateRunning = false; return; }
+    final langCode  = ctx.read<LanguageProvider>().languageCode;
+    final machine   = agentProv.current?.updatedMemory['machine_type'] as String? 
+                      ?? ctx.read<DiagnosisProvider>().solution?.machineType 
+                      ?? 'tractor';
     _locateRunning = true;
     _locateAttempts++;
     final now = DateTime.now();
@@ -448,12 +480,8 @@ void maybeStartLocateLoop() {
     }
 
     try {
-      final File frame;
-      try { frame = await captureFrame(); }
-      catch (e) {
-        debugPrint('ARGuide captureFrame error: $e');
-        _locateRunning = false; return;
-      }
+      final File? frame = await captureFrame();
+      if (frame == null) { _locateRunning = false; return; }  
 
       final bytes = await frame.readAsBytes();
       _lastLocateSent = DateTime.now();
@@ -473,9 +501,9 @@ void maybeStartLocateLoop() {
         _locateRunning = false; return;
       }
 
-      final part     = step.requiredPart.isNotEmpty
-          ? step.requiredPart : step.visualCue ?? '';
-      final area     = step.areaHint;
+      final part     = agentStep.requiredPart.isNotEmpty
+          ? agentStep.requiredPart : agentStep.visualCue;
+      final area     = agentStep.areaHint;
       if (part.isEmpty) { _locateRunning = false; return; }
 
       // Pre-detection hint — fires once
@@ -596,10 +624,9 @@ void maybeStartLocateLoop() {
           debugPrint('  bboxFadeCtrl started — arrow fading in over 350ms');
           debugPrint('══════════════════════════════════════════════');
 
-          // Part Found announcement
           final label = partDesc.isNotEmpty
               ? partDesc
-              : (step.requiredPart).replaceAll('_', ' ');
+              : agentStep.requiredPart.replaceAll('_', ' ');
           guidance.bypassDedup();
           unawaited(guidance.speakGuidance(
             label.isNotEmpty
@@ -664,11 +691,10 @@ void maybeStartLocateLoop() {
         if (_locateAttempts >= _kMaxLocateAttempts) {
           _stopLocateLoop();
           if (isMounted()) {
-            // ✅ Cleaned up unused variables and removed unnecessary ? and !
-            final part2 = (step.requiredPart.isNotEmpty 
-                ? step.requiredPart : (step.visualCue ?? ''))
+            final part2 = (agentStep.requiredPart.isNotEmpty 
+                ? agentStep.requiredPart : agentStep.visualCue)
                 .replaceAll('_', ' ');
-            final area2 = step.areaHint.replaceAll('_', ' ');
+            final area2 = agentStep.areaHint.replaceAll('_', ' ');
             final hindi = langCode == 'hi';
 
             setState(() {
@@ -726,18 +752,19 @@ void maybeStartLocateLoop() {
     if (!isMounted()) return;
     
     final ctx = getContext();
-    final prov = ctx.read<DiagnosisProvider>();
-    final steps = prov.solution?.steps ?? demoSteps;
-    final step = currentStep < steps.length ? steps[currentStep] : null;
-    if (step == null) return;
-    
-    final machine = prov.solution?.machineType ?? 'water_pump';
+    final agentProv = ctx.read<AgentSessionProvider>();
+    final agentStep = agentProv.current?.nextStep;
+    if (agentStep == null) return;
+    final machine = agentProv.current?.updatedMemory['machine_type'] as String?
+                    ?? ctx.read<DiagnosisProvider>().solution?.machineType
+                    ?? 'water_pump';
     final isHindi = ctx.read<LanguageProvider>().languageCode == 'hi';
     
     setState(() => arState = ARState.analyzing);
     
     try {
       final frame = await captureFrame();
+      if (frame == null) return;
       final bytes = await frame.readAsBytes();
       
       // Quality check first
@@ -750,9 +777,9 @@ void maybeStartLocateLoop() {
       
     final result = await ApiService.verifyStep(
       imageFile: frame, 
-      stepText: step.getLocalizedText(isHindi),
-      requiredPart: step.requiredPart,
-      areaHint: step.areaHint,
+      stepText: agentStep.localizedText(isHindi),
+      requiredPart: agentStep.requiredPart,
+      areaHint: agentStep.areaHint,
       machineType: machine,
       problemContext: '',
       attemptCount: 1,
@@ -768,14 +795,14 @@ void maybeStartLocateLoop() {
         setState(() => showOffScreenArrow = false);
         
         // Initialize Kalman with VLM's bbox
-        final bbox = result['bbox'];
+        final bbox = result['bbox'] as List?;
         if (bbox != null && bbox.length == 4) {
           tracking.update(
-            cx: (bbox[0] + bbox[2]) / 2,
-            cy: (bbox[1] + bbox[3]) / 2,
-            bw: (bbox[2] - bbox[0]),
-            bh: (bbox[3] - bbox[1]),
-            confidence: result['confidence'] ?? 0.85,
+            cx: ((bbox[0] as num) + (bbox[2] as num)) / 2.0,
+            cy: ((bbox[1] as num) + (bbox[3] as num)) / 2.0,
+            bw: ((bbox[2] as num) - (bbox[0] as num)).toDouble(),
+            bh: ((bbox[3] as num) - (bbox[1] as num)).toDouble(),
+            confidence: (result['confidence'] as num?)?.toDouble() ?? 0.85,
           );
           transitionTo(ARState.guiding);
           HapticFeedback.mediumImpact();
@@ -818,6 +845,8 @@ void maybeStartLocateLoop() {
       case ToastKind.resultOk:   return const Duration(seconds: 6);
       case ToastKind.resultWarn: return const Duration(seconds: 8);
       case ToastKind.error:      return const Duration(seconds: 8);
+      case ToastKind.verifying:  return const Duration(seconds: 15);
+      case ToastKind.inspecting: return const Duration(seconds: 15);      
     }
   }
 
@@ -860,6 +889,10 @@ void maybeStartLocateLoop() {
         break;
       case ARState.analyzing:
         break;
+      case ARState.verifying:
+      case ARState.inspecting:
+      case ARState.repairing:
+        break;
       case ARState.unclear:
         break;
       case ARState.verified:
@@ -879,6 +912,31 @@ void maybeStartLocateLoop() {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // AGENT STATUS HANDLER
+  // ══════════════════════════════════════════════════════════════════════════
+
+  void handleAgentStatus(AgentStatus? status) {
+    if (status == null || !isMounted()) return;
+    switch (status) {
+      case AgentStatus.resolved:
+      case AgentStatus.escalate:
+        // Navigate back — SolutionScreen will show escalation card
+        if (isMounted()) {
+          Navigator.of(getContext()).pop();
+        }
+        break;
+      case AgentStatus.unsafe:
+        setState(() {
+          dangerMessage = 'The agent detected an unsafe condition. Stopping repair.';
+        });
+        transitionTo(ARState.danger);
+        break;
+      default:
+        break;
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // CAPTURE / VERIFY
   // ══════════════════════════════════════════════════════════════════════════
 
@@ -886,133 +944,214 @@ void maybeStartLocateLoop() {
     if (arState == ARState.analyzing) return;
     if (!cameraReady || cameraController == null) return;
     final ctx   = getContext();
-    final prov  = ctx.read<DiagnosisProvider>();
-    final steps = prov.solution?.steps ?? demoSteps;
-    final step  = currentStep < steps.length ? steps[currentStep] : null;
-    final machine  = prov.solution?.machineType ?? 'tractor';
-    final ctx2     = getContext();
-    final isHindi  = ctx2.read<LanguageProvider>().languageCode == 'hi';
-    final problem  = prov.solution?.getLocalizedProblem(isHindi) ?? '';
-    if (step != null && (step.requiresDecisionPanel || step.isActionStep)) {
-      setState(() => inspectionPanelVisible = true);
-      return;
-    }
+    final agentProv = ctx.read<AgentSessionProvider>();
+    final agentStep = agentProv.current?.nextStep;
+    if (agentStep == null) return;
+    final machine  = agentProv.current?.updatedMemory['machine_type'] as String?
+                     ?? ctx.read<DiagnosisProvider>().solution?.machineType
+                     ?? 'tractor';
+    final isHindi  = ctx.read<LanguageProvider>().languageCode == 'hi';
+    final problem  = ctx.read<DiagnosisProvider>().solution?.getLocalizedProblem(isHindi) ?? '';
+    
+    final interactionType = agentStep.interaction?.type;
+    
+    if (interactionType == InteractionType.camera) {
+        // ── Camera flow: AR locate → verify → inspect ─────────────────
+        _stopLocateLoop();
+        _partLocked         = false;
+        _lastCorrectionSent = null;
+        setState(() => bboxLocked = true);
+        HapticFeedback.mediumImpact();
+        attemptCount++;
+        await pauseCamera();
+        transitionTo(ARState.analyzing);
+        await showToast(ToastKind.analyzing);
 
-    _stopLocateLoop();
-    _partLocked         = false;
-    _lastCorrectionSent = null;
-    setState(() => bboxLocked = true);
-    HapticFeedback.mediumImpact();
-    attemptCount++;
-    await pauseCamera();
-    transitionTo(ARState.analyzing);
-    await showToast(ToastKind.analyzing);
+        File? tempFile;
+        try {
+          tempFile = await captureFrame();
+        } catch (_) {
+          await resumeCamera();
+          transitionTo(ARState.locating);
+          maybeStartLocateLoop();
+          return;
+        }
 
-    final File imageFile;
-    try {
-      imageFile = await captureFrame();
-    } catch (_) {
-      await resumeCamera();
-      transitionTo(ARState.locating);
-      maybeStartLocateLoop();
-      return;
-    }
+        if (tempFile == null) {
+          await resumeCamera();
+          transitionTo(ARState.locating);
+          maybeStartLocateLoop();
+          return;
+        }
+        
+        final File imageFile = tempFile;
+        await showToast(ToastKind.sent);
 
-    await showToast(ToastKind.sent);
+        final verifyBytes = await imageFile.readAsBytes();
+        final vq = await ARQualityGate.check(verifyBytes);
+        if (!vq.ok) {
+          await resumeCamera();
+          setState(() {
+            bboxLocked      = false;
+            dynamicFeedback = vq.message;
+          });
+          await showToast(ToastKind.resultWarn);
+          transitionTo(ARState.unclear);
+          Future.delayed(const Duration(seconds: 2), maybeStartLocateLoop);
+          return;
+        }
 
-    final verifyBytes = await imageFile.readAsBytes();
-    final vq = await ARQualityGate.check(verifyBytes);
-    if (!vq.ok) {
-      await resumeCamera();
-      setState(() {
-        bboxLocked      = false;
-        dynamicFeedback = vq.message;
-      });
-      await showToast(ToastKind.resultWarn);
-      transitionTo(ARState.unclear);
-      Future.delayed(const Duration(seconds: 2), maybeStartLocateLoop);
-      return;
-    }
+        final cropBytes = tracking.smoothBbox != null
+            ? await ARCropHelper.cropToBbox(verifyBytes, tracking.smoothBbox!)
+            : null;
 
-    final cropBytes = tracking.smoothBbox != null
-        ? await ARCropHelper.cropToBbox(verifyBytes, tracking.smoothBbox!)
-        : null;
+        final stepText = agentStep.textEn.isNotEmpty
+            ? agentStep.textEn : '';
+        final reqPart  = agentStep.requiredPart.isNotEmpty
+            ? agentStep.requiredPart : agentStep.visualCue;
+        final areaHint = agentStep.areaHint;
 
-    final stepText = step?.textEn.isNotEmpty == true
-        ? step!.textEn : step?.text ?? '';
-    final reqPart  = step?.requiredPart.isNotEmpty == true
-        ? step!.requiredPart : (step?.visualCue ?? '');
-    final areaHint = step?.areaHint ?? '';
+        Map<String, dynamic> result;
+        try {
+          result = await ApiService.verifyStep(
+            imageFile:      imageFile,
+            imageCropBytes: cropBytes,
+            stepText:       stepText,
+            machineType:    machine,
+            problemContext: problem,
+            attemptCount:   attemptCount,
+            requiredPart:   reqPart,
+            areaHint:       areaHint,
+            previousSteps:  jsonEncode(attemptResults),
+          );
+        } on Exception catch (e) {
+          debugPrint('ARGuide verifyStep error: $e');
+          await showToast(ToastKind.error);
+          await resumeCamera();
+          setState(() => bboxLocked = false);
+          transitionTo(ARState.locating);
+          Future.delayed(const Duration(seconds: 2), maybeStartLocateLoop);
+          return;
+        }
 
-    Map<String, dynamic> result;
-    try {
-      result = await ApiService.verifyStep(
-        imageFile:      imageFile,
-        imageCropBytes: cropBytes,
-        stepText:       stepText,
-        machineType:    machine,
-        problemContext: problem,
-        attemptCount:   attemptCount,
-        requiredPart:   reqPart,
-        areaHint:       areaHint,
-        previousSteps:  jsonEncode(attemptResults),
-      );
-    } on Exception catch (e) {
-      debugPrint('ARGuide verifyStep error: $e');
-      await showToast(ToastKind.error);
-      await resumeCamera();
-      setState(() => bboxLocked = false);
-      transitionTo(ARState.locating);
-      Future.delayed(const Duration(seconds: 2), maybeStartLocateLoop);
-      return;
-    }
+        await showToast(ToastKind.analyzed);
 
-    await showToast(ToastKind.analyzed);
+        final isDangerous = result['danger'] == true ||
+            result['status'] == 'danger' ||
+            (result['severity'] as String? ?? '').toLowerCase() == 'critical';
 
-    final isDangerous = result['danger'] == true ||
-        result['status'] == 'danger' ||
-        (result['severity'] as String? ?? '').toLowerCase() == 'critical';
+        if (isDangerous) {
+          if (isMounted()) {
+            setState(() {
+              dangerMessage = result['danger_message'] as String? ??
+                  'STOP — Critical safety hazard detected!\n\n'
+                  'The machine appears to be running or there is an immediate risk.\n'
+                  'Do NOT proceed until the machine is fully off and safe.';
+            });
+          }
+          transitionTo(ARState.danger);
+          HapticFeedback.vibrate();
+          return;
+        }
 
-    if (isDangerous) {
-      if (isMounted()) {
-        setState(() {
-          dangerMessage = result['danger_message'] as String? ??
-              'STOP — Critical safety hazard detected!\n\n'
-              'The machine appears to be running or there is an immediate risk.\n'
-              'Do NOT proceed until the machine is fully off and safe.';
-        });
-      }
-      transitionTo(ARState.danger);
-      HapticFeedback.vibrate();
-      return;
-    }
+        final verified = result['verified'] == true ||
+            result['status'] == 'verified';
 
-    final verified = result['verified'] == true ||
-        result['status'] == 'verified' || result['correct'] == true;
-
-    if (verified) {
-      await showToast(ToastKind.resultOk);
-      transitionTo(ARState.verified);
-      HapticFeedback.heavyImpact();
+        if (verified) {
+          await _runInspection(verifyBytes, reqPart, areaHint, machine, isHindi);
+        } else {
+          attemptResults.add({
+            'attempt_count': result['attempt_count'] ?? attemptCount,
+            'status':        result['status']        ?? 'unclear',
+            'detected_part': result['detected_part'] ?? '',
+            'feedback':      result['feedback']      ?? '',
+          });
+          if (isMounted()) {
+            setState(() {
+              final raw = isHindi
+                  ? (result['feedback_hi'] ?? result['feedback'])
+                  : result['feedback'];
+              dynamicFeedback = raw ??
+                  result['ai_observation'] ??
+                  'Image unclear or wrong part captured — see hint below for guidance.';
+            });
+          }
+          await showToast(ToastKind.resultWarn);
+          await resumeCamera();
+          setState(() => bboxLocked = false);
+          transitionTo(ARState.unclear);
+          Future.delayed(const Duration(seconds: 2), maybeStartLocateLoop);
+        }
     } else {
-      attemptResults.add({
-        'attempt_count': result['attempt_count'] ?? attemptCount,
-        'status':        result['status']        ?? 'unclear',
-        'detected_part': result['detected_part'] ?? '',
-        'feedback':      result['feedback']      ?? '',
-      });
-      if (isMounted()) {
-        // ✅ Removed ctx3 and hindi3 entirely!
-        setState(() {
-          final raw = isHindi
-              ? (result['feedback_hi'] ?? result['feedback'])
-              : result['feedback'];
-          dynamicFeedback = raw ??
-              result['ai_observation'] ??
-              'Image unclear or wrong part captured — see hint below for guidance.';
+        // ── Non-camera flow: open the inspection panel ─────────────────
+        agentPanelModel = InspectionPanelModel.fromAgentStep(agentStep);
+        setState(() => inspectionPanelVisible = true);
+    }
+}
+    /// Runs AFTER verification confirms the correct part.
+  /// Sends the frozen frame to /inspect_part for damage analysis.
+  Future<void> _runInspection(
+    Uint8List imageBytes,
+    String requiredPart,
+    String areaHint,
+    String machineType,
+    bool isHindi,
+  ) async {
+    transitionTo(ARState.inspecting);
+    
+    try {
+      final result = await ApiService.inspectPart(
+        imageBytes: imageBytes,
+        machineType: machineType,
+        requiredPart: requiredPart,
+        areaHint: areaHint,
+        language: isHindi ? 'hi' : 'en',
+      );
+      
+      inspectionSnapshot = InspectionSnapshot.fromJson(result, imageBytes.toList());
+      
+      final outcome = inspectionSnapshot!.outcome;
+      
+      if (outcome == InspectionOutcome.damaged) {
+        // Damage found — stay frozen for review
+        HapticFeedback.heavyImpact();
+        
+        final desc = inspectionSnapshot!.getLocalizedDescription(isHindi);
+        if (desc.isNotEmpty) {
+          await tts.stop();
+          await tts.speak(desc);
+        }
+        // Stay in inspecting state — UI shows InspectionOverlay
+        
+      } else if (outcome == InspectionOutcome.healthy) {
+        // No damage — advance agent
+        final ctx = getContext();
+        final agentProv = ctx.read<AgentSessionProvider>();
+        lastCompletedInteractionType = InteractionType.camera;
+        await agentProv.advance({
+          'status': 'inspected',
+          'outcome': 'healthy',
+          'observations': inspectionSnapshot!.observations,
         });
+        handleAgentStatus(agentProv.current?.status);
+        await showToast(ToastKind.resultOk);
+        transitionTo(ARState.verified);
+        HapticFeedback.heavyImpact();
+        
+      } else {
+        // Unclear/hidden/dirty — let user retry
+        setState(() {
+          dynamicFeedback = inspectionSnapshot!.getLocalizedDescription(isHindi);
+        });
+        await showToast(ToastKind.resultWarn);
+        await resumeCamera();
+        setState(() => bboxLocked = false);
+        transitionTo(ARState.unclear);
+        Future.delayed(const Duration(seconds: 2), maybeStartLocateLoop);
       }
-      await showToast(ToastKind.resultWarn);
+      
+    } catch (e) {
+      debugPrint('Inspection failed: $e');
       await resumeCamera();
       setState(() => bboxLocked = false);
       transitionTo(ARState.unclear);
@@ -1024,26 +1163,32 @@ void maybeStartLocateLoop() {
   // STEP NAVIGATION
   // ══════════════════════════════════════════════════════════════════════════
 
-  void nextPart(List<StepData> steps) {
-    if (currentStep + 1 >= steps.length) return;
+  // NOTE: does NOT call agentProv.advance() — the step shown here was
+  // already fetched by whichever handler (onActionDone / onInspectionAnswer /
+void nextPart(List<StepData> steps) {
     HapticFeedback.lightImpact();
     _stopLocateLoop();
     resumeCamera();
+
+    final ctx = getContext();
+    final agentProv = ctx.read<AgentSessionProvider>();
+
+    handleAgentStatus(agentProv.current?.status);
+
     setState(() {
-      currentStep             = currentStep + 1;
-      arState                 = ARState.scanning;
-      attemptCount            = 0;
-      panelExpanded           = false;
-      dynamicFeedback         = '';
-      cameraGuidance          = '';
-      partDescription         = '';
-      bboxLocked              = false;
-      _partLocked             = false;
-      _lastCorrectionSent     = null;
-      _netFailCount           = 0;
-      _everDetected           = false;
-      _trackingEnabled        = false;
-      inspectionPanelVisible  = false;
+      currentStep++; // <-- FIX: Increment step counter to fix "stuck on step 1" UI bug
+      attemptCount = 0;
+      panelExpanded = false;
+      dynamicFeedback = '';
+      cameraGuidance = '';
+      partDescription = '';
+      bboxLocked = false;
+      _partLocked = false;
+      _lastCorrectionSent = null;
+      _netFailCount = 0;
+      _everDetected = false;
+      _trackingEnabled = false;
+      inspectionPanelVisible = false;
     });
     tracking.reset();
     guidance.resetOnStepChange();
@@ -1051,81 +1196,89 @@ void maybeStartLocateLoop() {
     verifiedCtrl.reset();
     bboxFadeCtrl.reset();
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!isMounted()) return;
-      final ctx   = getContext();
-      final prov  = ctx.read<DiagnosisProvider>();
-      final stps  = prov.solution?.steps ?? demoSteps;
-      if (currentStep < stps.length) {
-        final s = stps[currentStep];
-        if (s.requiresDecisionPanel || s.isActionStep) {
-          setState(() => inspectionPanelVisible = true);
-        } else {
-          maybeStartLocateLoop();
-        }
-      }
-    });
-  }
-
-  void onInspectionAnswer(StepOption option, List<StepData> steps) {
-    HapticFeedback.mediumImpact();
-    attemptResults.add({
-      'attempt_count': 1,
-      'status':        'answered',
-      'detected_part': option.id,
-      'feedback':      option.labelEn,
-    });
-    setState(() => inspectionPanelVisible = false);
-
-    if (option.nextStep.isNotEmpty) {
-      final ctx      = getContext();
-      final prov     = ctx.read<DiagnosisProvider>();
-      final targetIdx = prov.solution?.indexOfStepId(option.nextStep) ?? -1;
-      if (targetIdx >= 0 && targetIdx < steps.length) {
-        Future.delayed(const Duration(milliseconds: 300), () {
-          if (!isMounted()) return;
-          _stopLocateLoop();
-          setState(() {
-            currentStep             = targetIdx;
-            arState                 = ARState.scanning;
-            attemptCount            = 0;
-            panelExpanded           = false;
-            dynamicFeedback         = '';
-            cameraGuidance          = '';
-            bboxLocked              = false;
-            _partLocked             = false;
-            _lastCorrectionSent     = null;
-            _trackingEnabled        = false;
-            _everDetected           = false;
-            inspectionPanelVisible  = false;
-          });
-          tracking.reset();
-          guidance.resetOnStepChange();
-          attemptResults.clear();
-          verifiedCtrl.reset();
-          bboxFadeCtrl.reset();
-          final nextS = steps[targetIdx];
-          if (nextS.requiresDecisionPanel || nextS.isActionStep) {
-            setState(() => inspectionPanelVisible = true);
-          } else {
-            maybeStartLocateLoop();
-          }
-        });
-        return;
-      }
+    transitionTo(ARState.scanning);
+    final nextStep = agentProv.current?.nextStep;
+    
+    // FIX: Route to camera if there's ANY visual target
+    if (nextStep != null && (nextStep.requiredPart.isNotEmpty || nextStep.visualCue.isNotEmpty)) {
+      maybeStartLocateLoop();
     }
-
-    Future.delayed(const Duration(milliseconds: 300), () {
-      if (!isMounted()) return;
-      transitionTo(ARState.verified);
-      HapticFeedback.heavyImpact();
-    });
   }
 
-  void onActionDone() {
+void onInspectionAnswer(StepOption option, List<StepData> steps) {
+    HapticFeedback.mediumImpact();
+    setState(() => inspectionPanelVisible = false);
+    transitionTo(ARState.analyzing);           // ← ADD THIS
+    showToast(ToastKind.analyzing);            // ← ADD THIS
+
+    final ctx = getContext();
+    final agentProv = ctx.read<AgentSessionProvider>();
+
+    final interactionOption = InteractionOption(
+      id: option.id,
+      label: option.getLocalizedLabel(false),
+      nextState: option.nextStep,
+    );
+    final result = AgentResultBuilder.fromChoice(interactionOption);
+    lastCompletedInteractionType = agentProv.current?.nextStep.interaction?.type;
+    
+    agentProv.advance(result).then((_) {
+      if (!isMounted()) return;
+      
+      final status = agentProv.current?.status; 
+      handleAgentStatus(status);
+      
+      if (status == AgentStatus.continueFlow) {
+        transitionTo(ARState.verified);
+        HapticFeedback.heavyImpact();
+      }
+    });
+}
+
+void onActionDone() {
     HapticFeedback.heavyImpact();
     setState(() => inspectionPanelVisible = false);
-    transitionTo(ARState.verified);
+    transitionTo(ARState.analyzing);           // ← ADD THIS
+    showToast(ToastKind.analyzing);            // ← ADD THIS
+
+    final ctx = getContext();
+    final agentProv = ctx.read<AgentSessionProvider>();
+    lastCompletedInteractionType = agentProv.current?.nextStep.interaction?.type;
+    
+    agentProv.advance(AgentResultBuilder.fromBoolean(true, 'done')).then((_) {
+      if (!isMounted()) return;
+      final status = agentProv.current?.status; 
+      handleAgentStatus(status);
+      if (status == AgentStatus.continueFlow) {
+        transitionTo(ARState.verified);
+        HapticFeedback.heavyImpact();
+      }
+    });
+}
+
+void checkAgentPanel() {
+      if (inspectionPanelVisible) return;
+      if (arState != ARState.scanning) return;
+      
+      final ctx = getContext();
+      final agentStep = ctx.read<AgentSessionProvider>().current?.nextStep;
+      if (agentStep == null) return;
+      final interaction = agentStep.interaction;
+      if (interaction == null) return;
+      
+      // FIX: If there is a part to look at, DO NOT auto-open the panel.
+      // We must force the user to point the camera and press "Analyze Part" first.
+      if (agentStep.requiredPart.isNotEmpty || agentStep.visualCue.isNotEmpty) {
+        return;
+      }
+      
+      if (interaction.type == InteractionType.camera) return;
+      
+      _stopLocateLoop();
+      agentPanelModel = InspectionPanelModel.fromAgentStep(agentStep);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (isMounted()) setState(() => inspectionPanelVisible = true);
+      });
   }
 
   void maybeShowInspectionPanel(StepData? step) {
@@ -1186,6 +1339,7 @@ final demoSteps = List.generate(12, (i) => StepData(
   text:      'Inspect component ${i + 1} carefully before proceeding.',
   textEn:    'Inspect component ${i + 1} carefully before proceeding.',
   textHi:    '',
+  action:    'Inspect component ${i + 1}',
   visualCue: i == 3 ? 'red_cable'
            : i == 4 ? 'fuse_box'
            : i == 5 ? 'battery_terminal'

@@ -88,6 +88,8 @@ class ProcedureValidation:
 def _step_text(step: Dict[str, Any]) -> str:
     parts = [
         str(step.get("instruction", "")),
+        str(step.get("text_en", "")),
+        str(step.get("text_hi", "")),
         str(step.get("description", "")),
         str(step.get("action", "")),
         str(step.get("warning", "")),
@@ -111,37 +113,45 @@ def _detect_work_type(steps_text: str) -> dict:
 # ── Safety step injectors ──────────────────────────────────────────────────────
 
 def _make_shutdown_step(machine_type: str, work_type: dict) -> Dict[str, Any]:
-    if work_type["electrical"]:
-        instruction = "Switch off the MCB / main breaker and verify all indicator lights are OFF. Wait 60 seconds for capacitors to discharge before touching any terminals."
-        instruction_hi = "MCB / main switch band karein aur ensure karein ki saare indicator lights band ho jaayein. Capacitor discharge ke liye 60 second rukein."
-    elif machine_type in ("tractor", "harvester", "diesel_engine", "power_tiller"):
-        instruction = "Turn off the engine and remove the ignition key. Engage the parking brake and wait for all moving parts to stop completely."
-        instruction_hi = "Engine band karein aur ignition key nikaal lein. Parking brake lagayein aur saare parts band hone tak wait karein."
-    elif work_type["hydraulic"]:
-        instruction = "Lower all hydraulic implements to the ground and turn off the engine. Open the hydraulic pressure relief valve to depressurise the system."
-        instruction_hi = "Saare hydraulic implements zameen par lower karein aur engine band karein. Hydraulic pressure relief valve khol ke system ko depressurise karein."
-    else:
-        instruction = "Ensure the machine is completely shut down and isolated from its power source before proceeding with any inspection or repair."
-        instruction_hi = "Koi bhi kaam shuru karne se pehle machine ko power source se bilkul alag karein."
-
+    from utils.machine_registry import get_shutdown_instruction
+    shutdown = get_shutdown_instruction(machine_type)
+    
     return {
-        "step_number":     1,
-        "instruction":     instruction,
-        "instruction_hi":  instruction_hi,
-        "required_part":   "power_isolation_point",
-        "area_hint":       "control_panel",
-        "is_safety_step":  True,
-        "_auto_injected":  True,
+        "step_number": 1,
+        "text_en": shutdown["instruction_en"],
+        "text_hi": shutdown["instruction_hi"],
+        "description": shutdown["instruction_en"],
+        "instruction": shutdown["instruction_en"],
+        "instruction_hi": shutdown["instruction_hi"],
+        "visual_cue": f"Locate the {shutdown['required_part'].replace('_', ' ')} and confirm it is in the OFF/safe position.",
+        "part": shutdown["required_part"],
+        "action": shutdown["action"],
+        "required_part": shutdown["required_part"],
+        "area_hint": shutdown["area_hint"],
+        "is_safety_step": True,
+        "_auto_injected": True,
         "_injection_rule": "SHUTDOWN_STEP_INJECTION",
     }
 
 def _make_lockout_step() -> Dict[str, Any]:
+    _instruction    = "Apply lockout/tagout: switch off the main isolator, attach a lockout padlock, and affix a DO NOT OPERATE tag before any work begins."
+    _instruction_hi = "Lockout/tagout lagayein: main isolator band karein, padlock lagayein, aur 'DO NOT OPERATE' tag lagayein kaam shuru karne se pehle."
     return {
-        "step_number":     1,
-        "instruction":     "Apply lockout/tagout: switch off the main isolator, attach a lockout padlock, and affix a DO NOT OPERATE tag before any work begins.",
-        "instruction_hi":  "Lockout/tagout lagayein: main isolator band karein, padlock lagayein, aur 'DO NOT OPERATE' tag lagayein kaam shuru karne se pehle.",
-        "is_safety_step":  True,
-        "_auto_injected":  True,
+        # ── Flutter-required fields ──────────────────────────────────────────
+        "step_number":    1,
+        "text_en":        _instruction,
+        "text_hi":        _instruction_hi,
+        # Legacy aliases
+        "instruction":    _instruction,
+        "instruction_hi": _instruction_hi,
+        "visual_cue":     "Locate the main isolator switch. Confirm padlock is attached and DO NOT OPERATE tag is visible.",
+        "part":           "main_isolator",
+        "action":         "lockout_tagout",
+        "required_part":  "main_isolator",
+        "area_hint":      "control_panel",
+        # ── Safety metadata ──────────────────────────────────────────────────
+        "is_safety_step": True,
+        "_auto_injected": True,
         "_injection_rule": "LOCKOUT_TAGOUT_INJECTION",
     }
 
@@ -213,29 +223,44 @@ def validate_procedure(
     # ── Rule 1: Shutdown/isolation step ──
     shutdown_present = _keywords_present(steps_text, _SHUTDOWN_KEYWORDS)
     shutdown_first   = _keywords_present(step1_text, _SHUTDOWN_KEYWORDS)
-    shutdown_ok      = shutdown_present
+    # FIX A2: shutdown_ok is set AFTER injection decisions, not before.
+    # The old code set shutdown_ok=shutdown_present prematurely, then re-set it
+    # after injection — making the CRITICAL issue appear alongside shutdown_ok=True
+    # in the log. Now shutdown_ok reflects the final post-injection state only.
+    shutdown_ok = False  # computed at the end of Rule 1
 
     if is_high_risk or is_electric or work_type["hydraulic"]:
         if not shutdown_present:
             issues.append(ValidationIssue(
-                severity="CRITICAL", rule="SHUTDOWN_STEP_MISSING",
-                detail=f"No shutdown/isolation step found for {machine_type} (risk={risk_level}).",
-                auto_fix=safe_inject,
+            severity="WARN" if not safe_inject else "CRITICAL",
+            rule="SHUTDOWN_STEP_MISSING",
+            detail=f"No shutdown/isolation step found for {machine_type} (risk={risk_level}).",
+            auto_fix=safe_inject,
             ))
             if safe_inject:
                 safe_steps.insert(0, _make_shutdown_step(machine_type, work_type))
                 safe_steps = _renumber_steps(safe_steps)
+                # shutdown_ok is True only because we just injected it
                 shutdown_ok = True
+            else:
+                # No injection — shutdown is genuinely absent and unresolved
+                shutdown_ok = False
         elif not shutdown_first and is_electric:
             issues.append(ValidationIssue(
                 severity="HIGH", rule="SHUTDOWN_NOT_FIRST_STEP",
                 detail="Shutdown exists but is not Step 1.",
                 auto_fix=False,
             ))
+            shutdown_ok = True  # present but in wrong position
+        else:
+            shutdown_ok = True  # present and correctly placed
+    else:
+        # Machine/risk profile does not require a shutdown step
+        shutdown_ok = True
 
     # ── Rule 2: Lockout/tagout ──
     lockout_present = _keywords_present(steps_text, _LOCKOUT_KEYWORDS)
-    lockout_ok      = lockout_present
+    lockout_ok = False  # computed below
 
     if risk_level == "CRITICAL" and is_electric and work_type["rotating"]:
         if not lockout_present:
@@ -248,6 +273,12 @@ def validate_procedure(
                 safe_steps.insert(0, _make_lockout_step())
                 safe_steps = _renumber_steps(safe_steps)
                 lockout_ok = True
+            else:
+                lockout_ok = False
+        else:
+            lockout_ok = True
+    else:
+        lockout_ok = True  # not required for this profile
 
     # ── Rule 3: Electrical PPE ──
     if is_electric and is_high_risk:
@@ -260,6 +291,10 @@ def validate_procedure(
             ))
 
     # ── Determine overall pass/fail ──
+    # FIX A2 (continued): passed=True only when ALL non-auto-fixed CRITICALs and HIGHs
+    # are absent. auto_fix=True issues that were successfully injected do NOT
+    # prevent passed=True — which is correct, because the injection resolved them.
+    # The logging block below fires unconditionally for ALL issues regardless of passed.
     remaining_criticals = [i for i in issues if i.severity == "CRITICAL" and not i.auto_fix]
     remaining_highs     = [i for i in issues if i.severity == "HIGH"     and not i.auto_fix]
     passed = len(remaining_criticals) == 0 and len(remaining_highs) == 0

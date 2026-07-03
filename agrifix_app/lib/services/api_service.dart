@@ -23,12 +23,11 @@ class NetworkException implements Exception {
 
 class ServerException implements Exception {
   final int statusCode;
-  final String message;
-  const ServerException(this.statusCode, this.message);
+  final String body;
+  const ServerException(this.statusCode, this.body);
   @override
-  String toString() => 'ServerException($statusCode): $message';
+  String toString() => 'ServerException($statusCode): $body';
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Result type passed to DiagnosisProvider
 // ─────────────────────────────────────────────────────────────────────────────
@@ -41,8 +40,8 @@ class DiagnosisResult {
 // ApiService
 // ─────────────────────────────────────────────────────────────────────────────
 class ApiService {
-  static const String _baseUrl = //'http://10.0.2.2:7860';
-      'https://technospes-agrifixar-backend-new.hf.space';
+  static const String _baseUrl = 'http://192.168.29.116:7860';
+      // 'https://technospes-agrifixar-backend-new.hf.space';
   static const String _appKey = '020b082f133f403abf8694e6144df1a79396b2706dd9de108bc54a05e891fc29';
   static const Duration _uploadTimeout = Duration(seconds: 90);
   static const Duration _streamTimeout = Duration(minutes: 3);
@@ -490,6 +489,37 @@ class ApiService {
     return result.raw; 
   }
 
+  /// Inspect a verified part for damage.
+  /// Uses the NEW /inspect_part endpoint (separate from /verify_step).
+  static Future<Map<String, dynamic>> inspectPart({
+    required Uint8List imageBytes,
+    required String machineType,
+    required String requiredPart,
+    required String areaHint,
+    String language = 'en',
+  }) async {
+    final request = http.MultipartRequest(
+        'POST', Uri.parse('$_baseUrl/inspect_part'))
+      ..headers['X-App-Key'] = _appKey
+      ..files.add(http.MultipartFile.fromBytes(
+        'image', imageBytes, filename: 'inspect.jpg'))
+      ..fields.addAll({
+        'machine_type': machineType,
+        'required_part': requiredPart,
+        'area_hint': areaHint,
+        'language': language,
+      });
+
+    final streamed = await request.send()
+        .timeout(const Duration(seconds: 15));
+    final response = await http.Response.fromStream(streamed);
+    
+    if (response.statusCode != 200) {
+      throw ServerException(response.statusCode, response.body);
+    }
+    return jsonDecode(response.body) as Map<String, dynamic>;
+  }
+
   // ── AR Part Location ───────────────────────────────────────────────────────
   // Called by the AR guidance loop every ~3 seconds.
   // Returns { found, bbox, confidence, camera_guidance, part_description }.
@@ -535,5 +565,62 @@ class ApiService {
       'part_description': null,
     };
   }
+  // ── Agent session lifecycle ─────────────────────────────────────────────
+static Future<Map<String, dynamic>> createAgentSession({
+  required String machineType,
+  required String problemDescription,
+  required String language,
+  required List<Map<String, dynamic>> diagnosisSteps,
+}) async {
+  final uri = Uri.parse('$_baseUrl/agent/session');
+  final resp = await http.post(
+    uri,
+    headers: {'Content-Type': 'application/json', 'X-App-Key': _appKey},
+    body: jsonEncode({
+      'machine_type': machineType,
+      'problem_description': problemDescription,
+      'language': language,
+      'diagnosis_steps': diagnosisSteps,
+    }),
+  ).timeout(const Duration(seconds: 20));
 
+  if (resp.statusCode != 200) {
+    throw ServerException(resp.statusCode, resp.body);
+  }
+  return jsonDecode(resp.body) as Map<String, dynamic>;
+}
+
+static Future<Map<String, dynamic>> agentNext({
+  required String sessionId,
+  required Map<String, dynamic> lastVerificationResult,
+}) async {
+  final uri = Uri.parse('$_baseUrl/agent/next');
+  final resp = await http.post(
+    uri,
+    headers: {'Content-Type': 'application/json', 'X-App-Key': _appKey},
+    body: jsonEncode({
+      'session_id': sessionId,
+      'last_verification_result': lastVerificationResult,
+    }),
+  ).timeout(const Duration(seconds: 30));
+
+  if (resp.statusCode == 404) {
+    throw const ServerException(404, 'Session expired or not found');
+  }
+  if (resp.statusCode != 200) {
+    throw ServerException(resp.statusCode, resp.body);
+  }
+  return jsonDecode(resp.body) as Map<String, dynamic>;
+}
+
+static Future<void> deleteAgentSession(String sessionId) async {
+  try {
+    await http.delete(
+      Uri.parse('$_baseUrl/agent/session/$sessionId'),
+      headers: {'X-App-Key': _appKey},
+    ).timeout(const Duration(seconds: 10));
+  } catch (_) {
+    // best-effort cleanup — server TTL will reclaim it anyway
+  }
+  }
 }

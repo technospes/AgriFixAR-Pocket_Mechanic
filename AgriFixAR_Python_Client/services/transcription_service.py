@@ -682,7 +682,19 @@ async def _extract_with_gemini(
             data = _json.loads(raw_json)
             full_desc = (data.get("full_description") or "").strip()
             if full_desc:
-                logger.info(f"✨ Gemini structured: {full_desc[:120]}")
+                # Strip "unknown machine" hallucination
+                full_desc = re.sub(
+                    r"\b(?:the\s+)?unknown\s+machine'?s?\b\s*",
+                    "",
+                    full_desc,
+                    flags=re.IGNORECASE,
+                ).strip()
+                # Also strip leading "on the" or "in the" left behind
+                full_desc = re.sub(r"^(?:on|in)\s+the\s+", "", full_desc, flags=re.IGNORECASE).strip()
+                # Capitalize first letter
+                if full_desc:
+                    full_desc = full_desc[0].upper() + full_desc[1:]
+                logger.info(f"Gemini structured: {full_desc[:120]}")
                 return full_desc
         except (_json.JSONDecodeError, AttributeError):
             # JSON parse failed — fall through to raw fallback

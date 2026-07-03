@@ -1,22 +1,21 @@
 from __future__ import annotations
 import asyncio
+import os
 import json
 import logging
-import io
 from typing import Optional
-from PIL import Image
 import time as _time
-from utils.helpers import sanitize_json_text
+from utils.json_repair import repair_json
+from utils.image_utils import resize_image
 from utils.vision_client import vision_call
 from utils.machine_registry import get_area_farmer_description, get_profile
 _BBOX_CACHE_TTL_S: float = 0.8
 _bbox_cache: dict = {}   # key → {result, ts, hits}
+LOCATE_PART_MAX_IMAGE_DIM = int(os.getenv("LOCATE_PART_MAX_IMAGE_DIM", "512"))
 
 logger = logging.getLogger(__name__)
 
-_CONF_THRESHOLD  = 0.82          # FIX 2: raised from 0.72 — LLM bboxes need higher bar
-_MAX_IMAGE_PX    = 512           # Resize before sending — keeps tokens low
-_MAX_IMAGE_DIM   = _MAX_IMAGE_PX
+_CONF_THRESHOLD  = 0.82
 
 _AREA_DIRECTIONS: dict[str, str] = {
     "suction_side":     "the inlet/suction side of the pump",
@@ -109,7 +108,7 @@ async def locate_part_with_gemini(
     )
 
     try:
-        resized_bytes = await _resize_image(image_bytes)
+        resized_bytes = await resize_image(image_bytes, max_dim=LOCATE_PART_MAX_IMAGE_DIM, quality=82)
 
         area_desc      = get_area_farmer_description(machine_type, area_hint, language)
         area_direction = _AREA_DIRECTIONS.get(area_hint, f"the {area_hint.replace('_', ' ')}")
@@ -192,7 +191,7 @@ Return ONLY this JSON (no markdown, no preamble):
             temperature=0.1,
         )
 
-        raw = json.loads(sanitize_json_text(response_text))
+        raw = repair_json(response_text)
 
         # ── Anti-hallucination gate ───────────────────────────────────────────
         # If ANY reject flag is true, force found=false regardless of what
@@ -357,18 +356,3 @@ def _fallback_not_found(part: str, area: str, machine: str, lang: str) -> dict:
         "reject_flags":     {"part_not_visible": True, "wrong_area": False,
                              "image_too_blurry": False, "part_behind_machine": False},
     }
-
-
-async def _resize_image(image_bytes: bytes) -> bytes:
-    """Resize to max 512px — keeps Gemini token cost at ~258 per image."""
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        if img.width > _MAX_IMAGE_DIM or img.height > _MAX_IMAGE_DIM:
-            img.thumbnail((_MAX_IMAGE_DIM, _MAX_IMAGE_DIM), Image.Resampling.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=82)
-            return buf.getvalue()
-        return image_bytes
-    except Exception as exc:
-        logger.warning(f"locate_part image resize failed: {exc}")
-        return image_bytes

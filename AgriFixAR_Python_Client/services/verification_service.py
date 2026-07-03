@@ -1,19 +1,10 @@
-# ═══════════════════════════════════════════════════════════════════
-# MIGRATION NOTE: Vision calls migrated from deprecated google.generativeai
-# to vision_call() from utils.vision_client (new google.genai SDK with
-# automatic API key rotation across 4 Gemini keys).
-# Future target: llama-3.2-11b-vision-preview via groq_client.
-# MIGRATED: google.generativeai → utils.vision_client (vision_call)
-# ═══════════════════════════════════════════════════════════════════
 from __future__ import annotations
 import asyncio
+import os
 import json
 import logging
-import io
-
-from PIL import Image
-
-from utils.helpers import sanitize_json_text
+from utils.json_repair import repair_json
+from utils.image_utils import resize_image
 from utils.vision_client import vision_call
 from utils.machine_registry import (
     get_area_farmer_description,
@@ -22,13 +13,8 @@ from utils.machine_registry import (
     get_profile,
     get_compact_parts_list,
 )
-
+VERIFY_MAX_IMAGE_DIM = int(os.getenv("VERIFY_MAX_IMAGE_DIM", "720"))
 logger = logging.getLogger(__name__)
-_MAX_IMAGE_DIM = 720
-
-# ── Confidence thresholds ─────────────────────────────────────────────────────
-# Verified (pass) requires ≥ 0.70 — below this returns "need_verification".
-# Fail/unclear are reported as-is without threshold enforcement.
 CONFIDENCE_THRESHOLD_PASS = 0.70
 
 # ── Jargon substitution map ───────────────────────────────────────────────────
@@ -135,7 +121,7 @@ async def verify_step_with_gemini(
     )
 
     try:
-        resized_bytes = await _resize_image(image_bytes)
+        resized_bytes = await resize_image(image_bytes, max_dim=VERIFY_MAX_IMAGE_DIM)
 
         area_desc   = get_area_farmer_description(machine_type, area_hint, language)
         is_electric = is_electric_machine(machine_type)
@@ -223,7 +209,7 @@ pass=part_visible+assessable(conf≥0.70); fail=wrong_area; unclear=bad_image; u
             temperature=0.1,
         )
 
-        result    = json.loads(sanitize_json_text(response_text))
+        result    = repair_json(response_text)
         raw_status = result.get("status", "unclear")
         raw_conf   = float(result.get("confidence", 0.0))
 
@@ -345,21 +331,6 @@ pass=part_visible+assessable(conf≥0.70); fail=wrong_area; unclear=bad_image; u
         logger.error(f"❌ Vision error [{machine_type}]: {exc}")
 
     return _fallback_verification(required_part, machine_type, attempt_count)
-
-
-async def _resize_image(image_bytes: bytes, max_dim: int = _MAX_IMAGE_DIM) -> bytes:
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        if img.width > max_dim or img.height > max_dim:
-            img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=85)
-            return buf.getvalue()
-        return image_bytes
-    except Exception as exc:
-        logger.warning(f"Image resize failed: {exc}")
-        return image_bytes
-
 
 def _fallback_verification(required_part: str, machine_type: str, attempt_count: int) -> dict:
     return {

@@ -5,7 +5,8 @@ import io
 import json
 import logging
 import re
-from typing import List, Optional
+from typing import List, Optional, TypedDict
+from enum import StrEnum
 import os
 # MIGRATED: Gemini → Groq — google.generativeai removed
 from utils.groq_client import groq_client, TEXT_MODEL, JSON_CONFIG, groq_chat_completion  # MIGRATED: Gemini → Groq  # FAILOVER: primary → fallback
@@ -14,12 +15,17 @@ from PIL import Image
 
 from rag import retrieve_with_confidence, RAG_WEAK_THRESHOLD
 from query_router import route_query, load_machine_registry
-from utils.helpers import sanitize_json_text, generate_cache_key, get_cached_response, cache_response
+from utils.helpers import generate_cache_key, get_cached_response, cache_response
 from utils.machine_registry import (
     get_profile_or_default, get_allowed_area_ids, get_compact_parts_list,
     get_compact_safety_keywords, is_electric_machine, is_tractor_attachment,
 )
-
+from services.safety_guards import (
+    run_text_hazard_checks,
+    _guard_electric_hazard,
+    _guard_dangerous_workaround,
+    _guard_emergency_hazard,
+)
 # FIX 3: Multi-hop diagnostic chain — subsystem classification + root cause ranking
 from multihop_diagnosis import run_diagnostic_chain
 
@@ -32,10 +38,54 @@ from procedure_validator import validate_procedure
 # FIX 6: Verification gate — verify machine/component before final repair
 from services.verification_service import verify_step_with_gemini
 
+# Repair-plan structural validation — single source of truth, shared with
+# repair_agent.py. See agent/validation.py for the rationale.
+from agent.validation import InvalidRepairPlan, validate_repair_plan_steps
+
 
 logger = logging.getLogger(__name__)
 # _GEMINI_MODEL removed — TEXT_MODEL from groq_client used instead  # MIGRATED: Gemini → Groq
 _RAG_STRICT_THRESHOLD = 0.40
+
+# ── Escalation response schema ────────────────────────────────────────────────
+
+class RagSource(StrEnum):
+    """Canonical rag_source values. One typo breaks analytics — use these."""
+    PRE_CALL            = "pre_call_guard"
+    ERROR               = "error"
+    NO_CONTEXT          = "no_context"
+    EMPTY_RAG_MAINT     = "guard5_empty_rag_maintenance"
+    UNKNOWN_ATTACHMENT  = "guard_unknown_attachment"
+    ELECTRIC_HAZARD     = "pre_guard_electric_shock_injury"
+    WORKAROUND          = "pre_guard_workaround"
+    EMERGENCY_HAZARD    = "emergency_hazard_guard"
+    ESCALATION          = "escalation"
+
+
+class EscalationResponse(TypedDict, total=False):
+    """Canonical shape of every escalation response. Flutter parses this."""
+    status: str
+    problem_description: str
+    technical_analysis: str
+    solution: dict
+    rag_source: str
+    machine_label: str
+    # Optional: unsafe scene
+    unsafe_scene_suspected: bool
+    unsafe_scene_message: str
+    # Optional: emergency hazard metadata
+    hazard_category: str
+    hazard_level: str
+    emergency_stop_required: bool
+    requires_power_isolation: bool
+    requires_medical_attention: bool
+    requires_fire_response: bool
+    requires_evacuation: bool
+    # Internal markers
+    cache_hit: bool
+    _informational_override: bool
+    _reassurance_override: bool
+    _verification_issues: list
 
 # ── FIX 6: Verification gate thresholds ──────────────────────────────────────
 # Below this confidence, verification fails and we return "Need verification"
@@ -44,11 +94,22 @@ _VERIFICATION_CONFIDENCE_THRESHOLD = 0.60
 _VERIFICATION_RISK_LEVELS = {"HIGH", "CRITICAL"}
 
 _GROUNDING_RULE = """\
-GROUNDING RULE (non-negotiable): Your diagnosis MUST be derived exclusively from
-the KNOWLEDGE BASE CONTEXT below. Do NOT use your general training knowledge to
-fill gaps. If the context does not contain enough information to answer with
-confidence, state: "This is not covered in the manual — consult a certified
-mechanic." Never invent part names, causes, steps, intervals, or specifications."""
+GROUNDING RULE (non-negotiable): The retrieved evidence below is your PRIMARY
+knowledge source. Reason over these chunks first. Your DIAGNOSIS — which part
+is at fault, what fixes it, and any spec/interval/measurement — MUST be derived
+exclusively from the KNOWLEDGE BASE CONTEXT below. Never invent a cause, fix,
+spec, or interval that isn't in the context.
+
+Use your general mechanical knowledge ONLY to:
+• Connect evidence across chunks
+• Explain terminology in farmer-friendly language
+• Describe what named parts look like and where they are located
+• Fill obvious procedural gaps (e.g., "tighten the bolt" when the manual says
+  "secure the component")
+
+Never contradict the retrieved evidence. If the evidence is insufficient to
+diagnose the actual fault, state: "This is not covered in the manual — consult
+a certified mechanic." """
 
 _WEAK_CONTEXT_HEADER = """\
  RAG CONTEXT QUALITY: LOW (top relevance score < 0.40)
@@ -99,14 +160,22 @@ def _build_strict_grounding_prompt(machine_type, machine_label, problem_text, ra
     visual_snippet = _extract_visual_snippet(problem_text) if visual_text_present else ""
 
     if has_visual_frames:
-        visual_note = "VISUAL PRIORITY OVERRIDE — ACTIVE (image frames provided):\n  • Visual evidence is the PRIMARY source of truth.\n  • If the 'Audio Symptom' text contradicts what the frames show, TRUST THE FRAMES.\n"
+        visual_note = "Camera images are available for context. Use them to confirm the machine type and general condition, but generate repair steps based on the manual excerpts and symptom description below."
     elif visual_text_present:
         visual_note = f"VISUAL PRIORITY OVERRIDE — ACTIVE (embedded visual descriptor detected):\n  • RULE: The visual context (\"{visual_snippet}\") is the PRIMARY symptom.\n  • If the 'Audio:' field contradicts the visual context, TRUST THE VISUAL CONTEXT.\n"
 
+    # from utils.machine_registry import get_shutdown_instruction
+    # shutdown = get_shutdown_instruction(machine_type)
+    
     electric_note = ""
-    if is_electric_machine(machine_type): electric_note = "CRITICAL: This is an ELECTRIC machine. Step 1 MUST verify main power is OFF.\n"
-    elif is_tractor_attachment(machine_type): electric_note = "CRITICAL: Tractor attachment — Step 1 MUST verify PTO is disengaged.\n"
-
+    # f"""CRITICAL SAFETY — STEP 1 REQUIREMENT:
+    #                 Your FIRST step MUST be a safety step with these EXACT values:
+    #                 action: "{shutdown['action']}"
+    #                 description: "{shutdown['instruction_en']}"
+    #                 required_part: "{shutdown['required_part']}"
+    #                 area_hint: "{shutdown['area_hint']}"
+    #                 step_type: "safety"
+    #                 Copy these values exactly. Do NOT modify or paraphrase.\n"""
     quality_banner = _WEAK_CONTEXT_HEADER if context_quality == "weak" else _STRONG_CONTEXT_HEADER
     quality_banner += f"Top chunk relevance: {top_score:.2f} | "
 
@@ -116,6 +185,7 @@ def _build_strict_grounding_prompt(machine_type, machine_label, problem_text, ra
         rag_block = f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚠️ NO MANUAL EXTRACTS AVAILABLE — HALLUCINATION TRAP ACTIVE\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nThe RAG retrieval system found NO chunks above the relevance threshold.\nYOU MUST OUTPUT AN ESCALATION RESPONSE. Set steps = [] (empty array).\nDO NOT generate steps, intervals, oil grades, or any procedure from your\nown training knowledge — that is a CRITICAL FAILURE regardless of how\nhelpful it would be to the user.\n\nCASE A — Machine type matches {machine_type} AND query describes a real\nmechanical part or maintenance task:\n  → status = \"escalate\", steps = []\n  → technical_analysis = \"This procedure is not covered in the {machine_label} service manual.\"\n  → safety_warnings_en[0] = \"This specific procedure is not in our repair manual for the {machine_label}. Please consult the manufacturer's user guide or a certified mechanic.\"\n\nCASE B — Out-of-scope or unknown fault:\n  → status = \"escalate\", steps = []\n  → technical_analysis = \"Insufficient knowledge base coverage for this symptom.\"\n  → safety_warnings_en[0] = \"Automatic diagnosis unavailable: symptom outside knowledge base. Consult a certified mechanic.\""
 
     target_symptoms = ", ".join(router_symptoms) if router_symptoms else problem_text
+    user_query_words = problem_text
     grounding_rules = f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {_GROUNDING_RULE}
@@ -131,9 +201,19 @@ STRICT GROUNDING RULES — ZERO-HALLUCINATION PROTOCOL
    One sentence: "The user describes [X symptom] with [visual/audio evidence Y]."
    Visual context (if present) ALWAYS overrides audio/text description.
 
-   STEP 2 — [RAG Chunk Search]:
-   For EVERY chunk in the Manual Extracts, copy the PROBLEM: field verbatim.
-   Format: "Chunk [ID]: PROBLEM: [exact problem text from chunk]"
+   STEP 2 — RAG CHUNK SEARCH:
+    The user said: "{user_query_words}"
+    Review each chunk. A chunk matches if:
+    • Its PROBLEM field contains the SAME mechanical symptom OR describes
+      a fault in the SAME component/system, even if the exact wording differs
+      (e.g. "clutch is stuck" matches "Clutch fails to work" / "Clutch cable
+      damage" — these are all clutch malfunctions; do NOT require literal
+      word-for-word symptom equality).
+    • Prefer chunks where MULTIPLE user symptoms or the SAME component appear.
+    • Only state "no chunk covers this symptom" if NO chunk mentions the same
+      component or system at all.
+    List all matching chunk IDs with their PROBLEM fields and explain why each
+    matches.
    
    The user's extracted symptoms are: {target_symptoms}
    
@@ -153,10 +233,20 @@ STRICT GROUNDING RULES — ZERO-HALLUCINATION PROTOCOL
      • "ESCALATE — Routine maintenance, no active fault (Chunk [ID])."
      • "SUCCESS/REASSURE — Chunk [ID] explicitly confirms symptom is normal."
      • "SUCCESS/FIRE_EXT — Chunk 3b informational query, ESCALATE_IF says DO NOT escalate."
-     • "DIAGNOSE — Chunk [ID] PROBLEM field provides the exact fix for this symptom."
+     • "DIAGNOSE — Chunk [ID] covers the same component/system as the symptom
+       (component-class match per RULE 5); use its PROBLEM/STEPS as the closest
+       applicable fix."
 
    STEP 4 — [Faithfulness Verification]:
-   Read your planned steps. Are you about to output any tool, part, or action that is NOT explicitly written in the matched chunk? If yes, delete it immediately. Your output must be a 1:1 reflection of the manual.
+   Check only the DIAGNOSTIC claims in your draft — which part is at fault,
+   what fixes it, any spec/interval/part number. Is each one explicitly
+   written in the matched chunk? If not, delete or soften it.
+   
+   Do NOT apply this check to general descriptive language (how to locate
+   a part using visible landmarks, what it looks like, what healthy vs.
+   faulty looks like). That is general mechanical knowledge, not a
+   diagnostic claim, and is REQUIRED by the FARMER INSTRUCTION STANDARD
+   below even when the manual itself doesn't spell it out.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 1 — UNIVERSAL SAFETY MASTER (ABSOLUTE HIGHEST PRIORITY)
@@ -236,16 +326,193 @@ CRITICAL SCHEMA RULES:
   5. "required_part" MUST be a snake_case ID from: {parts_list}
   6. "area_hint" MUST be one of: {allowed_areas}
 
-🔒 TERMINOLOGY LOCK & STEP GENERATION:
-  - Copy every part name EXACTLY as in the Manual Extracts.
-  - Preserve ALL technical instructions, warnings, and measurements exactly as written in the manual. Omitting a spec is a CRITICAL FAITHFULNESS FAILURE.
-  - STRICT GROUNDED EXTRACTION: Extract the exact steps provided in the matched chunk. Output exactly as many steps as the chunk dictates. Do NOT pad or expand.
+🌾 FARMER INSTRUCTION STANDARD:
+
+  Your job is to TEACH the farmer, not merely list repair steps.
+  The farmer should feel more confident after reading each step, not overwhelmed.
+
+   ═══ USER MENTAL MODEL ═══
+  Assume the operator:
+    • Has never repaired this machine before
+    • Cannot identify components by name
+    • Does not know mechanical terminology
+    • May be anxious about making mistakes
+
+  Write instructions that increase confidence while remaining
+  technically accurate.
+
+  "action":      A short imperative (e.g. "Switch OFF the pump", "Inspect the capacitor").
+                 This is the repair action — what the farmer must do.
+
+  "description": The teaching. This should reduce uncertainty for a first-time
+                 operator. When relevant, include:
+                   • How to locate the component using visible landmarks
+                     (e.g. "where the power cable enters", "beside the fan cover",
+                     "underneath the fuel tank") — prefer landmarks over left/right
+                   • How to visually identify the component
+                   • What healthy looks like and what failure looks like
+                   • How to perform the action safely
+                   • How the operator can confirm the expected outcome
+                     using sight, sound, or touch (only when safe).
+                     Prefer observations over measurements.
+                     Example: "The humming noise should stop."
+                     Example: "Water should begin flowing steadily."
+                 Include only information that helps perform the current step.
+                 Do not force every step to contain every category.
+    "step_type": One of: "safety" | "inspection" | "repair" | "verification".
+                   Classify each step:
+                   - "safety": ONLY for mid-repair safety warnings when a NEW hazard emerges that wasn't covered by the initial safety gate. Do NOT generate safety steps for power-off/shutdown at the start — the app's SafetyGate already handles this before AR begins. Only use "safety" if a step creates a NEW risk (e.g., "Warning: the part you just removed exposes live terminals").
+                   - "inspection": Camera-verifiable visual check ONLY. The farmer points their phone at a specific visible part. FORBIDDEN: measurement tools (tape, gauge), exact numbers (40-45mm), tool-based adjustments. REQUIRED: specific snake_case required_part, visible landmark description, what healthy vs faulty looks like. If the manual specifies a measurement, convert it to a visual observation using body-part comparisons (finger-width, thumb-length).
+                   - "repair": Replace, tighten, remove, install, adjust a part
+                   - "verification": Restore power, start machine, confirm operation
+
+  ═══ COMPONENT INTRODUCTION ═══
+  Introduce a component only if the operator must interact with it.
+  If a component is only mentioned for context, do not interrupt the
+  procedure with a long explanation.
+
+  The first time the operator must interact with a component:
+    1. Describe only the characteristics that are actually visible
+       without disassembly. Do not describe hidden internal components
+       as though they can be seen.
+    2. Then give its technical name.
+
+  When describing locations, use this priority:
+    1. Permanent external landmarks (power cable entry, fan cover,
+       fuel tank, radiator, belt pulley)
+    2. Nearby visible components
+    3. Clock-face directions (e.g. "at the 2 o'clock position
+       relative to the fan cover")
+  Avoid left/right unless orientation is already established.
+
+  Example:
+    "Look for the small rectangular plastic box attached to the outside
+     of the motor where the electrical cable enters. This is called the
+     capacitor box."
+
+  After a component has been introduced, you may simply call it by name.
+  Do not repeat the full identification unless another similar component
+  could reasonably be confused with it.
+
+  ═══ STEP DETAIL BY TYPE ═══
+  Safety steps (e.g. "Switch OFF the main breaker"):
+    Be concise and unambiguous. Do not add unnecessary explanation.
+
+  Inspection steps (CAMERA-VERIFIABLE ONLY):
+    Design EVERY inspection step so the farmer can point their phone
+    camera at a specific part and the AI vision system can verify it.
+    - Include visual identification landmarks, what healthy looks like,
+      and what damage/fault looks like.
+    - NEVER ask the farmer to measure anything with a tool (tape, gauge,
+      multimeter). If the manual specifies a measurement, convert it to
+      a visual observation: "about two finger-widths" not "40-45mm".
+    - Every inspection step MUST have a specific required_part the
+      camera can point at. Use snake_case from the allowed parts list.
+    - The camera IS the verification tool — use it for everything visual.
+
+  Repair/replacement steps:
+    Include physical actions, tool placement, expected outcome.
+    After describing what to do, add a CAMERA VERIFICATION sub-step:
+    "After completing, point camera at [part] to verify it's correctly
+    installed/tightened/replaced."
+
+  Verification steps (e.g. "Start the pump and check for leaks"):
+    Include what to observe and how to confirm success.
+    When possible, make this camera-verifiable: "Point camera at [part]
+    and confirm [expected visual outcome]."
+
+  ═══ SAFETY PREREQUISITES ═══
+  Every repair step must include every safety prerequisite immediately
+  required for that step. Do not assume the operator remembers a warning
+  from several steps earlier.
+
+  Example: If a step involves touching electrical components, repeat
+  "Ensure the main power is OFF" even if mentioned in Step 1.
+
+  ═══ NEVER TELL THE FARMER TO READ THE MANUAL ═══
+  The farmer may be semi-literate or unable to read English/Hindi text.
+  Your job is to BE the manual — translate everything into simple,
+  actionable instructions the farmer can follow immediately.
+
+  BANNED PHRASES — never include these in any step's action or description:
+  • "Refer to the manual" / "Read the user guide"
+  • "Check the manufacturer's instructions" / "See service manual"
+  • "Consult a certified mechanic" / "Bring a technician"
+  • "Contact Mahindra service centre" / "Visit the dealership"
+  • Any measurement with units: "40-45mm", "2cm", "0.5 inches", "measure with tape"
+  • Any tool-based measurement: "use a measuring tape", "check with multimeter", "use a feeler gauge"
+
+  If the repair truly requires a professional (e.g., internal engine work,
+  electrical hazards beyond simple checks), escalate the ENTIRE diagnosis
+  with status="escalate" and steps=[]. Do NOT generate helpful steps and
+  then end with "if problem persists, consult a mechanic."
+
+  ═══ LANGUAGE RULES ═══
+  Words like "inspect", "check", and "verify" are acceptable only when
+  immediately followed by specific guidance on what to look for.
+
+  GOOD: "Inspect the capacitor for bulging, oil leakage, or burn marks."
+  BAD:  "Inspect the capacitor."
+
+  GOOD: "Check whether the terminal screws are loose or burnt."
+  BAD:  "Check the wiring."
+
+  Use cautious language ("typically", "usually", "commonly") only when
+  relying on general engineering knowledge. When information comes directly
+  from the manual, state it confidently. Do not overuse hedging words.
+
+  ═══ QUALITY STANDARD ═══
+  Write only enough information to complete the current step safely.
+  Do not explain future steps early.
+  Do not explain previous steps again.
+  Each step should solve only one immediate problem.
+
+  ═══ LAST STEP MUST BE ACTIONABLE ═══
+  The final step MUST be a verification check the farmer can actually do:
+  "Start the engine and check that the clutch engages smoothly"
+  NOT: "If the problem persists, consult a mechanic"
+  NOT: "Refer to the manual for further guidance"
+  
+  The escalation condition already exists in the escalate_if field.
+  Do not repeat it as a step. Every step must teach the farmer something
+  they can do right now.
+
+  ═══ WORKED EXAMPLE ═══
+  Manual chunk says only: "Clutch — Clutch cable damage."
+
+  BAD (manual-literal, what you must NOT do):
+    "action": "Check the clutch cable for damage"
+    "description": ""
+
+  GOOD (same diagnosis, taught clearly — this is what's required):
+    "action": "Check the clutch cable for fraying or stretching"
+    "description": "The clutch cable runs from the clutch pedal to the
+    clutch fork near the gearbox housing, usually visible as a thick wire
+    cable in a metal sheath. Follow it from the pedal toward the engine.
+    A damaged cable looks frayed, kinked, or stretched, and the clutch
+    pedal will feel loose or won't fully disengage the clutch. The fix —
+    cable replacement — comes from the manual; the description of what
+    the cable looks like and where it runs is general mechanical knowledge
+    used here only to help you find it." 
+
+    ═══ CONSISTENCY RULE ═══
+    Apply the teaching standard above to EVERY step — including the last one.
+    The final step must be as detailed as the first. "Check for other issues"
+    without landmarks or visual guidance is NOT acceptable. If the manual
+    mentions "welding points breaking off, fork pin bent, spring failure",
+    describe WHERE to look for each and WHAT each looks like when damaged.
+
+  The goal is safe completion, not comprehensive education.
 """
 
     prompt = f"""
-You are a diagnostic AI for {machine_label} machinery. Generate a camera-guided repair plan.
+You are an experienced agricultural mechanic explaining repairs to a
+first-time {machine_label} operator. Your job is to safely guide the
+operator through the repair using the manufacturer's manual.
+Reduce uncertainty. Never assume the operator already knows machinery
+or component names.
 {visual_note}
-{electric_note}
+""
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PROBLEM DESCRIPTION
@@ -267,6 +534,81 @@ SAFETY WARNINGS & LANGUAGE RULES
 """.strip()
     return prompt
 
+# ── Unified escalation response factory ───────────────────────────────────────
+# Single source of truth for every escalation response dict. All pre-LLM guards,
+# fallback paths, and no-context handlers produce responses through this function.
+#
+# Reserved keys (status, solution, problem_description, technical_analysis,
+# safety_warnings) are protected — metadata cannot overwrite them.
+
+import copy as _copy
+
+_BASE_ESCALATION: dict = {
+    "status": "escalate",
+    "solution": {
+        "steps": [],
+        "tools_needed": [],
+    },
+}
+
+_RESERVED_KEYS: frozenset = frozenset({
+    "status", "solution", "problem_description", "technical_analysis",
+    "safety_warnings_en", "safety_warnings_hi", "rag_source", "machine_label",
+})
+
+
+def _build_escalation_response(
+    machine_type: str,
+    machine_label: str,
+    problem_text: str,
+    technical_analysis: str,
+    safety_warnings_en: List[str],
+    safety_warnings_hi: List[str],
+    *,
+    rag_source: RagSource = RagSource.ESCALATION,
+    problem_identified: str = "",
+    metadata: Optional[dict] = None,
+) -> dict:
+    """
+    Produce a canonical escalation response dict.
+
+    Args:
+        machine_type:        Canonical machine ID (e.g. "electric_motor").
+        machine_label:       Human-readable label (e.g. "Electric Motor").
+        problem_text:        Original farmer query text.
+        technical_analysis:  One-paragraph explanation of why escalated.
+        safety_warnings_en:  List of English safety messages.
+        safety_warnings_hi:  List of Hindi safety messages.
+        rag_source:          Canonical RagSource enum value.
+        problem_identified:  Short fault label (defaults to technical_analysis).
+        metadata:            Optional dict of extra fields merged into response.
+                             Reserved keys are silently dropped.
+
+    Returns:
+        EscalationResponse-compatible dict.
+    """
+    result = _copy.deepcopy(_BASE_ESCALATION)
+    result.update({
+        "problem_description": problem_text,
+        "technical_analysis": technical_analysis,
+        "solution": {
+            **result["solution"],
+            "machine_type": machine_type,
+            "problem_identified": problem_identified or technical_analysis,
+            "safety_warnings_en": list(safety_warnings_en),
+            "safety_warnings_hi": list(safety_warnings_hi),
+        },
+        "rag_source": rag_source.value,
+        "machine_label": machine_label,
+    })
+
+    # Merge caller-supplied metadata, protecting reserved keys
+    if metadata:
+        for key, value in metadata.items():
+            if key not in _RESERVED_KEYS:
+                result[key] = value
+
+    return result
 
 def _should_hard_escalate(problem_text: str, rag_context: str) -> Optional[str]:
     if not problem_text or not problem_text.strip(): return "__empty_input__"
@@ -284,21 +626,16 @@ def _guard5_empty_rag_maintenance(problem_text: str, rag_context: str, machine_t
     if rag_context and rag_context.strip(): return None
     if not any(p.search(problem_text or "") for p in _MAINTENANCE_PATTERNS): return None
     logger.warning(f"🛡️ GUARD 5 PRE-LLM: Empty RAG + maintenance query [{machine_type}] — escalating")
-    return {
-        "status": "escalate",
-        "problem_description": problem_text,
-        "technical_analysis": f"This maintenance procedure is not covered in the {machine_label} service manual.",
-        "solution": {
-            "machine_type": machine_type,
-            "problem_identified": "Routine maintenance schedule query — not in knowledge base.",
-            "steps": [],
-            "safety_warnings_en": [f"This specific procedure is not in our repair manual for the {machine_label}. Please consult the manufacturer's user guide or a certified mechanic."],
-            "safety_warnings_hi": [f"यह रखरखाव की जानकारी हमारे {machine_label} मैनुअल में नहीं है। कृपया निर्माता की गाइड देखें या प्रमाणित मैकेनिक से पूछें।"],
-            "tools_needed": [],
-        },
-        "rag_source": "guard5_empty_rag_maintenance",
-        "machine_label": machine_label,
-    }
+    return _build_escalation_response(
+        machine_type=machine_type,
+        machine_label=machine_label,
+        problem_text=problem_text,
+        technical_analysis=f"This maintenance procedure is not covered in the {machine_label} service manual.",
+        safety_warnings_en=[f"This specific procedure is not in our repair manual for the {machine_label}. Please consult the manufacturer's user guide or a certified mechanic."],
+        safety_warnings_hi=[f"यह रखरखाव की जानकारी हमारे {machine_label} मैनुअल में नहीं है। कृपया निर्माता की गाइड देखें या प्रमाणित मैकेनिक से पूछें।"],
+        rag_source=RagSource.EMPTY_RAG_MAINT,
+        problem_identified="Routine maintenance schedule query — not in knowledge base.",
+    )
 
 
 # ─── PRE-LLM GUARDS ─────────────────────────────────────────────────────────
@@ -313,157 +650,16 @@ _UNKNOWN_ATTACHMENT_PATTERNS = [
 def _guard_unknown_attachment(problem_text: str, machine_type: str, machine_label: str) -> Optional[dict]:
     if not any(p.search(problem_text or "") for p in _UNKNOWN_ATTACHMENT_PATTERNS): return None
     logger.warning(f"🛡️ GUARD UNKNOWN_ATTACHMENT: Unidentified implement [{machine_type}]")
-    return {
-        "status": "escalate",
-        "problem_description": problem_text,
-        "technical_analysis": "The attachment or implement cannot be identified. This falls outside the knowledge base coverage for this machine.",
-        "solution": {
-            "machine_type": machine_type,
-            "problem_identified": "Unknown implement — insufficient knowledge base coverage.",
-            "steps": [],
-            "safety_warnings_en": ["This attachment is not covered in our repair manual. Consult the manufacturer."],
-            "safety_warnings_hi": ["यह उपकरण हमारे मैनुअल में नहीं है।"],
-            "tools_needed": [],
-        },
-        "rag_source": "guard_unknown_attachment",
-        "machine_label": machine_label,
-    }
-
-_ELECTRIC_SHOCK_PATTERNS = [
-    re.compile(r'\bcurrent\s+lag(?:a|i)\b', re.IGNORECASE),
-    re.compile(r'\bbijli\s+lag(?:i|a)\b', re.IGNORECASE),
-    re.compile(r'\belectric(?:al)?\s+shock\b', re.IGNORECASE),
-    re.compile(r'\bjhatka\s+lag(?:a|i)\b', re.IGNORECASE),
-    re.compile(r'\bshock\s+lag(?:a|i)\b', re.IGNORECASE),
-]
-_SHOCK_EXCLUSIONS = [
-    re.compile(r'\btingling\b', re.IGNORECASE),
-    re.compile(r'\bmild\s+shock\b', re.IGNORECASE),
-    re.compile(r'\bhalka\s+current\b', re.IGNORECASE),
-]
-_FLOODED_MOTOR_PATTERNS = [
-    re.compile(r'(?:standing|sitting|submerged|lying)\s+in\s+(?:water|flood|paani)', re.IGNORECASE),
-    re.compile(r'\d+\s*inch(?:es)?\s+(?:of\s+)?(?:water|paani)', re.IGNORECASE),
-]
-_ELECTRIC_HAZARD_MACHINES = {"electric_motor", "submersible_pump", "water_pump"}
-
-def _guard_electric_hazard(diagnosis: dict, problem_text: str, machine_type: str, machine_label: str) -> Optional[dict]:
-    prob_lower = (problem_text or "").lower()
-    if any(p.search(prob_lower) for p in _SHOCK_EXCLUSIONS):
-        return None
-    is_shock = any(p.search(prob_lower) for p in _ELECTRIC_SHOCK_PATTERNS)
-    is_flooded = (machine_type in _ELECTRIC_HAZARD_MACHINES and any(p.search(prob_lower) for p in _FLOODED_MOTOR_PATTERNS))
-    if not (is_shock or is_flooded): return None
-    logger.warning(f"🛡️ PRE-LLM GUARD: Electric shock/flood [{machine_type}]")
-    if is_shock:
-        warn_en = "EMERGENCY — electric shock. (1) Cut the main MCB immediately. (2) Call emergency services (ambulance) now. (3) Do not operate any equipment until certified safe."
-        warn_hi = "आपातकाल — करंट लगा है। तुरंत मेन MCB काटें और एम्बुलेंस को फोन करें।"
-        analysis = "Electric shock reported. Immediate MCB cutoff and emergency medical response required."
-    else:
-        warn_en = "DANGER — do NOT start or energise this motor while it is submerged in water. Cut the main MCB immediately. Allow the motor to dry completely."
-        warn_hi = "खतरा — पानी में डूबी मोटर को बिल्कुल मत चलाएं। तुरंत मेन MCB काटें।"
-        analysis = "Motor submerged in water — electrocution risk if energised."
-    return {
-        "status": "escalate",
-        "problem_description": problem_text,
-        "technical_analysis": analysis,
-        "solution": {
-            "machine_type": machine_type,
-            "problem_identified": analysis,
-            "steps": [],
-            "safety_warnings_en": [warn_en],
-            "safety_warnings_hi": [warn_hi],
-            "tools_needed": [],
-        },
-        "unsafe_scene_suspected": True,
-        "unsafe_scene_message": "Electric hazard detected. Ensure power is cut before contact.",
-        "rag_source": "pre_guard_electric_shock_injury",
-        "machine_label": machine_label,
-    }
-
-_DANGEROUS_WORKAROUND_PATTERNS = [
-    (re.compile(r'\brubber\s*band\b', re.IGNORECASE), "rubber band used as governor/throttle spring"),
-    (re.compile(
-        r'\bwire\s+(?:for|instead|as)\s+belt\b'
-        r'|\bwire\s+se\s+(?:belt|bandh|kaam\s+chala)\b'
-        r'|\b(?:wire|taar)\s+(?:belt|v[\-\s]?belt)\s+(?:ki\s+jagah|ke\s+badle|laga)\b'
-        r'|\btaar\s+(?:laga\s+diya|lagaya|bandh\s+kar)\b',
-        re.IGNORECASE
-    ), "wire used instead of belt"),
-    (re.compile(r'\brope\s+(?:for|instead|as)\s+(?:drive\s+)?belt\b', re.IGNORECASE), "rope used as drive belt"),
-    (re.compile(r'\bnail\s+(?:for|instead|as)\s+fuse\b', re.IGNORECASE), "nail used as fuse"),
-    (re.compile(r'\bfoil\s+(?:for|instead|as)\s+fuse\b', re.IGNORECASE), "foil used as fuse"),
-    (re.compile(r'\bstring\s+(?:tied|for|as)\s+throttle\b', re.IGNORECASE), "string tied to throttle"),
-    (re.compile(r'\bbypas(?:s|sing)\s+(?:safety|interlock|switch|sensor)\b', re.IGNORECASE), "safety bypass detected"),
-]
-
-_WORKAROUND_WARNINGS = {
-    "rubber band used as governor/throttle spring": (
-        "STOP. A rubber band on the throttle/governor is an extreme fire and overspeeding hazard. The engine cannot regulate speed and may overspeed to destruction. Do NOT start the engine. Replace with the correct OEM governor spring immediately.",
-        "रुकें! थ्रॉटल/गवर्नर पर रबर बैंड लगाना बेहद खतरनाक है — इंजन बेकाबू होकर टूट सकता है। इंजन बिल्कुल मत चलाएं। तुरंत असली गवर्नर स्प्रिंग लगाएं।",
-        "TO FIX: Remove the rubber band. Install the correct OEM governor spring between the governor arm and throttle linkage.",
-    ),
-    "wire used instead of belt": (
-        "STOP. A wire cannot safely replace a drive belt — it will snap under load, become a projectile, or jam the pulleys causing serious injury. Do NOT operate the machine. Replace with the correct specification V-belt immediately.",
-        "रुकें! तार बेल्ट की जगह नहीं ले सकता — यह टूटकर गंभीर चोट कर सकता है या पुली में फंस सकता है। मशीन बिल्कुल मत चलाएं। सही नाप की V-बेल्ट तुरंत लगाएं।",
-        "TO FIX: Remove the wire. Loosen the tensioner pulley bolt, route the correct OEM V-belt over both pulleys, adjust tension until the belt deflects ~10mm when pressed firmly at centre.",
-    ),
-    "rope used as drive belt": (
-        "STOP. A rope will slip, fray, and fail under load causing sudden power loss or injury. Do NOT operate. Replace with the correct specification V-belt.",
-        "रुकें! रस्सी बेल्ट का काम नहीं करती — यह टूट सकती है। मशीन मत चलाएं। सही V-बेल्ट लगाएं।",
-        "TO FIX: Remove the rope. Install the correct OEM V-belt.",
-    ),
-    "nail used as fuse": (
-        "STOP. A nail bypasses overcurrent protection — this will cause a fire or electrocution under fault. Replace with a fuse of the correct amperage rating immediately.",
-        "रुकें! नाखून से फ्यूज का काम नहीं होता — आग या करंट का खतरा है। सही एम्पीयर का फ्यूज लगाएं।",
-        "TO FIX: Remove the nail. Install a fuse with the correct amperage rating.",
-    ),
-    "foil used as fuse": (
-        "STOP. Foil bypasses overcurrent protection and will cause a fire under fault conditions. Replace with the correct rated fuse immediately.",
-        "रुकें! फॉयल से फ्यूज नहीं बनता — आग लग सकती है। सही रेटिंग का फ्यूज लगाएं।",
-        "TO FIX: Remove the foil. Install the correct rated fuse as marked on the fuse holder.",
-    ),
-    "string tied to throttle": (
-        "STOP. A string tied to the throttle is a dangerous workaround — engine speed cannot be safely controlled. Do not operate. Replace with the OEM throttle linkage.",
-        "रुकें! धागे से थ्रॉटल बांधना खतरनाक है। मशीन मत चलाएं। असली थ्रॉटल लिंकेज लगाएं।",
-        "TO FIX: Remove the string. Install the correct OEM throttle linkage or cable.",
-    ),
-    "safety bypass detected": (
-        "STOP. Bypassing a safety interlock removes a critical protection designed to prevent serious injury. Do not operate the machine. Restore the interlock and have it inspected before use.",
-        "रुकें! सेफ्टी स्विच बायपास करना बहुत खतरनाक है। मशीन मत चलाएं। पहले सेफ्टी स्विच ठीक करवाएं।",
-        "TO FIX: Restore the safety interlock. If the switch is faulty, replace it with an identical OEM safety switch.",
-    ),
-}
-
-def _guard2_dangerous_workaround(diagnosis: dict, problem_text: str, machine_type: str, machine_label: str) -> Optional[dict]:
-    matched_reason = None
-    for pattern, reason in _DANGEROUS_WORKAROUND_PATTERNS:
-        if pattern.search(problem_text or ""):
-            matched_reason = reason
-            break
-    if not matched_reason: return None
-    logger.warning(f"🛡️ PRE-LLM GUARD: Dangerous workaround ({matched_reason})")
-    default = ("STOP. This is a dangerous workaround. Replace with the OEM part immediately.", "रुकें! यह खतरनाक तरीका है। तुरंत असली पुर्जा लगाएं।", "")
-    warn_en, warn_hi, fix_en = _WORKAROUND_WARNINGS.get(matched_reason, default)
-    warnings_en = [warn_en, fix_en] if fix_en else [warn_en]
-    return {
-        "status": "escalate",
-        "unsafe_scene_suspected": True,
-        "unsafe_scene_message": "Dangerous mechanical workaround detected. Do not operate machine.",
-        "problem_description": problem_text,
-        "technical_analysis": f"Dangerous workaround detected: {matched_reason}.",
-        "solution": {
-            "machine_type": machine_type,
-            "problem_identified": f"Dangerous mechanical workaround — {matched_reason}.",
-            "steps": [],
-            "safety_warnings_en": warnings_en,
-            "safety_warnings_hi": [warn_hi],
-            "tools_needed": [],
-        },
-        "rag_source": "pre_guard_workaround",
-        "machine_label": machine_label,
-    }
-
+    return _build_escalation_response(
+        machine_type=machine_type,
+        machine_label=machine_label,
+        problem_text=problem_text,
+        technical_analysis="The attachment or implement cannot be identified. This falls outside the knowledge base coverage for this machine.",
+        safety_warnings_en=["This attachment is not covered in our repair manual. Consult the manufacturer."],
+        safety_warnings_hi=["यह उपकरण हमारे मैनुअल में नहीं है।"],
+        rag_source=RagSource.UNKNOWN_ATTACHMENT,
+        problem_identified="Unknown implement — insufficient knowledge base coverage.",
+    )
 
 # ─── NON-DESTRUCTIVE POST-LLM GUARDS ────────────────────────────────────────
 
@@ -537,39 +733,17 @@ def _derive_unsafe_scene(problem_text: str, technical_analysis: str, has_any_vis
         return True, "Dangerous mechanical workaround detected. Do not operate machine."
     return False, ""
 
-def _build_escalation_dict(machine_type, machine_label, problem_text, trigger):
-    return {
-        "status": "escalate",
-        "problem_description": problem_text,
-        "technical_analysis": f"Pre-call guard triggered: '{trigger}'. No input to process.",
-        "solution": {
-            "machine_type": machine_type,
-            "problem_identified": "Empty or invalid input.",
-            "steps": [],
-            "safety_warnings_en": ["Automatic diagnosis unavailable: no input received."],
-            "safety_warnings_hi": ["स्वचालित निदान उपलब्ध नहीं है: कोई इनपुट प्राप्त नहीं हुआ।"],
-            "tools_needed": [],
-        },
-        "rag_source": "pre_call_guard",
-        "machine_label": machine_label,
-    }
-
 def _fallback_escalation_response(machine_type, machine_label, problem_text, error_reason):
-    return {
-        "status": "escalate",
-        "problem_description": problem_text,
-        "technical_analysis": f"Unable to diagnose: {error_reason}",
-        "solution": {
-            "machine_type": machine_type,
-            "problem_identified": problem_text,
-            "steps": [],
-            "safety_warnings_en": ["Automatic diagnosis unavailable.", "Consult a certified technician."],
-            "safety_warnings_hi": ["स्वचालित निदान उपलब्ध नहीं है।", "प्रमाणित तकनीशियन से संपर्क करें।"],
-            "tools_needed": [],
-        },
-        "rag_source": "error",
-        "machine_label": machine_label,
-    }
+    return _build_escalation_response(
+        machine_type=machine_type,
+        machine_label=machine_label,
+        problem_text=problem_text,
+        technical_analysis=f"Unable to diagnose: {error_reason}",
+        safety_warnings_en=["Automatic diagnosis unavailable.", "Consult a certified technician."],
+        safety_warnings_hi=["स्वचालित निदान उपलब्ध नहीं है।", "प्रमाणित तकनीशियन से संपर्क करें।"],
+        rag_source=RagSource.ERROR,
+        problem_identified=problem_text,
+    )
 
 
 # ── FIX 6: Verification Gate ──────────────────────────────────────────────────
@@ -728,6 +902,15 @@ def _normalize_status(diagnosis: dict) -> dict:
 
     return diagnosis  # MIGRATED: Groq format normalization
 
+def _contains_actionable_guidance(diagnosis: dict) -> bool:
+    """True if the _post_process_diagnosis contains concrete repair guidance (not just text)."""
+    solution = diagnosis.get("solution", {})
+    return bool(
+        solution.get("steps")
+        or solution.get("tools_needed")
+        or solution.get("parts")
+        or solution.get("verification_steps")
+    )
 
 async def _post_process_diagnosis(
     diagnosis: dict,
@@ -736,6 +919,7 @@ async def _post_process_diagnosis(
     problem_text: str,
     rag_context: str,
     visual_frames: Optional[List[bytes]],
+    context_quality: str,
 ) -> dict:
 
     # MIGRATED: Groq format normalization — normalize before any routing logic
@@ -755,11 +939,78 @@ async def _post_process_diagnosis(
     if diagnosis.get("status") == "escalate" and not diagnosis.get("rag_source"):
         diagnosis["rag_source"] = "escalation"
 
-    # 3. Deduplication
+    # 3. Normalize step field names + deduplication
+    # The LLM (especially fallback models) may return steps with non-standard
+    # field names like "description"/"warning" instead of "text_en"/"safety_warning".
+    # Normalize them so Flutter always sees a consistent schema.
     steps = diagnosis["solution"].get("steps", [])
-    diagnosis["solution"]["steps"] = _deduplicate_steps(steps)
+    _normalized_steps = []
+    for _s in steps:
+        if not isinstance(_s, dict):
+            continue
+        _ns = dict(_s)
 
-    # ── FIX 5: Procedure Validator ──────────────────────────────────────────
+        # Build text_en from action + description without destroying original fields.
+        # action = short imperative (good for title/speech), description = explanation.
+        # Concatenate both so the farmer sees the full instruction.
+        _action = _ns.get("action", "").strip()
+        _desc = _ns.get("description", "").strip()
+
+        if "text_en" not in _ns:
+            # Format snake_case action for display
+            _display = _action.replace("_", " ") if "_" in _action and " " not in _action else _action
+            if _display and _desc:
+                _ns["text_en"] = f"{_display}\n{_desc}"
+            elif _display:
+                _ns["text_en"] = _display
+            elif _desc:
+                _ns["text_en"] = _desc
+            elif _action:
+                _ns["text_en"] = _action
+            elif _desc:
+                _ns["text_en"] = _desc
+
+        # Map other common LLM field name variations to canonical names
+        if "description_hi" in _ns and "text_hi" not in _ns:
+            _ns["text_hi"] = _ns.get("description_hi", "")
+        if "warning" in _ns and "safety_warning" not in _ns:
+            _ns["safety_warning"] = _ns.get("warning", "")
+        if "part" in _ns and "required_part" not in _ns:
+            _ns["required_part"] = _ns.get("part", "")
+        # Infer step_type if LLM didn't provide it — diagnosis owns this classification
+        if "step_type" not in _ns:
+            if not _ns.get("required_part") or _ns.get("required_part") in ("none", "unknown", ""):
+                _ns["step_type"] = "safety"
+            else:
+                _ns["step_type"] = "inspection"
+        if "area_hint" not in _ns or not _ns.get("area_hint"):
+            _ns["area_hint"] = "engine_compartment"
+
+        _normalized_steps.append(_ns)
+    # DEBUG: Verify filter will run
+    logger.info(f"🔍 DEBUG: About to filter {len(_normalized_steps)} steps")
+    for i, s in enumerate(_normalized_steps):
+        logger.info(f"🔍   Step {i}: type={s.get('step_type')} part={s.get('required_part')}")
+
+    # ── Filter safety steps handled by Flutter SafetyGate ─────────────────
+    # This runs AFTER the normalization loop, filtering the complete list.
+    _SHUTDOWN_PARTS = {"ignition_key", "power_switch", "mcb", "circuit_breaker", 
+                       "main_isolator", "battery_terminal", "fuel_valve", "machine_part"}
+    
+    _steps_before = len(_normalized_steps)
+    _normalized_steps = [
+        s for s in _normalized_steps
+        if not (
+            s.get("step_type") == "safety"
+            and s.get("required_part", "") in _SHUTDOWN_PARTS
+        )
+    ]
+    if len(_normalized_steps) < _steps_before:
+        logger.info(f"🛡️  Removed %d safety step(s) — Flutter SafetyGate handles pre-AR safety",
+            _steps_before - len(_normalized_steps))
+    
+    steps = _normalized_steps
+    diagnosis["solution"]["steps"] = _deduplicate_steps(steps)
     if diagnosis.get("status") != "escalate":
         try:
             raw_steps  = diagnosis["solution"].get("steps", [])
@@ -770,24 +1021,116 @@ async def _post_process_diagnosis(
                 machine_type = machine_type,
                 risk_level   = risk_level,
                 tools_list   = tools_list,
-                safe_inject  = True,
+                safe_inject  = False,
             )
+
+            # Always apply safe_steps — even in Path A this is the correct list
+            # (auto-injected shutdown step is now Flutter-compatible per FIX A2).
             diagnosis["solution"]["steps"] = validation.safe_steps
-            if not validation.passed:
-                logger.warning(
-                    "FIX 5: Procedure validation issues for %s: %s",
-                    machine_type, validation.summary(),
+
+            # Log all issues unconditionally — not gated by passed flag.
+            logger.info("FIX 5: %s", validation.summary())
+            for issue in validation.issues:
+                level = logging.WARNING if issue.severity in ("CRITICAL", "HIGH") else logging.DEBUG
+                logger.log(level, "  [%s] %s: %s", issue.severity, issue.rule, issue.detail[:80])
+
+            # Path B: unresolvable CRITICALs — block the response.
+            # This is the enforcement gate that was previously missing.
+            unresolvable_criticals = [
+                i for i in validation.issues
+                if i.severity == "CRITICAL" and not i.auto_fix
+            ]
+            if unresolvable_criticals:
+                logger.error(
+                    "FIX 5: BLOCKING dangerous steps for %s — %d unresolvable CRITICAL issue(s): %s",
+                    machine_type,
+                    len(unresolvable_criticals),
+                    [i.rule for i in unresolvable_criticals],
                 )
-                critical_msgs = [
+                diagnosis["status"]  = "escalate"
+                diagnosis["solution"]["steps"] = []
+                critical_detail_msgs = [i.detail for i in unresolvable_criticals]
+                existing_en = diagnosis["solution"].get("safety_warnings_en", [])
+                diagnosis["solution"]["safety_warnings_en"] = critical_detail_msgs + existing_en
+                # Preserve machine_label so Flutter can render the escalation card correctly.
+                diagnosis.setdefault("machine_label", machine_label)
+
+            # Path B also: surface HIGH non-fixable issues as warnings (no blocking,
+            # but they must be visible — not just in logs).
+            elif not validation.passed:
+                # HIGH issues only (CRITICALs handled above, WARNINGs don't block)
+                high_msgs = [
                     i.detail for i in validation.issues
-                    if i.severity == "CRITICAL" and not i.auto_fix
+                    if i.severity == "HIGH" and not i.auto_fix
                 ]
-                if critical_msgs:
+                if high_msgs:
                     existing_en = diagnosis["solution"].get("safety_warnings_en", [])
-                    diagnosis["solution"]["safety_warnings_en"] = critical_msgs + existing_en
+                    diagnosis["solution"]["safety_warnings_en"] = high_msgs + existing_en
+
         except Exception as exc:
             logger.warning("FIX 5: Procedure validation failed (non-fatal): %s", exc)
     # ────────────────────────────────────────────────────────────────────────
+
+    # ── Step ID assignment — SINGLE SOURCE OF TRUTH ─────────────────────────
+    # This runs once, here, after every mutation that can add/remove/reorder
+    # steps (dedup + procedure_validator's safe_steps injection) has already
+    # happened. Every downstream consumer — Flutter's SolutionData, the
+    # agent's RepairPlan/RepairPlanStep — must trust diagnosis["solution"]
+    # ["steps"][i]["step_id"] as final. No fallback generation, no silent
+    # patching anywhere further down the pipeline (session creation, the
+    # agent's step-advancement logic, etc.) — if it's missing there, that's
+    # a bug in THIS function, not something to paper over downstream.
+    _final_steps = diagnosis["solution"].get("steps", [])
+    for _idx, _step in enumerate(_final_steps):
+        if isinstance(_step, dict):
+            _step["step_id"] = f"s{_idx + 1}"
+
+    # Structural validation happens immediately after generation — not
+    # thousands of lines later — so an invalid plan can never exist beyond
+    # this point. If this raises, it means THIS function has a bug (the
+    # loop above is the only thing that sets step_id, so blank/duplicate
+    # ids here would mean the assignment itself is broken). This is a
+    # backend defect, not a mechanical fault — it must propagate as
+    # InvalidRepairPlan, NOT get wrapped in an escalation card telling the
+    # farmer to "consult a certified mechanic." Nothing is wrong with their
+    # equipment; something is wrong with this service. The caller of
+    # generate_diagnosis_with_gemini() (main.py) must catch InvalidRepairPlan
+    # separately from normal escalation handling and return a generic
+    # service-error response.
+    validate_repair_plan_steps(_final_steps, context=f"machine={machine_type}")
+    # ────────────────────────────────────────────────────────────────────────
+
+    # ── C7: Weak-context grounding enforcement ─────────────────────────────
+    # The LLM is instructed to escalate when context is weak, but that's a soft
+    # prompt instruction. This is the code-level backstop: if retrieval quality
+    # is weak AND the model returned actionable guidance anyway, force escalation
+    # through the canonical factory. No in-place mutation — single return path.
+    if context_quality == "weak" and _contains_actionable_guidance(diagnosis):
+        logger.warning(
+            "C7: Weak context with actionable guidance (status='%s', steps=%d) — "
+            "forcing escalation via factory",
+            diagnosis.get("status"),
+            len(diagnosis.get("solution", {}).get("steps", [])),
+        )
+        return _build_escalation_response(
+            machine_type=machine_type,
+            machine_label=machine_label,
+            problem_text=problem_text,
+            technical_analysis=(
+                "The repair manual does not contain enough information to "
+                "safely guide this repair. Consult a certified mechanic."
+            ),
+            safety_warnings_en=[
+                "The repair manual does not contain enough information to "
+                "safely guide this repair. Consult a certified mechanic."
+            ],
+            safety_warnings_hi=[
+                "मरम्मत मैनुअल में इस समस्या के लिए पर्याप्त जानकारी नहीं है। "
+                "कृपया प्रमाणित मैकेनिक से संपर्क करें।"
+            ],
+            rag_source=RagSource.NO_CONTEXT,
+            problem_identified="Insufficient knowledge base coverage for safe repair guidance.",
+        )
 
     # 4. Unsafe-scene flag
     if diagnosis.get("_reassurance_override") or diagnosis.get("_informational_override") or diagnosis.get("_electric_hazard_override"):
@@ -877,8 +1220,9 @@ def _enrich_industrial_response(
     issues: List[str] = []
     if not steps and diagnosis.get("status") == "success":
         issues.append("WARNING: status=success but steps list is empty.")
-    if steps and not any(s.get("part") or s.get("action") for s in steps):
-        issues.append("WARNING: steps present but missing part/action fields.")
+    if diagnosis.get("status") == "success" and steps:
+        if not any(s.get("required_part") or s.get("text_en") for s in steps):
+            issues.append("WARNING: steps present but missing required_part/text_en fields.")
     if not sol.get("safety_warnings_en"):   # covers None and []
         sol["safety_warnings_en"] = ["Follow all standard safety precautions."]
     if issues:
@@ -904,6 +1248,7 @@ async def generate_diagnosis_with_gemini(
     router_confidence: float = 1.0,
     clarification_round: int = 0,
     vector_db=None,
+    top_score: float = 0.0,
 ) -> dict:
     logger.info(
         f"🧠 Diagnosis v11.0: machine={machine_type}, "
@@ -916,14 +1261,45 @@ async def generate_diagnosis_with_gemini(
     if visual_frames:
         mid_frame = visual_frames[len(visual_frames) // 2]
         visual_hash = hashlib.md5(mid_frame).hexdigest()[:8]
-
-    cache_key = generate_cache_key("diag_v110", machine_type, f"{problem_text}|vhash:{visual_hash}", language)
-    cached = get_cached_response(cache_key)
-    if cached:
-        return cached
-
     profile       = get_profile_or_default(machine_type)
     machine_label = profile.label_en
+
+    if top_score <= 0.0 and (rag_context or knowledge_base):
+        score_match = re.search(r'Relevance:\s*([\d.]+)', rag_context or knowledge_base)
+        if score_match:
+            top_score = float(score_match.group(1))
+        else:
+            top_score = 0.60
+    context_quality = "strong" if top_score >= _RAG_STRICT_THRESHOLD else "weak"
+
+    cache_key = generate_cache_key("diag_v302", machine_type, f"{problem_text}|vhash:{visual_hash}", language)
+    cached = get_cached_response(cache_key)
+    if cached:
+        try:
+            processed = await _post_process_diagnosis(
+                cached, machine_type, machine_label, problem_text,
+                rag_context or knowledge_base, visual_frames,
+                context_quality=context_quality,
+            )
+            processed["cache_hit"] = True
+            return processed
+        except InvalidRepairPlan as exc:
+            # The cached plan re-validated as broken (e.g. cached before
+            # this validation existed). This is a backend defect, not a
+            # mechanical fault — do NOT wrap it in an escalation card.
+            # The raw cached entry was itself never re-validated on write,
+            # so it's not necessarily safe either; surface this loudly and
+            # let it propagate so the API layer can return a service error
+            # instead of silently serving a plan we know is broken.
+            logger.error(
+                "❌ Cached repair plan failed validation for machine=%s: %s",
+                machine_type, exc,
+            )
+            raise
+        except Exception as exc:
+            logger.warning("Cache post-processing failed, returning raw cached plan: %s", exc)
+            cached["cache_hit"] = True
+            return cached
     allowed_areas = " | ".join(get_allowed_area_ids(machine_type))
     parts_list    = get_compact_parts_list(machine_type)
     safety_kw     = get_compact_safety_keywords(machine_type)
@@ -932,7 +1308,16 @@ async def generate_diagnosis_with_gemini(
 
     trigger = _should_hard_escalate(problem_text, effective_rag)
     if trigger:
-        result = _build_escalation_dict(machine_type, machine_label, problem_text, trigger)
+        result = _build_escalation_response(
+            machine_type=machine_type,
+            machine_label=machine_label,
+            problem_text=problem_text,
+            technical_analysis=f"Pre-call guard triggered: '{trigger}'. No input to process.",
+            safety_warnings_en=["Automatic diagnosis unavailable: no input received."],
+            safety_warnings_hi=["स्वचालित निदान उपलब्ध नहीं है: कोई इनपुट प्राप्त नहीं हुआ।"],
+            rag_source=RagSource.PRE_CALL,
+            problem_identified="Empty or invalid input.",
+        )
         cache_response(cache_key, result)
         return result
 
@@ -946,26 +1331,58 @@ async def generate_diagnosis_with_gemini(
         cache_response(cache_key, g_unknown)
         return g_unknown
 
-    g_pre_electric = _guard_electric_hazard({}, problem_text, machine_type, machine_label)
+    g_pre_electric = _guard_electric_hazard(problem_text, machine_type)
     if g_pre_electric is not None:
-        cache_response(cache_key, g_pre_electric)
-        return g_pre_electric
+        result = _build_escalation_response(
+            machine_type=machine_type,
+            machine_label=machine_label,
+            problem_text=problem_text,
+            technical_analysis=g_pre_electric["technical_analysis"],
+            safety_warnings_en=g_pre_electric["safety_warnings_en"],
+            safety_warnings_hi=g_pre_electric["safety_warnings_hi"],
+            rag_source=RagSource.ELECTRIC_HAZARD,
+            problem_identified=g_pre_electric["technical_analysis"],
+            metadata={
+                "unsafe_scene_suspected": True,
+                "unsafe_scene_message": "Electric hazard detected. Ensure power is cut before contact.",
+            },
+        )
+        cache_response(cache_key, result)
+        return result
 
-    g_pre_workaround = _guard2_dangerous_workaround({}, problem_text, machine_type, machine_label)
+    g_pre_workaround = _guard_dangerous_workaround(problem_text)
     if g_pre_workaround is not None:
-        cache_response(cache_key, g_pre_workaround)
-        return g_pre_workaround
-
-    top_score       = 0.0
-    context_quality = "strong"
-
-    if effective_rag:
-        score_match = re.search(r'Relevance:\s*([\d.]+)', effective_rag)
-        if score_match:
-            top_score = float(score_match.group(1))
-        else:
-            top_score = 0.60
-        context_quality = "strong" if top_score >= _RAG_STRICT_THRESHOLD else "weak"
+        result = _build_escalation_response(
+            machine_type=machine_type,
+            machine_label=machine_label,
+            problem_text=problem_text,
+            technical_analysis=g_pre_workaround["technical_analysis"],
+            safety_warnings_en=g_pre_workaround["safety_warnings_en"],
+            safety_warnings_hi=g_pre_workaround["safety_warnings_hi"],
+            rag_source=RagSource.WORKAROUND,
+            problem_identified=g_pre_workaround["technical_analysis"],
+            metadata={
+                "unsafe_scene_suspected": True,
+                "unsafe_scene_message": "Dangerous mechanical workaround detected. Do not operate machine.",
+            },
+        )
+        cache_response(cache_key, result)
+        return result
+        
+    g_emergency = _guard_emergency_hazard(problem_text)
+    if g_emergency is not None:
+        result = _build_escalation_response(
+            machine_type=machine_type,
+            machine_label=machine_label,
+            problem_text=problem_text,
+            technical_analysis=g_emergency["technical_analysis"],
+            safety_warnings_en=g_emergency["safety_warnings_en"],
+            safety_warnings_hi=g_emergency["safety_warnings_hi"],
+            rag_source=RagSource.EMERGENCY_HAZARD,
+            problem_identified=g_emergency["technical_analysis"],
+        )
+        cache_response(cache_key, result)
+        return result
 
     # FIX 4: Config-driven threshold — skip multihop when primary retrieval is strong.
     # Saves 2 Gemini calls per request for high-confidence queries.
@@ -1006,21 +1423,16 @@ async def generate_diagnosis_with_gemini(
 
     if not effective_rag:
         logger.warning(f"⚠️ No RAG context for [{machine_type}] — returning safe no-context escalation")
-        result = {
-            "status": "escalate",
-            "problem_description": problem_text,
-            "technical_analysis": "No relevant manual excerpts found for this query.",
-            "solution": {
-                "machine_type": machine_type,
-                "problem_identified": problem_text,
-                "steps": [],
-                "safety_warnings_en": [_NO_CONTEXT_ESCALATION_EN],
-                "safety_warnings_hi": [_NO_CONTEXT_ESCALATION_HI],
-                "tools_needed": [],
-            },
-            "rag_source": "no_context",
-            "machine_label": machine_label,
-        }
+        result = _build_escalation_response(
+            machine_type=machine_type,
+            machine_label=machine_label,
+            problem_text=problem_text,
+            technical_analysis="No relevant manual excerpts found for this query.",
+            safety_warnings_en=[_NO_CONTEXT_ESCALATION_EN],
+            safety_warnings_hi=[_NO_CONTEXT_ESCALATION_HI],
+            rag_source=RagSource.NO_CONTEXT,
+            problem_identified=problem_text,
+        )
         cache_response(cache_key, result)
         return result
 
@@ -1056,43 +1468,38 @@ async def generate_diagnosis_with_gemini(
         top_score         = top_score,
         router_symptoms   = symptoms,
     )
-    _MAX_RETRIES  = 3  # MIGRATED: Gemini → Groq
-    _RETRY_DELAYS = [2, 5, 10]   # MIGRATED: Gemini → Groq — Groq recovers faster than Gemini
-
-    last_exc: Exception = RuntimeError("Diagnosis: no attempts made")
-    for attempt in range(_MAX_RETRIES):
-        try:
-            response = await asyncio.to_thread(  # FAILOVER: primary → fallback
-                lambda: groq_chat_completion(  # FAILOVER: primary → fallback
-                    messages=[{"role": "user", "content": prompt}],
-                    **JSON_CONFIG,
-                )
+    try:
+        response = await asyncio.to_thread(
+            lambda: groq_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                **JSON_CONFIG,
             )
-            diagnosis = repair_json(response.choices[0].message.content)  # FAILOVER: primary → fallback
-
-            diagnosis = await _post_process_diagnosis(
-                diagnosis, machine_type, machine_label, problem_text, effective_rag, visual_frames
+        )
+        raw_text = response.choices[0].message.content
+        diagnosis = repair_json(raw_text)
+        if not isinstance(diagnosis, dict):
+            raise ValueError(
+                f"LLM returned non-dict JSON ({type(diagnosis).__name__}): "
+                f"{str(diagnosis)[:80]}"
             )
-            cache_response(cache_key, diagnosis)
-            return diagnosis
 
-        except Exception as e:
-            last_exc = e
-            err_str = str(e).lower()
-            is_retryable = any(kw in err_str for kw in (  # MIGRATED: Gemini → Groq
-                "429", "rate limit", "too many requests",
-                "503", "service unavailable", "connection",
-            ))
-            if is_retryable and attempt < _MAX_RETRIES - 1:
-                wait = _RETRY_DELAYS[attempt]
-                logger.warning(
-                    "⏳ Groq rate-limited (attempt %d/%d) — retrying in %ds: %s",  # MIGRATED: Gemini → Groq
-                    attempt + 1, _MAX_RETRIES, wait, e,
-                )
-                await asyncio.sleep(wait)
-            else:
-                logger.error("❌ Diagnosis generation failed (attempt %d/%d): %s",
-                             attempt + 1, _MAX_RETRIES, e)
-                break
+        diagnosis = await _post_process_diagnosis(
+            diagnosis, machine_type, machine_label, problem_text, effective_rag, visual_frames,
+            context_quality=context_quality,
+        )
+        cache_response(cache_key, diagnosis)
+        return diagnosis
 
-    return _fallback_escalation_response(machine_type, machine_label, problem_text, str(last_exc))
+    except InvalidRepairPlan as exc:
+        # A structurally broken repair plan is a backend defect, not a
+        # mechanical fault with the farmer's machine. Do NOT catch this
+        # below and wrap it in _fallback_escalation_response() — that
+        # would tell the farmer to "consult a certified mechanic" when
+        # the actual problem is in this service. Let it propagate; the
+        # API layer (main.py) must catch InvalidRepairPlan separately
+        # and return a generic service-error response (e.g. HTTP 500).
+        logger.error("❌ Invalid repair plan for machine=%s: %s", machine_type, exc)
+        raise
+    except Exception as exc:
+        logger.error("❌ Diagnosis generation failed: %s", exc)
+        return _fallback_escalation_response(machine_type, machine_label, problem_text, str(exc))

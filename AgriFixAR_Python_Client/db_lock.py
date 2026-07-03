@@ -15,8 +15,7 @@ from typing import Any, Dict, Optional, Callable
 
 logger = logging.getLogger(__name__)
 
-LOCK_SCORE_THRESHOLD: float = float(os.environ.get("AGRIFIX_LOCK_THRESHOLD", "0.30"))
-WEAK_SCORE_THRESHOLD: float = float(os.environ.get("AGRIFIX_WEAK_THRESHOLD", "0.55"))
+LOCK_SCORE_THRESHOLD: float = float(os.environ.get("AGRIFIX_LOCK_THRESHOLD", "0.35"))
 MIN_CHUNKS_REQUIRED: int = int(os.environ.get("AGRIFIX_MIN_CHUNKS", "1"))
 
 # ── Safe Windows SQLite execution ──────────────────────────────────────────────

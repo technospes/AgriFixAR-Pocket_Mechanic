@@ -14,6 +14,8 @@ from langchain_core.documents import Document
 from crossencoder_reranker import _RERANKER
 from mmr_dedup import mmr_deduplicate_from_query
 from database_creation.metadata_schema import extract_escalate_if_from_content
+from db_lock import LOCK_SCORE_THRESHOLD
+from utils.text_utils import tokenize as _tokenize
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +35,11 @@ _TAXONOMY_BOOST     = 0.30
 _MAX_PER_PARENT     = 3
 
 # ── Confidence thresholds — SINGLE SOURCE OF TRUTH ───────────────────────────
-RETRIEVAL_LOCK   = 0.38
 RAG_WEAK_THRESHOLD = 0.30
 
-CONFIDENCE_HIGH   = 0.75
-CONFIDENCE_MEDIUM = 0.55
-CONFIDENCE_LOW    = 0.35
+CONFIDENCE_HIGH   = float(os.environ.get("AGRIFIX_CONFIDENCE_HIGH",   "0.65"))
+CONFIDENCE_MEDIUM = float(os.environ.get("AGRIFIX_CONFIDENCE_MEDIUM", "0.45"))
+CONFIDENCE_LOW    = float(os.environ.get("AGRIFIX_CONFIDENCE_LOW",    "0.30"))
 
 # ── BM25 index cache ──────────────────────────────────────────────────────────
 _bm25_cache: Dict[str, "_BM25Index"] = {}
@@ -179,10 +180,6 @@ def normalize_query(query: str) -> str:
     normalized = re.sub(r'[^\w\s]', ' ', normalized)
     normalized = re.sub(r'\s+', ' ', normalized)
     return normalized
-
-def _tokenize(text: str) -> List[str]:
-    raw = re.findall(r'\b\w+\b', text.lower())
-    return [t for t in raw if len(t) > 1 and t not in _STOP_WORDS]
 
 def _safe_meta_str(metadata: dict, key: str) -> str:
     val = metadata.get(key, "")
@@ -517,7 +514,7 @@ def _format_rag_context(
     confidence_label: str = "MEDIUM",
 ) -> str:
     parts = []
-    for doc, score in chunks:
+    for i, (doc, score) in enumerate(chunks, 1):
         source   = _safe_meta_str(doc.metadata, "source_file") or "manual"
         chunk_id = _safe_meta_str(doc.metadata, "chunk_id")    or "unknown"
         text     = doc.page_content.strip()
@@ -528,24 +525,38 @@ def _format_rag_context(
         electric = doc.metadata.get("electrical_hazard", False)
         shutdown = doc.metadata.get("shutdown_required", False)
 
-        lines = [
-            f"[Source: {source} | Chunk: {chunk_id} | Relevance: {score:.2f}"
-            f" | Risk: {risk} | Taxonomy: {taxonomy}]"
-        ]
-        if electric:
-            lines.append("⚡ ELECTRICAL HAZARD — power OFF before any step.")
-        if shutdown:
-            lines.append("🔴 SHUTDOWN REQUIRED before proceeding.")
-        if escalate:
-            lines.append(f"⚠️ ESCALATE_IF:\n{escalate}")
+        # Build structured evidence block
+        block = [f"━━━ Evidence {i} ━━━"]
+        block.append(f"Source: {source} | Chunk: {chunk_id} | Relevance: {score:.2f}")
+        
         if problem:
-            lines.append(f"PROBLEM:\n{problem}")
-        lines.append(f"DIAGNOSTIC CONTENT:\n{text}")
-        parts.append("\n".join(lines))
+            block.append(f"Problem: {problem}")
+        if taxonomy:
+            block.append(f"Category: {taxonomy}")
+        if risk:
+            block.append(f"Risk Level: {risk}")
+        if electric:
+            block.append("⚡ ELECTRICAL HAZARD — power OFF before any step.")
+        if shutdown:
+            block.append("🔴 SHUTDOWN REQUIRED before proceeding.")
+        if escalate:
+            block.append(f"⚠️ Escalate If: {escalate}")
+        
+        # Extract structured fields from the chunk text
+        # Look for CAUSE/FIX/STEPS patterns in the content
+        cause_match = re.search(r'(?:CAUSE|Cause|Root Cause)[:\s]+(.+?)(?:\n\n|\n[A-Z]|$)', text, re.IGNORECASE)
+        fix_match = re.search(r'(?:FIX|Repair|Solution|STEPS)[:\s]+(.+?)(?:\n\n|\n[A-Z]|$)', text, re.IGNORECASE)
+        
+        if cause_match:
+            block.append(f"Cause: {cause_match.group(1).strip()}")
+        if fix_match:
+            block.append(f"Repair: {fix_match.group(1).strip()}")
+        
+        block.append(f"Full Content:\n{text}")
+        parts.append("\n".join(block))
 
-    header = f"[Retrieval Confidence: {confidence_label}]\n\n"
-    return header + "\n\n" + "=" * 70 + "\n\n".join(parts)
-
+    header = f"[Retrieval Confidence: {confidence_label}]\n"
+    return header + "\n\n" + "\n\n".join(parts)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FIX F: Dynamic compatible machine types
@@ -713,11 +724,13 @@ def _stitch_adjacent_chunks(
             continue
         seen_parents.add(parent_id)
 
+        metadata_machine_type = _safe_meta_str(anchor_doc.metadata, "machine_type")
+
         try:
             results = vector_db._collection.get(
-                where={"chunk_id": {"": f"^{parent_id}_"}},
+                where={"machine_type": {"$eq": metadata_machine_type}},
                 include=["documents", "metadatas"],
-                limit=20,
+                limit=200,
             )
         except Exception:
             logger.debug("Sibling stitch: filter failed for parent=%s — skipping", parent_id)
@@ -771,7 +784,7 @@ def _is_out_of_domain(
     all_candidates: List[Tuple[Document, float]],
     top_score: float,
 ) -> bool:
-    if top_score >= RETRIEVAL_LOCK:
+    if top_score >= LOCK_SCORE_THRESHOLD:
         return False
     if not all_candidates:
         return False
@@ -790,7 +803,8 @@ def retrieve_with_confidence(
     k: int = RAG_TOP_K,
     min_score: float = RAG_MIN_SCORE,
     query_variants: Optional[List[str]] = None,
-    language: str = "en",           # FIX 2: NEW parameter for adaptive weights
+    language: str = "en",
+    components: Optional[List[str]] = None,
 ) -> Tuple[str, float, int]:
     if vector_db is None:
         logger.warning("Vector DB not available")
@@ -808,13 +822,41 @@ def retrieve_with_confidence(
             if v and v.strip() and v.strip() != query.strip():
                 all_variants.append(v.strip())
 
-    # Phase 1 — multi-query semantic retrieval + merge
+    # Phase 1 — component-aware candidate generation
+    all_candidate_lists = []
+    
+    # 1a. Machine-filtered retrieval
     if len(all_variants) > 1:
-        candidates = _retrieve_multi_query(vector_db, all_variants, machine_type,
+        machine_candidates = _retrieve_multi_query(vector_db, all_variants, machine_type,
             k_per_variant=15, min_score=min_score)
     else:
-        candidates = _semantic_retrieve(vector_db, query, machine_type,
+        machine_candidates = _semantic_retrieve(vector_db, query, machine_type,
             k=_CANDIDATE_K, min_score=min_score)
+    if machine_candidates:
+        all_candidate_lists.append(machine_candidates)
+    
+    # 1b. Component-based retrieval (no machine filter)
+    if components:
+        for comp in components[:3]:  # max 3 components
+            comp_query = f"{comp.replace('_', ' ')} {query}"
+            comp_candidates = _semantic_retrieve(vector_db, comp_query, machine_type,
+                k=10, min_score=min_score)
+            if comp_candidates:
+                all_candidate_lists.append(comp_candidates)
+    
+    # 1c. Universal retrieval (unfiltered)
+    universal_candidates = _semantic_retrieve(vector_db, query, machine_type="unknown",
+        k=10, min_score=min_score)
+    if universal_candidates:
+        all_candidate_lists.append(universal_candidates)
+    
+    # Merge all candidate sources
+    if len(all_candidate_lists) > 1:
+        candidates = _merge_candidates(all_candidate_lists)[:_CANDIDATE_K]
+    elif all_candidate_lists:
+        candidates = all_candidate_lists[0][:_CANDIDATE_K]
+    else:
+        candidates = []
 
     if not candidates:
         logger.warning("No candidates above %.2f for machine=%s", min_score, machine_type)
@@ -830,6 +872,19 @@ def retrieve_with_confidence(
 
     if not reranked:
         return "", 0.0, 0
+
+    # Phase 4 — Dynamic K: fewer chunks when confidence is high
+    # Reduces context noise and hallucination risk for strong retrieval
+    _DYNAMIC_K_MAP = {
+        "HIGH":   4,
+        "MEDIUM": 6,
+        "LOW":    8,
+    }
+    dynamic_k = _DYNAMIC_K_MAP.get(confidence_label, k)
+    reranked = reranked[:dynamic_k]
+    
+    logger.debug("Dynamic K: %d chunks (conf=%s, score=%.3f)",
+                 dynamic_k, confidence_label, top_score)
 
     # Post-rerank quality gate
     reranked = [(doc, s) for doc, s in reranked if s >= _POST_RERANK_MIN_SCORE]
@@ -860,6 +915,7 @@ def retrieve_with_confidence(
         len(reranked), top_score, confidence_label,
         "WEAK" if top_score < RAG_WEAK_THRESHOLD else "STRONG", language,
     )
+    
 
     context_str = _format_rag_context(reranked, confidence_label)
     return context_str, top_score, len(reranked)

@@ -569,6 +569,61 @@ def check_prompt_injection(text: str, ip: str = "", field: str = "input") -> str
                                 detail="Input rejected: contains disallowed phrases.")
     return clean
 
+def _check_prompt_injection_safe(text: str, ip: str = "", field: str = "input") -> str:
+    """
+    Non-raising variant of check_prompt_injection for recursive sanitization.
+
+    Returns the sanitized text. If an injection pattern is detected, logs the
+    attempt and replaces the malicious content with a safe placeholder instead
+    of raising HTTPException. This allows sanitize_prompt_object() to clean an
+    entire JSON object without aborting on the first malicious string.
+    """
+    clean = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    clean = re.sub(r" {3,}", "  ", clean).strip()
+
+    for pattern in _INJECTION_PATTERNS:
+        if pattern.search(clean):
+            log_security_event(
+                "prompt_injection_sanitized",
+                ip=ip, field=field,
+                snippet=clean[:80],
+            )
+            return "[CONTENT REMOVED — injection detected]"
+
+    return clean
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 7b. RECURSIVE PROMPT OBJECT SANITIZER
+# ═════════════════════════════════════════════════════════════════════════════
+
+def sanitize_prompt_object(obj, ip: str = "", field: str = "input"):
+    """
+    Recursively sanitize every string in an arbitrary JSON object.
+
+    Why recursive: attackers can hide injection payloads in any field,
+    not just the ones we know about today. This protects against future
+    schema changes automatically — no field-name allowlist to maintain.
+
+    Returns a new object with all strings passed through check_prompt_injection.
+    Non-string scalars (int, float, bool, None) pass through unchanged.
+    """
+    if isinstance(obj, str):
+        return _check_prompt_injection_safe(obj, ip=ip, field=field)
+
+    if isinstance(obj, list):
+        return [
+            sanitize_prompt_object(v, ip, f"{field}[{i}]")
+            for i, v in enumerate(obj)
+        ]
+
+    if isinstance(obj, dict):
+        return {
+            k: sanitize_prompt_object(v, ip, f"{field}.{k}")
+            for k, v in obj.items()
+        }
+
+    # int, float, bool, None — pass through
+    return obj
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 8.  SECURITY EVENT LOGGING

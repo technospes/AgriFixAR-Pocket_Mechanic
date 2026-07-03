@@ -6,34 +6,62 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
-# MIGRATED: Gemini → Groq — google.generativeai removed
-from utils.groq_client import groq_client, TEXT_MODEL  # MIGRATED: Gemini → Groq
+from utils.groq_client import groq_client, TEXT_MODEL, groq_chat_completion
 
 logger = logging.getLogger(__name__)
 
-# ── Model config ───────────────────────────────────────────────────────────────
-# _ROUTER_MODEL removed — TEXT_MODEL from groq_client used instead  # MIGRATED: Gemini → Groq
-
-# ── Dynamic machine registry ───────────────────────────────────────────────────
-# KNOWN_MACHINE_IDS is no longer a hardcoded literal.
-# It is populated at startup by load_machine_registry() which reads whatever
-# machines + their aliases exist in the ChromaDB metadata.
-#
-# Structure loaded from registry:
-#   {
-#     "water_pump":       {"aliases": ["pump", "paani machine", "water pump"], "symptoms": ["not starting", ...]},
-#     "tractor":          {"aliases": ["tractor", "kisan machine"],             "symptoms": ["smoke", ...]},
-#     ...
-#   }
-#
-# Both KNOWN_MACHINE_IDS (for validation) and _MACHINE_ALIAS_MAP (for keyword
-# fallback matching) are derived from this single source of truth.
-
-_MACHINE_REGISTRY: Dict[str, Dict] = {}   # machine_id → {aliases, symptoms}
-KNOWN_MACHINE_IDS: Set[str] = set()       # flat set of valid machine IDs
-_MACHINE_ALIAS_MAP: Dict[str, str] = {}   # alias_token → machine_id  (for fallback)
+_MACHINE_REGISTRY: Dict[str, Dict] = {}
+KNOWN_MACHINE_IDS: Set[str] = set()
+_MACHINE_ALIAS_MAP: Dict[str, str] = {}
 _EXPANSION_BANK: Dict[str, List[str]] = {}  # machine|symptom → [variants]  (populated dynamically)
 
+def _extract_components_from_query(query: str, machine_type: str) -> List[str]:
+    """
+    Extract component/part names from the user's query by matching against
+    the machine registry's part names using overlap scoring.
+    
+    A part matches if >= 50% of its tokens appear in the query.
+    Results are ranked by overlap score, capped at 3.
+    Avoids false positives from single-token matches to generic words.
+    """
+    q = query.lower()
+    q_words = set(w for w in q.split() if len(w) > 2)
+    
+    from utils.machine_registry import get_profile, get_all_part_ids
+    
+    scored: List[tuple] = []  # (part_id, overlap_score)
+    
+    # Try machine-specific parts first
+    profile = get_profile(machine_type)
+    part_ids_to_check = []
+    if profile:
+        part_ids_to_check = [p.id for p in profile.parts]
+    else:
+        part_ids_to_check = get_all_part_ids(None)
+    
+    for part_id in part_ids_to_check:
+        part_tokens = [t for t in part_id.replace("_", " ").split() if len(t) > 2]
+        if not part_tokens:
+            continue
+        
+        overlap = sum(1 for t in part_tokens if re.search(rf'\b{re.escape(t)}\b', q))
+        score = overlap / len(part_tokens)
+        
+        if score >= 0.5:  # At least half the tokens match
+            scored.append((part_id, score))
+    
+    # Sort by score descending, then by part_id for stability
+    scored.sort(key=lambda x: (-x[1], x[0]))
+    
+    # Take top 3, dedup
+    result = list(dict.fromkeys(p[0] for p in scored))[:3]
+    
+    if result:
+        logger.debug("Component extraction: query='%s' machine=%s → %s (scores: %s)",
+                     query[:60], machine_type, result,
+                     [(p[0], f"{p[1]:.2f}") for p in scored[:3]])
+    
+    return result
 
 def load_machine_registry(vector_db=None) -> None:
     global _MACHINE_REGISTRY, KNOWN_MACHINE_IDS, _MACHINE_ALIAS_MAP, _EXPANSION_BANK
@@ -261,7 +289,7 @@ class RouterOutput:
     symptoms: List[str]                  # English symptom phrases
     confidence: float                    # 0.0–1.0 for machine_type
     language: str                        # "hi" | "en" | "mixed"
-    raw_query: str                       # original farmer input, unmodified
+    raw_query: str = ""                       # original farmer input, unmodified
     query_variants: List[str] = field(default_factory=list)
     router_ok: bool = True               # False if router call failed
     error: Optional[str] = None         # populated on failure
@@ -269,22 +297,11 @@ class RouterOutput:
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
-def _clean_json(raw: str) -> str:
-    """Strip markdown fences and trailing commas before JSON parse."""
-    text = raw.strip()
-    text = re.sub(r"^```json\s*", "", text)
-    text = re.sub(r"^```\s*",     "", text)
-    text = re.sub(r"\s*```$",     "", text)
-    text = re.sub(r",\s*}",       "}", text)
-    text = re.sub(r",\s*]",       "]", text)
-    return text.strip()
-
-
 def _parse_router_json(raw: str, query: str) -> RouterOutput:
     """Parse LLM response into RouterOutput; degrade gracefully on error."""
     try:
-        data = json.loads(_clean_json(raw))
-
+        from utils.json_repair import repair_json
+        data = repair_json(raw)
         machine = str(data.get("machine_type", "unknown")).lower().strip()
 
         # Validate against dynamic registry; accept if registry is empty (cold start)
@@ -414,6 +431,12 @@ def _keyword_fallback(query: str) -> RouterOutput:
             "not start", "does not start", "start nahi", "no start",
             "band", "dead", "chalu nahi", "shuru nahi",
         ],
+        "jammed": [
+            "stuck", "jam", "jammed", "phas gaya", "phasa hua", "phas",
+            "jaam", "locked up", "frozen", "seized", "atak", "atka",
+            "not moving", "won't move", "wont move", "stuck in place",
+            "hil nahi raha", "ruk gaya", "atak gaya",
+        ],
         "humming": [
             "hum", "humming", "buzz", "buzzing", "gunguna",
             "awaz", "awaaz", "gharrr", "ghurr",
@@ -476,10 +499,18 @@ def _keyword_fallback(query: str) -> RouterOutput:
 
     symptoms = list(dict.fromkeys(symptoms))
 
+    # ── Extract component names from query using machine registry ───────────
+    components = _extract_components_from_query(query, machine_type)
+    if components:
+        logger.debug("Keyword fallback components: %s", components)
+
     # ── Build enriched variant ────────────────────────────────────────────────
     variants = [query]
     if machine_type != "unknown":
-        enriched = (machine_type.replace("_", " ") + " " + " ".join(symptoms)).strip()
+        enriched_parts = [machine_type.replace("_", " ")]
+        enriched_parts.extend(symptoms)
+        enriched_parts.extend(components)
+        enriched = " ".join(enriched_parts).strip()
         if enriched != query:
             variants.append(enriched)
 
@@ -492,8 +523,8 @@ def _keyword_fallback(query: str) -> RouterOutput:
     is_hinglish = any(w in q for w in _HINDI_MARKERS)
 
     logger.info(
-        "Keyword fallback: machine=%s symptoms=%s variants=%d",
-        machine_type, symptoms, len(all_variants),
+        "Keyword fallback: machine=%s symptoms=%s components=%s variants=%d",
+        machine_type, symptoms, components, len(all_variants),
     )
 
     return RouterOutput(
@@ -537,12 +568,11 @@ async def route_query(query: str) -> RouterOutput:
     prompt = _build_router_prompt(query.strip())
 
     try:
-        raw_response = await asyncio.to_thread(  # MIGRATED: Gemini → Groq
-            lambda: groq_client.chat.completions.create(  # MIGRATED: Gemini → Groq
-                model=TEXT_MODEL,  # MIGRATED: Gemini → Groq
-                messages=[{"role": "user", "content": prompt}],  # MIGRATED: Gemini → Groq
-                temperature=0.1,  # MIGRATED: Gemini → Groq
-                max_tokens=1000,  # MIGRATED: Gemini → Groq
+        raw_response = await asyncio.to_thread(
+            lambda: groq_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=1000,
             )
         )
         return _parse_router_json(raw_response.choices[0].message.content, query)  # MIGRATED: Gemini → Groq
@@ -563,4 +593,8 @@ def build_enriched_query(router_output: RouterOutput) -> str:
         parts.append(router_output.machine_type.replace("_", " "))
     if router_output.symptoms:
         parts.extend(router_output.symptoms)
+    raw = (router_output.raw_query or "").strip()
+    if raw:
+        clean = re.sub(r"[`'']", "", raw)
+        parts.append(clean)
     return " ".join(parts)

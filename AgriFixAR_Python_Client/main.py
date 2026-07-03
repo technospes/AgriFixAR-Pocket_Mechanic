@@ -20,7 +20,9 @@ import io
 from dotenv import load_dotenv
 load_dotenv()
 import hashlib
+import tempfile
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from langchain_chroma import Chroma
@@ -32,16 +34,16 @@ from rag import (
     RAG_TOP_K,
     RAG_MIN_SCORE,
 )
+from agent.validation import InvalidRepairPlan
 from pipeline_orchestrator import run_full_pipeline, resolve_machine_from_query
 from db_lock import LOCK_SCORE_THRESHOLD
 from agent.models import CreateSessionRequest, CreateSessionResponse, AgentNextRequest
 from agent import session_manager, repair_agent
 from services.transcription_service import transcribe_audio_with_gemini, transcribe_audio_full
-from services.diagnosis_service import generate_diagnosis_with_gemini
+from services.inspect_part_service import inspect_part_service
 from services.verification_service import verify_step_with_gemini
 from services.machine_detection_service import detect_machine, detect_machine_from_frames, load_clip_model
 from utils.helpers import (
-    sanitize_json_text,
     generate_cache_key,
     get_cached_response,
     cache_response,
@@ -53,6 +55,7 @@ from utils.machine_registry import (
     get_profile,
     resolve_machine_id,
 )
+from services.diagnosis_service import generate_diagnosis_with_gemini, _normalize_status
 
 # ── Security layer ────────────────────────────────────────────────────────────
 from security import (
@@ -66,6 +69,7 @@ from security import (
     gemini_with_timeout,
     check_prompt_injection,
     log_security_event,
+    sanitize_prompt_object,
     get_gemini_usage,
     # Limit constants — used in /health and startup log so operators can
     # verify what the server is enforcing without reading source code.
@@ -95,6 +99,23 @@ def _cached_embed_query(model: str, text: str) -> tuple:
         task_type="retrieval_query",
     )
     return tuple(result["embedding"])
+
+def normalize_diagnosis_response(diagnosis: dict, machine_type: str) -> dict:
+    """
+    Ensure every diagnosis response has machine_type at the top level
+    AND inside solution. Uses setdefault() so existing values are never
+    overwritten — only fills missing fields.
+    
+    Call this from every endpoint that returns a diagnosis:
+      /diagnose, /diagnose/stream, /evaluate_text_rag
+    """
+    diagnosis.setdefault("machine_type", machine_type)
+    
+    solution = diagnosis.get("solution")
+    if isinstance(solution, dict):
+        solution.setdefault("machine_type", machine_type)
+    
+    return diagnosis
 
 
 class GoogleEmbeddingsV1(Embeddings):
@@ -143,13 +164,17 @@ PLAN_CACHE_DIR = Path("plan_cache")   # ← repair plan cache
 MAX_IMAGE_SIZE = 512
 MAX_AUDIO_SIZE = 10 * 1024 * 1024  # 10 MB
 MAX_CACHE_AGE = 86400
-PLAN_CACHE_TTL = int(os.environ.get("PLAN_CACHE_TTL_SECONDS", str(30 * 24 * 3600)))  # 30 days default
+PLAN_CACHE_TTL = int(os.environ.get("PLAN_CACHE_TTL_SECONDS", str(30 * 24 * 3600)))
+PLAN_CACHE_MAX_ENTRIES = int(os.environ.get("PLAN_CACHE_MAX_ENTRIES", "500"))
+PLAN_CACHE_EPHEMERAL = os.environ.get("PLAN_CACHE_EPHEMERAL", "auto").lower()
+THREAD_POOL_WORKERS = int(os.getenv("AGRIFIX_THREAD_POOL_WORKERS", "20"))
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 KB_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(exist_ok=True)
 PLAN_CACHE_DIR.mkdir(exist_ok=True)
-
+EFFECTIVE_PLAN_CACHE_TTL: int = PLAN_CACHE_TTL      # may be reduced for ephemeral storage
+PLAN_CACHE_IS_EPHEMERAL: bool = False               # detected at startup
 
 def _safe_filename(raw: str, fallback: str) -> str:
     """
@@ -227,7 +252,7 @@ def _plan_cache_get(key: str) -> Optional[Dict[str, Any]]:
         return None
     try:
         age = time.time() - p.stat().st_mtime
-        if age > PLAN_CACHE_TTL:
+        if age > EFFECTIVE_PLAN_CACHE_TTL:
             p.unlink(missing_ok=True)
             logger.info(f"🗑️  Plan cache expired and removed: {key}")
             return None
@@ -240,8 +265,21 @@ def _plan_cache_get(key: str) -> Optional[Dict[str, Any]]:
 
 
 def _plan_cache_set(key: str, plan: Dict[str, Any]) -> None:
-    """Write plan to disk cache. Failures are non-fatal."""
+    """Write plan to disk cache. Evicts oldest entries when over limit. Failures are non-fatal."""
     try:
+        # P2-3: Evict oldest files when cache exceeds max entries
+        _existing = sorted(
+            PLAN_CACHE_DIR.glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        while len(_existing) >= PLAN_CACHE_MAX_ENTRIES:
+            _oldest = _existing.pop(0)
+            try:
+                _oldest.unlink()
+            except FileNotFoundError:
+                pass
+            logger.debug("🗑️  Plan cache evicted (max entries %d): %s", PLAN_CACHE_MAX_ENTRIES, _oldest.name)
+
         p = PLAN_CACHE_DIR / f"{key}.json"
         p.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
         logger.info(f"💾 Plan cache WRITE: {key}")
@@ -254,25 +292,76 @@ def _plan_cache_set(key: str, plan: Dict[str, Any]) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 AgriFix v4.1 Backend starting...")
+    global EFFECTIVE_PLAN_CACHE_TTL, PLAN_CACHE_IS_EPHEMERAL
+
+    logger.info("AgriFix v4.1 Backend starting...")
     UPLOAD_DIR.mkdir(exist_ok=True)
     KB_DIR.mkdir(exist_ok=True)
 
-    # Load CLIP once at startup — shared across all requests (workers=1)
-    clip_ok = await asyncio.to_thread(load_clip_model)
-    logger.info(
-        "🔮 CLIP detector: ACTIVE" if clip_ok
-        else "⚠️  CLIP detector: DISABLED — audio keywords + Gemini fallback only"
-    )
-    from crossencoder_reranker import _RERANKER
-    await asyncio.to_thread(_RERANKER._load)
-    logger.info("✅ CrossEncoder pre-loaded")
-    
-    rag_ok = load_vector_db()
-    logger.info("🔍 RAG pipeline: ACTIVE" if rag_ok else "⚠️  RAG pipeline: DISABLED — Gemini-only mode")
-    yield
-    logger.info("👋 AgriFix Backend shutting down...")
-    cleanup_old_files(UPLOAD_DIR)
+    # P2-3: Detect ephemeral storage and compute effective cache TTL.
+    # Runtime detection using tempfile.gettempdir() — no hardcoded paths.
+    # Operators can override with PLAN_CACHE_EPHEMERAL=true|false|auto.
+    if PLAN_CACHE_EPHEMERAL == "true":
+        EFFECTIVE_PLAN_CACHE_TTL = min(PLAN_CACHE_TTL, 86400)
+        PLAN_CACHE_IS_EPHEMERAL = True
+        logger.info(
+            "💾 Plan cache: ephemeral (env override) — TTL capped at %d hours",
+            EFFECTIVE_PLAN_CACHE_TTL // 3600,
+        )
+    elif PLAN_CACHE_EPHEMERAL == "false":
+        EFFECTIVE_PLAN_CACHE_TTL = PLAN_CACHE_TTL
+        PLAN_CACHE_IS_EPHEMERAL = False
+        logger.info("💾 Plan cache: persistent (env override) — TTL %d days", PLAN_CACHE_TTL // 86400)
+    else:  # "auto"
+        _temp_root = Path(tempfile.gettempdir()).resolve()
+        _cache_path = PLAN_CACHE_DIR.resolve()
+        PLAN_CACHE_IS_EPHEMERAL = (
+            _cache_path == _temp_root
+            or _temp_root in _cache_path.parents
+        )
+        if PLAN_CACHE_IS_EPHEMERAL and PLAN_CACHE_TTL > 86400:
+            EFFECTIVE_PLAN_CACHE_TTL = 86400
+            logger.warning(
+                "⚠️  Plan cache on ephemeral storage (%s) — TTL reduced from %d days to %d hours. "
+                "Set PLAN_CACHE_EPHEMERAL=false or PLAN_CACHE_TTL_SECONDS to override.",
+                _cache_path, PLAN_CACHE_TTL // 86400, EFFECTIVE_PLAN_CACHE_TTL // 3600,
+            )
+        else:
+            EFFECTIVE_PLAN_CACHE_TTL = PLAN_CACHE_TTL
+            logger.info(
+                "💾 Plan cache: %s — TTL %d days",
+                "ephemeral" if PLAN_CACHE_IS_EPHEMERAL else "persistent",
+                EFFECTIVE_PLAN_CACHE_TTL // 86400,
+            )
+
+    default_executor = ThreadPoolExecutor(max_workers=THREAD_POOL_WORKERS)
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(default_executor)
+    logger.info("Thread pool configured with %d workers", THREAD_POOL_WORKERS)
+
+    try:
+        # Load CLIP once at startup — shared across all requests (workers=1)
+        clip_ok = await asyncio.to_thread(load_clip_model)
+        logger.info(
+            "CLIP detector: ACTIVE" if clip_ok
+            else "⚠️ CLIP detector: DISABLED — audio keywords + Gemini fallback only"
+        )
+
+        from utils.machine_registry import _init_machine_categories
+        _init_machine_categories()
+        logger.info("Machine categories initialized for shutdown instructions")
+
+        from crossencoder_reranker import _RERANKER
+        await asyncio.to_thread(_RERANKER._load)
+        logger.info("CrossEncoder pre-loaded")
+
+        rag_ok = load_vector_db()
+        logger.info("RAG pipeline: ACTIVE" if rag_ok else "⚠️  RAG pipeline: DISABLED — Gemini-only mode")
+        yield
+    finally:
+        logger.info("AgriFix Backend shutting down...")
+        default_executor.shutdown(wait=True)
+        cleanup_old_files(UPLOAD_DIR)
 
 # ============================================================================
 # FASTAPI APP
@@ -288,6 +377,36 @@ app = FastAPI(
 # ── Security: attach SlowAPI limiter state ────────────────────────────────────
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+
+from agent.validation import InvalidRepairPlan
+
+@app.exception_handler(InvalidRepairPlan)
+async def invalid_repair_plan_handler(request: Request, exc: InvalidRepairPlan):
+    """
+    A repair plan is structurally broken — this is a BACKEND DEFECT,
+    not a mechanical fault with the farmer's machine.
+    
+    Return a generic "service error" response, NEVER an escalation card
+    telling the farmer to "consult a certified mechanic." Nothing is wrong
+    with their equipment; something is wrong with this service.
+    """
+    logger.critical(
+        "❌ InvalidRepairPlan reached API boundary: %s | path=%s",
+        exc, request.url.path,
+    )
+    # TODO: send to Sentry/alerting here
+    
+    return JSONResponse(
+        status_code=503,
+        content={
+            "status": "service_error",
+            "message": "Something went wrong while preparing your repair guide. "
+                       "Please try again in a moment. If the problem continues, "
+                       "restart the app.",
+            "message_hi": "आपकी मरम्मत गाइड तैयार करते समय कुछ गलत हो गया। "
+                          "कृपया कुछ क्षण बाद पुनः प्रयास करें।",
+        },
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -416,8 +535,18 @@ Return ONLY JSON, no markdown."""
             logger.warning(f"⚠️ Safety hazard: {result.get('hazard_detected')}")
         return result
     except Exception as exc:
-        logger.error(f"❌ Safety check error: {exc}")
-        return {"safe": True, "hazard_detected": None, "severity": None, "warning_message": None}
+        logger.exception("❌ Safety check unavailable — failing closed")
+        return {
+            "safe": False,
+            "analysis_available": False,
+            "hazard_detected": "Unable to verify scene safety — analysis unavailable.",
+            "severity": "high",
+            "warning_message": (
+                "STOP. The safety camera could not analyze the scene. "
+                "Do not continue until the area has been visually checked."
+            ),
+            "error_code": "SAFETY_ANALYSIS_UNAVAILABLE",
+        }
 
 
 # ============================================================================
@@ -500,7 +629,9 @@ async def health(request: Request):
         "your_gemini_calls_this_hour": get_gemini_usage(ip),
         "plan_cache": {
             "entries": len(list(PLAN_CACHE_DIR.glob("*.json"))),
-            "ttl_days": PLAN_CACHE_TTL // 86400,
+            "ttl_days": EFFECTIVE_PLAN_CACHE_TTL // 86400,
+            "max_entries": PLAN_CACHE_MAX_ENTRIES,
+            "ephemeral": PLAN_CACHE_IS_EPHEMERAL,
         },
         # Server-enforced limits — visible to operators; attackers already know
         # the client limits, so publishing server limits does not aid attacks.
@@ -773,6 +904,32 @@ async def diagnose(
         problem_text = check_prompt_injection(
             problem_text_raw or "", ip=ip, field="transcription"
         )
+        # Strip "unknown machine" hallucination from transcription normalizer
+        problem_text = re.sub(
+            r"^The\s+unknown\s+machine'?s?\s+",
+            "The ",
+            problem_text,
+            flags=re.IGNORECASE,
+        )
+        problem_text = re.sub(
+            r"^The\s+unknown\s+machines'?\s+",
+            "The ",
+            problem_text,
+            flags=re.IGNORECASE,
+        )
+        # Also catch "on/in the unknown machine" and "unknown machine has/is"
+        problem_text = re.sub(
+            r"\s+(?:on|in)\s+the\s+unknown\s+machine",
+            "",
+            problem_text,
+            flags=re.IGNORECASE,
+        )
+        problem_text = re.sub(
+            r"^The\s+unknown\s+machine\s+(?:has|is)\s+",
+            "The ",
+            problem_text,
+            flags=re.IGNORECASE,
+        )
 
         # ── Machine-context re-validation (zero extra API calls) ──────────────
         # Now that CLIP has given us a machine_hint, validate the transcription
@@ -854,15 +1011,17 @@ async def diagnose(
 
         # ── Phase 1–3 Pipeline: router → DB lock → visual gate ────────────────
         # Phase 1 (router) is skipped here because machine type is already
-        # resolved above via CLIP + transcription. We pass machine_type_override
-        # so the pipeline goes straight to Phase 2 (DB lock) and Phase 3 (visual gate).
+        # Use machine override only when CLIP confidence is high
+        # When low, let the router determine machine type from query keywords
+        _machine_override = resolved if detection.confidence >= 0.70 else None
+            
         pipeline = await run_full_pipeline(
-            query=problem_text,
-            vector_db=vector_db,
-            frame_bytes=mid_frame,              # best mid-frame for visual gate
-            language=language,
-            machine_type_override=resolved,     # already resolved by CLIP
-        )
+                query=problem_text,
+                vector_db=vector_db,
+                frame_bytes=mid_frame,
+                language=language,
+                machine_type_override=_machine_override,
+            )
 
         if pipeline.blocked:
             # Phase 2 (no DB match) or Phase 3 (visual gate failed) — no LLM call
@@ -898,6 +1057,7 @@ async def diagnose(
                     rag_context=rag_context,
                     knowledge_base=knowledge,
                     visual_frames=clip_frames,
+                    top_score=round(pipeline.lock.score, 3) if pipeline.lock else 0.0,
                 ),
                 fallback=None,
                 context="diagnosis",
@@ -935,6 +1095,7 @@ async def diagnose(
         }
 
         logger.info(f"✅ /diagnose complete steps={len(diagnosis.get('solution', {}).get('steps', []))}")
+        diagnosis = normalize_diagnosis_response(diagnosis, resolved)
         return JSONResponse(content=diagnosis)
 
     except HTTPException:
@@ -1096,6 +1257,32 @@ async def diagnose_stream(
             problem_text = check_prompt_injection(
                 problem_text_raw or "", ip=ip, field="stream/transcription"
             )
+            # Strip "unknown machine" hallucination from transcription normalizer
+            problem_text = re.sub(
+                r"^The\s+unknown\s+machine'?s?\s+",
+                "The ",
+                problem_text,
+                flags=re.IGNORECASE,
+            )
+            problem_text = re.sub(
+                r"^The\s+unknown\s+machines'?\s+",
+                "The ",
+                problem_text,
+                flags=re.IGNORECASE,
+            )
+            # Also catch "on/in the unknown machine" and "unknown machine has/is"
+            problem_text = re.sub(
+                r"\s+(?:on|in)\s+the\s+unknown\s+machine",
+                "",
+                problem_text,
+                flags=re.IGNORECASE,
+            )
+            problem_text = re.sub(
+                r"^The\s+unknown\s+machine\s+(?:has|is)\s+",
+                "The ",
+                problem_text,
+                flags=re.IGNORECASE,
+            )
 
             # ── Machine-context re-validation (zero extra API calls normally) ──
             _clip_hint_s = detection_clip.machine_type or ""
@@ -1208,13 +1395,15 @@ async def diagnose_stream(
             yield _sse("stage_start", {"stage": 2, "label": "Searching repair manuals for your issue"})
 
             # Phase 1 router is skipped — machine already resolved via CLIP.
-            # Pipeline runs Phase 2 (DB lock) and Phase 3 (visual gate).
+            # Use machine override only when CLIP confidence is high
+            # When low, let the router determine machine type from query keywords
+            _machine_override = resolved if detection.confidence >= 0.70 else None
             pipeline = await run_full_pipeline(
                 query=problem_text,
                 vector_db=vector_db,
-                frame_bytes=mid_frame,          # mid frame for visual gate
+                frame_bytes=mid_frame,
                 language=language,
-                machine_type_override=resolved, # already resolved by CLIP
+                machine_type_override=_machine_override,
             )
 
             if pipeline.blocked:
@@ -1236,6 +1425,7 @@ async def diagnose_stream(
                     "pipeline_blocked": True,
                     "block_reason": pipeline.block_reason,
                 })
+            
                 yield _sse("stage_done", {
                     "stage": 3, "label": "Preparing your step-by-step repair guide",
                     "result": block_response,
@@ -1268,6 +1458,7 @@ async def diagnose_stream(
                 diagnosis = cached_plan
                 diagnosis["cache_hit"] = True
                 logger.info(f"🎯 stream cache HIT key={plan_cache_key}")
+                diagnosis = normalize_diagnosis_response(diagnosis, pipeline.machine_type)
             elif can_call_gemini(ip):
                 diagnosis = await gemini_with_timeout(
                     generate_diagnosis_with_gemini(
@@ -1277,6 +1468,7 @@ async def diagnose_stream(
                         rag_context=rag_context,
                         knowledge_base=knowledge,
                         visual_frames=clip_frames,
+                        top_score=round(pipeline.lock.score, 3) if pipeline.lock else 0.0,
                     ),
                     fallback=None,
                     context="stream/diagnosis",
@@ -1312,6 +1504,7 @@ async def diagnose_stream(
                 "audio_confidence": detection.audio_confidence,
                 "gemini_used":     detection.gemini_used,
             }
+            diagnosis = normalize_diagnosis_response(diagnosis, pipeline.machine_type)
             yield _sse("stage_done", {
                 "stage": 3, "label": "Preparing your step-by-step repair guide",
                 "result": diagnosis,
@@ -1360,7 +1553,7 @@ async def diagnose_stream(
 # Token cost: ~573 tokens per call (~$0.00007)
 # ─────────────────────────────────────────────────────────────────────────────
 from services.locate_part_service import locate_part_with_gemini   # noqa: E402
-
+from services.safety_guards import check_multiple_texts
 @app.post("/locate_part")
 @limiter.limit("30/minute")
 async def locate_part(
@@ -1464,7 +1657,8 @@ async def locate_part(
                 "part_description": None, "reject_flags": {},
             },
         )
-
+    
+from services.safety_guards import check_multiple_texts
 
 @app.post("/verify_step")
 @limiter.limit("20/minute")
@@ -1505,15 +1699,37 @@ async def verify_step(
     if len(previous_steps) > 8000:
         previous_steps = "[]"   # silently drop oversized history — non-critical
 
-    # ── Security: previous_steps must be a JSON array ─────────────────────────
-    # json.loads() accepts dicts, strings, ints — all would break the for-loop
-    # in verification_service.py and produce garbage context sent to Gemini.
+        # ── Security: previous_steps — parse, validate, cap, sanitize ────────────
+    # F5 fix: previous_steps is embedded directly into the Gemini prompt as a
+    # history block. We must sanitize every string recursively — attackers can
+    # hide injection payloads in any field, not just the ones we know today.
+    _ps_parsed: list = []
+    MAX_HISTORY = 20
+
     try:
         _ps_parsed = json.loads(previous_steps)
-        if not isinstance(_ps_parsed, list):
-            previous_steps = "[]"
     except (json.JSONDecodeError, ValueError):
-        previous_steps = "[]"
+        _ps_parsed = []
+
+    # Ensure it's a list of dicts only
+    if isinstance(_ps_parsed, list):
+        _ps_parsed = [x for x in _ps_parsed if isinstance(x, dict)]
+    else:
+        _ps_parsed = []
+
+    # Cap history to prevent context-window abuse
+    if len(_ps_parsed) > MAX_HISTORY:
+        _ps_parsed = _ps_parsed[-MAX_HISTORY:]
+
+    # Recursive sanitization — catches injection in ANY field, now and future
+    if _ps_parsed:
+        _ps_parsed = sanitize_prompt_object(_ps_parsed, ip=ip, field="previous_steps")
+
+    # Re-serialize with ensure_ascii=False so Hindi stays in Devanagari
+    previous_steps = json.dumps(_ps_parsed, ensure_ascii=False)
+
+    # If parsing gave us nothing, derive part/area from step_text
+    if not _ps_parsed:
         required_part, area_hint = derive_part_and_area(step_text, machine_type)
 
     # ── Security: prompt injection on step_text + problem_context ─────────────
@@ -1609,6 +1825,35 @@ Return ONLY JSON:
         logger.error(f"❌ Verification failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
+@app.post("/inspect_part")
+@limiter.limit("30/minute")
+async def inspect_part(
+    image: UploadFile = File(...),
+    machine_type: str = Form(...),
+    required_part: str = Form(...),
+    area_hint: str = Form("engine_compartment"),
+    language: str = Form("en"),
+    request: Request = None,
+):
+    """
+    INSPECTION endpoint — analyzes a frozen frame for damage AFTER verification.
+    Returns: outcome, severity, damage_region, observations, repairability.
+    Does NOT verify part identity — that's /verify_step's job.
+    """
+    # Auth + rate limit checks...
+    
+    image_bytes = await image.read()
+    
+    result = await inspect_part_service(
+        image_bytes=image_bytes,
+        machine_type=machine_type,
+        required_part=required_part,
+        area_hint=area_hint,
+        language=language,
+    )
+    
+    return result
+
 @app.post("/verify_fix")
 @limiter.limit("20/minute")
 async def verify_fix(
@@ -1696,9 +1941,18 @@ async def safety_check(image: UploadFile = File(...)):
         result = await safety_check_with_gemini(image_bytes)
         return JSONResponse(content=result)
     except Exception as exc:
-        logger.error(f"❌ Safety check failed: {exc}")
-        return JSONResponse(content={"safe": True, "hazard_detected": None})
-
+        logger.exception("❌ Safety endpoint failed — failing closed")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "safe": False,
+                "analysis_available": False,
+                "hazard_detected": "Safety analysis unavailable.",
+                "severity": "high",
+                "warning_message": "STOP. Safety verification could not be completed.",
+                "error_code": "SAFETY_SERVICE_UNAVAILABLE",
+            },
+        )
 
 @app.delete("/plan_cache")
 async def clear_plan_cache(
@@ -1803,6 +2057,7 @@ async def create_agent_session(request: CreateSessionRequest):
         machine_type=canonical_type,
         problem=request.problem_description,
         language=request.language,
+        diagnosis_steps=request.diagnosis_steps,
     )
     logger.info(f"🆕 Agent session created: {session.session_id} machine={canonical_type}")
     return CreateSessionResponse(
@@ -1832,6 +2087,14 @@ async def agent_next(request: AgentNextRequest):
             session=session,
             last_verification=request.last_verification_result,
         )
+        # Immediately after creating RepairSession
+        logger.info("===== DEBUG: Repair Session Initialized =====")
+        logger.info("Session ID: %r", session.session_id)
+        logger.info("Initial current_step_id: %r", session.current_step_id)
+        logger.info("Repair plan steps:")
+        for i, step in enumerate(session.repair_plan.steps):
+            logger.info("  %d: id=%r, action=%s", i, step.step_id, step.action)
+        logger.info("===========================================")
         # Persist updated session
         session_manager.update_session(session)
 
@@ -1841,6 +2104,8 @@ async def agent_next(request: AgentNextRequest):
 
         return JSONResponse(content=response.model_dump())
 
+    except InvalidRepairPlan:
+        raise  # let the exception handler above return 503
     except Exception as exc:
         logger.error(f"❌ Agent reasoning failed: {exc}")
         raise HTTPException(status_code=500, detail=f"Agent error: {exc}")
@@ -1986,17 +2251,16 @@ async def evaluate_text_rag(req: EvalRequest):
         language="en",
         rag_context=pipeline.rag_context,
         knowledge_base=knowledge,
-        visual_frames=[],   # text-only evaluation
+        visual_frames=[],
+        top_score=round(pipeline.lock.score, 3) if pipeline.lock else 0.0,
     )
 
     # MIGRATED: Groq format normalization — ensure top-level lowercase status
     from services.diagnosis_service import _normalize_status  # MIGRATED: Groq format normalization
     diagnosis = _normalize_status(diagnosis)  # MIGRATED: Groq format normalization
 
-    # P0 FIX: Inject pipeline scores into diagnosis response for test suite
-    diagnosis["rag_score"] = rag_score  # MIGRATED: Groq format normalization (preserved)
-    diagnosis["machine_type"] = resolved_machine  # MIGRATED: Groq format normalization (preserved)
-
+    diagnosis = normalize_diagnosis_response(diagnosis, resolved_machine)
+    diagnosis["rag_score"] = rag_score
     return JSONResponse(content=diagnosis)
 # ============================================================================
 # MAIN

@@ -3,9 +3,8 @@ import logging
 import math
 import re
 from typing import Dict, List, Set, Tuple, Optional
-
 from langchain_core.documents import Document
-
+from utils.text_utils import tokenize as _tokenize
 logger = logging.getLogger(__name__)
 
 # ── MMR hyperparameters ────────────────────────────────────────────────────────
@@ -41,11 +40,6 @@ _STOP_WORDS: Set[str] = {
 
 
 # ── Text utilities ─────────────────────────────────────────────────────────────
-
-def _tokenize(text: str) -> List[str]:
-    raw = re.findall(r'\b\w+\b', text.lower())
-    return [t for t in raw if len(t) > 1 and t not in _STOP_WORDS]
-
 
 def _tf_vector(tokens: List[str]) -> Dict[str, float]:
     """Normalised term-frequency vector."""

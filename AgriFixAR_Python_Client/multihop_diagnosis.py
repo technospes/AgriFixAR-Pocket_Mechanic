@@ -39,19 +39,12 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 # MIGRATED: Gemini → Groq — google.generativeai removed
-from utils.groq_client import groq_client, TEXT_MODEL, SHORT_CONFIG  # MIGRATED: Gemini → Groq
+from utils.groq_client import SHORT_CONFIG, groq_chat_completion
 
 # FIX 1: Import repair_json instead of using local _clean_json + json.loads
 from utils.json_repair import repair_json
 
 logger = logging.getLogger(__name__)
-# _MODEL removed — TEXT_MODEL from groq_client used instead  # MIGRATED: Gemini → Groq
-
-
-# ── FIX 4: Component relationship graph ───────────────────────────────────────
-# Adjacency map: symptom keyword / component → related components to expand into.
-# Traversed 1 hop only — keeps expansion focused.
-# Based on real-world failure propagation paths in agricultural machinery.
 
 _COMPONENT_GRAPH: Dict[str, List[str]] = {
     # Water pump / electric motor failures
@@ -96,7 +89,6 @@ _COMPONENT_GRAPH: Dict[str, List[str]] = {
 }
 
 # ── Symptom → component mapping (entry points into the graph) ─────────────────
-# Maps symptom keywords from the router to initial graph nodes.
 
 _SYMPTOM_TO_COMPONENT: Dict[str, List[str]] = {
     "not starting":          ["capacitor", "not starting", "mcb"],
@@ -286,20 +278,13 @@ class DiagnosticChain:
             "chain_ok":       self.chain_ok,
         }
 
-
-# FIX 1: _clean_json() removed entirely — replaced by repair_json() from utils.helpers.
-# repair_json() handles all cases _clean_json did (fences, trailing commas) plus
-# unterminated strings and single-quoted keys which were the source of the
-# production JSON parse failures logged in the audit.
-
-
-def _llm_call(prompt: str) -> str:  # MIGRATED: Gemini → Groq
-    resp = groq_client.chat.completions.create(  # MIGRATED: Gemini → Groq
-        model=TEXT_MODEL,  # MIGRATED: Gemini → Groq
-        messages=[{"role": "user", "content": prompt}],  # MIGRATED: Gemini → Groq
-        **SHORT_CONFIG,  # MIGRATED: Gemini → Groq
+def _llm_call(prompt: str) -> str:
+    """Call Groq LLM with automatic primary→fallback failover (P1-2 fix)."""
+    resp = groq_chat_completion(
+        messages=[{"role": "user", "content": prompt}],
+        **SHORT_CONFIG,
     )
-    return resp.choices[0].message.content  # MIGRATED: Gemini → Groq
+    return resp.choices[0].message.content
 
 
 # ── Stage 2: Subsystem classification ─────────────────────────────────────────

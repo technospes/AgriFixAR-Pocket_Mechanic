@@ -21,22 +21,6 @@ CACHE_DIR = Path("response_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 MAX_CACHE_AGE = 86400  # 24 hours in seconds
 
-
-# ─────────────────────────────────────────────
-# JSON sanitisation
-# ─────────────────────────────────────────────
-
-def sanitize_json_text(text: str) -> str:
-    """Strip markdown fences and fix common JSON errors in AI responses."""
-    text = text.strip()
-    text = re.sub(r"^```json\s*", "", text)
-    text = re.sub(r"^```\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    text = re.sub(r",\s*}", "}", text)
-    text = re.sub(r",\s*]", "]", text)
-    return text.strip()
-
-
 # ─────────────────────────────────────────────
 # Response cache
 # ─────────────────────────────────────────────

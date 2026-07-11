@@ -172,7 +172,7 @@ class ARController {
   static const _kLocateIntervalGuidedMs = 4000;
   static const _kFrameCooldownMs        = 800;
   static const _kReacquireDelayMs       = 500;
-  static const _kMaxLocateAttempts      = 8;
+  static const _kMaxLocateAttempts      = 0;
 
   // ── AR state (UI reads these via getters) ─────────────────────────────────
   ARState   arState         = ARState.scanning;
@@ -214,7 +214,9 @@ class ARController {
   static const _kMissesTolerance = 2;
   String cloudGuidanceVector = '';
   bool showOffScreenArrow = false;
-  bool _isInBlindSearch = true;      // Phase 1: haven't found part yet
+  // Superseded by the /locate_part loop kicked off in maybeStartLocateLoop().
+  // Left wired but permanently off — see note there before re-enabling.
+  bool _isInBlindSearch = false;
   Timer? _stabilityTimer;
   bool _reticleSteady = false;
   DateTime? _reticleSteadyStart;
@@ -270,6 +272,29 @@ class ARController {
     );
   }
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // DIRECTION EXTRACTION
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /// Extracts AR arrow direction from Gemini's spatial guidance text.
+  /// Handles English and Hindi directional keywords.
+  /// Returns null if no clear spatial direction is found.
+  static String? _extractDirectionFromGuidance(String guidance) {
+    final lower = guidance.toLowerCase();
+    if (lower.contains('above') || lower.contains('up') || lower.contains('ऊपर')) {
+      return 'up';
+    }
+    if (lower.contains('below') || lower.contains('down') || lower.contains('नीचे')) {
+      return 'down';
+    }
+    if (lower.contains(' left') || lower.contains('बाएं') || lower.contains('बायें') || lower.contains('बाईं')) {
+      return 'left';
+    }
+    if (lower.contains(' right') || lower.contains('दाएं') || lower.contains('दायें') || lower.contains('दाईं')) {
+      return 'right';
+    }
+    return null;
+  }
   // ══════════════════════════════════════════════════════════════════════════
   // CAMERA
   // ══════════════════════════════════════════════════════════════════════════
@@ -359,8 +384,7 @@ void maybeStartLocateLoop() {
     final agentStep = ctx.read<AgentSessionProvider>().current?.nextStep;
     if (agentStep == null) return;
     
-    // FIX: Remove the "interaction.type != camera" block. 
-    // If there is a visual cue or required part, we MUST start the camera loop!
+    // Only camera steps with a visual target enter the AR flow
     if (agentStep.requiredPart.isEmpty && agentStep.visualCue.isEmpty) return;
     if (arState == ARState.verified) return;
 
@@ -372,15 +396,8 @@ void maybeStartLocateLoop() {
     _lastCorrectionSent = null;
     guidance.resetForNewSession();
     _consecutiveMisses = 0;
-    _isInBlindSearch = true;
     cloudGuidanceVector = '';
     showOffScreenArrow = false;
-
-    _stabilityTimer?.cancel();
-    _stabilityTimer = Timer.periodic(
-      const Duration(milliseconds: 100),
-      (_) => _checkReticleSteady(),
-    );
 
     unawaited(guidance.speakPreDetectionHint(
       agentStep.requiredPart.isNotEmpty ? agentStep.requiredPart : (agentStep.visualCue),
@@ -388,7 +405,24 @@ void maybeStartLocateLoop() {
       isHindi: ctx.read<LanguageProvider>().languageCode == 'hi',
     ));
 
-    if (isMounted()) setState(() => arState = ARState.scanning);
+    // ── MANUAL-ONLY MODE ──────────────────────────────────────────────────
+    // No auto-detection loop. The farmer reads the step instruction,
+    // points the camera at the part, and taps "Analyze Part".
+    // That single tap triggers onCapture() → /verify_step → /inspect_part.
+    final partName = (agentStep.requiredPart.isNotEmpty 
+        ? agentStep.requiredPart : agentStep.visualCue)
+        .replaceAll('_', ' ');
+    final areaName = agentStep.areaHint.replaceAll('_', ' ');
+    final isHindi = ctx.read<LanguageProvider>().languageCode == 'hi';
+    if (isMounted()) setState(() {
+      arState = ARState.scanning;
+      cameraGuidance = isHindi 
+          ? '$partName पर कैमरा लगाएं और "विश्लेषण करें" दबाएं'
+          : 'Point camera at the $partName${areaName.isNotEmpty ? ' ($areaName)' : ''} and tap Analyze Part';
+    });
+
+    // If _kMaxAutoAttempts > 0, the burst-mode auto-loop would start here.
+    // Currently set to 0 (manual-only) for production quota efficiency.
   }
 
   void _stopLocateLoop() {
@@ -665,8 +699,16 @@ void maybeStartLocateLoop() {
         if (wasLocked) {
           debugPrint('ARGuide [REACQUIRE] re-acquiring…');
         }
+        // ── Extract direction for off-screen AR arrow ─────────────────
+        final direction = serverGuidance.isNotEmpty
+            ? _extractDirectionFromGuidance(serverGuidance)
+            : null;
+        final hasDirection = direction != null;
+
         setState(() {
-          cameraGuidance = serverGuidance.isNotEmpty ? serverGuidance : '';
+          cameraGuidance     = serverGuidance.isNotEmpty ? serverGuidance : '';
+          showOffScreenArrow = hasDirection;
+          cloudGuidanceVector = direction ?? '';
           if (arState == ARState.guiding) {
             arState          = ARState.locating;
             tracking.smoothBbox = null;
@@ -808,13 +850,19 @@ void maybeStartLocateLoop() {
           HapticFeedback.mediumImpact();
         }
       } else {
-        // Phase 2: Wrong part — use VLM's directional guidance
-        cloudGuidanceVector = result['guidance_vector'] as String? ?? '';
-        showOffScreenArrow = cloudGuidanceVector.isNotEmpty;
-        
+        // Phase 2: Wrong part — extract direction from Gemini's spatial guidance
         final feedback = isHindi
             ? (result['feedback_hi'] as String? ?? 'गलत भाग — पुनः प्रयास करें')
             : (result['feedback_en'] as String? ?? 'Wrong part — try again');
+
+        // Try guidance_vector first, then extract from feedback text
+        final vectorFromApi = result['guidance_vector'] as String?;
+        final extractedDir = vectorFromApi != null && vectorFromApi.isNotEmpty
+            ? vectorFromApi
+            : _extractDirectionFromGuidance(feedback);
+        
+        cloudGuidanceVector = extractedDir ?? '';
+        showOffScreenArrow = extractedDir != null && extractedDir.isNotEmpty;
             
         setState(() {
           dynamicFeedback = feedback;
@@ -1176,11 +1224,13 @@ void nextPart(List<StepData> steps) {
     handleAgentStatus(agentProv.current?.status);
 
     setState(() {
-      currentStep++; // <-- FIX: Increment step counter to fix "stuck on step 1" UI bug
+      currentStep++;
       attemptCount = 0;
       panelExpanded = false;
       dynamicFeedback = '';
       cameraGuidance = '';
+      showOffScreenArrow = false;
+      cloudGuidanceVector = '';
       partDescription = '';
       bboxLocked = false;
       _partLocked = false;

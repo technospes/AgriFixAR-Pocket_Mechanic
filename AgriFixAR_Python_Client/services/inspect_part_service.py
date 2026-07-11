@@ -5,34 +5,49 @@ from utils.vision_client import vision_call
 
 logger = logging.getLogger(__name__)
 
-INSPECT_PROMPT = """You are inspecting a SINGLE specific part on agricultural machinery.
-The part has ALREADY been verified as the correct component.
-Your ONLY job: determine if this part shows VISIBLE DAMAGE.
+INSPECT_PROMPT = """You are inspecting ONE verified part on farm machinery.
+Target: {required_part} | Area: {area_hint} | Machine: {machine_label}
 
-Target: {required_part}
-Area: {area_hint}
-Machine: {machine_label}
+OUTCOME (pick one):
+  healthy      — no damage. Normal wear is NOT damage.
+  damaged      — cracks, fraying, bulging, corrosion, burns, leaks, breaks,
+                 bends, missing pieces, loose connections, melted plastic,
+                 exposed wires, rust.
+  unclear      — hidden, dirty, dark, cannot assess.
+  wrong_target — image shows a DIFFERENT part than the target.
 
-INSPECTION RULES:
-1. Look for: cracks, fraying, bulging, corrosion, burns, leaks, breaks, bends,
-   missing pieces, loose connections, melted plastic, exposed wires, rust.
-2. If damage is visible, describe it in simple farmer-friendly terms.
-3. If you can see the part clearly but it looks normal, say "healthy".
-4. If the part is partially hidden, dirty, or in shadow, say "unclear".
-5. If the wrong thing is in frame, say "wrong_target".
-6. Do NOT confuse normal wear with damage — be conservative.
+CONFIDENCE (0.0-1.0). Calibrate honestly:
+  0.9+ = certain, well-lit, clear view.
+  0.6-0.8 = minor obstruction or odd angle.
+  0.3-0.5 = partial view or ambiguous.
+  <0.3 = mostly guessing.
 
-Return ONLY valid JSON:
+REPAIRABILITY (only if damaged):
+  field_repairable  — basic tools: tighten, clean, patch, replace consumable.
+  mechanic_required — special tools/skill: welding, rewiring, precision fit.
+  replace_only      — destroyed or unsafe to repair.
+  unknown           — path unclear from this image.
+
+Return ONLY JSON:
 {{
-  "outcome": "healthy",
-  "severity": "none",
-  "damage_description": "",
-  "damage_description_hi": "",
-  "repairability": "unknown",
-  "observations": [],
-  "safety_concern": false,
-  "safety_note": ""
+  "outcome": "healthy"|"damaged"|"unclear"|"wrong_target",
+  "confidence": 0.0-1.0,
+  "severity": "none"|"minor"|"moderate"|"severe",
+  "damage_description": "<farmer-friendly, empty if healthy>",
+  "damage_description_hi": "<same in simple Hindi, empty if healthy>",
+  "repairability": "field_repairable"|"mechanic_required"|"replace_only"|"unknown",
+  "observations": ["<short factual note>"],
+  "safety_concern": true|false,
+  "safety_note": "<only if safety_concern=true, else empty>"
 }}"""
+
+def _parse_confidence(value) -> float:
+    """Safely cast Gemini's confidence to float in [0.0, 1.0]. Falls back to 0.5."""
+    try:
+        c = float(value)
+    except (TypeError, ValueError):
+        return 0.5
+    return max(0.0, min(1.0, c))
 
 async def inspect_part_service(
     image_bytes: bytes,
@@ -71,7 +86,7 @@ async def inspect_part_service(
             "observations": data.get("observations", []),
             "safety_concern": data.get("safety_concern", False),
             "safety_note": data.get("safety_note", ""),
-            "confidence": data.get("confidence", 0.5),
+            "confidence": _parse_confidence(data.get("confidence", 0.5)),
         }
         
     except Exception as exc:

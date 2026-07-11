@@ -6,11 +6,68 @@ Pydantic data structures for the AgriFix repair agent system.
 from __future__ import annotations
 from typing import Optional, Dict, List, Literal
 from pydantic import BaseModel, Field
+from enum import Enum, StrEnum
 
+class VerificationMode(StrEnum):
+    CAMERA = "camera"
+    CONFIRMATION = "confirmation"
+    MEASUREMENT = "measurement"
+    AUDIO = "audio"
+
+
+class Verification(BaseModel):
+    mode: VerificationMode = VerificationMode.CONFIRMATION
+    advance: str = "automatic"  # "automatic" | "agent"
+
+class StepType(str, Enum):
+    SAFETY = "safety"
+    INSPECTION = "inspection"
+    REPAIR = "repair"
+    VERIFICATION = "verification"
 
 # ─────────────────────────────────────────────
 # Session state stored in memory
 # ─────────────────────────────────────────────
+class InteractionOption(BaseModel):
+    """One choice the farmer can select."""
+    id: str                                    # stable ID e.g. "normal", "bulging"
+    label: str                                 # display text e.g. "Everything looks normal"
+    next_state: str = ""                       # semantic signal e.g. "continue", "oil_leak_detected"
+
+
+class Interaction(BaseModel):
+    """How the farmer should respond to this step. Flutter renders this directly."""
+    type: Literal["choice", "camera", "boolean", "text", "number", "none"] = "none"
+    question: str = ""
+    options: List[InteractionOption] = Field(default_factory=list)
+    required: bool = True
+
+class RepairPlanStep(BaseModel):
+    step_id: str
+    action: str
+    description: str = ""
+    required_part: Optional[str] = None
+    area_hint: str = "engine_compartment"
+    step_type: StepType = StepType.INSPECTION
+    verification: Optional[Verification] = None
+
+
+class RepairPlan(BaseModel):
+    """Immutable diagnosis result — stored as-is in the session."""
+    machine_type: str
+    confidence: float = 0.0
+    likely_fault: str = ""
+    rag_score: float = 0.0
+    steps: List[RepairPlanStep] = Field(default_factory=list)
+
+
+class VerifiedPart(BaseModel):
+    """Rich verification record per part."""
+    status: Literal["ok", "damaged", "unclear"] = "unclear"
+    confidence: float = 0.0
+    source: Literal["vision", "user", "agent"] = "user"
+    timestamp: str = ""
+    notes: str = ""
 
 class RepairSession(BaseModel):
     session_id: str
@@ -22,7 +79,10 @@ class RepairSession(BaseModel):
     #   {"battery_terminal": "white powder visible on both clamps — corrosion confirmed"}
     diagnostic_path: List[str] = Field(default_factory=list)
     generated_steps: List[str] = Field(default_factory=list)
-    # ↑ Step IDs + part from the diagnosis plan, e.g. ["s1:battery_terminal:visual", ...]
+    # ── Immutable diagnosis plan ──────────────────────────────────────────────
+    repair_plan: Optional[RepairPlan] = None
+    current_step_id: str = ""
+    verified_parts_rich: Dict[str, VerifiedPart] = Field(default_factory=dict)
     current_stage: int = 0
     attempt_count: int = 0
     last_verification: Optional[Dict] = None
@@ -46,8 +106,9 @@ class NextStepDetail(BaseModel):
 
     # ── AR / visual anchoring ────────────────────────────────────────────────
     visual_cue: str
-    ar_model: str
-    required_part: str
+    ar_model: str = "none"
+    required_part: Optional[str] = None
+    tracking_scope: Literal["component", "assembly"] = Field(default="component")
     area_hint: str
 
     # ── Safety ──────────────────────────────────────────────────────────────
@@ -68,6 +129,10 @@ class NextStepDetail(BaseModel):
 
     # Tool from the machine-specific allowed list, or null for visual-only steps
     required_tool: Optional[str] = None
+    # ── Interactive feedback ──────────────────────────────────────────────────
+    # Backend-driven: Flutter renders buttons, camera, yes/no, text, or numeric
+    # input based on this. null means informational step with no response needed.
+    interaction: Optional[Interaction] = None
 
 
 class UpdatedMemory(BaseModel):

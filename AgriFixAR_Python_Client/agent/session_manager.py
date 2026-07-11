@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict
 
 from agent.models import RepairSession
+from agent.validation import validate_repair_plan_steps
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +31,8 @@ _last_access: Dict[str, datetime] = {}
 # Public API
 # ─────────────────────────────────────────────
 
-def create_session(machine_type: str, problem: str, language: str = "en") -> RepairSession:
-    """Create a brand-new repair session and return it."""
+def create_session(machine_type: str, problem: str, language: str = "en",
+                   diagnosis_steps: list = None) -> RepairSession:
     session_id = str(uuid.uuid4())
     session = RepairSession(
         session_id=session_id,
@@ -39,11 +40,39 @@ def create_session(machine_type: str, problem: str, language: str = "en") -> Rep
         problem=problem,
         language=language,
     )
+    if diagnosis_steps:
+        from agent.models import RepairPlan, RepairPlanStep
+
+        # step_id is owned exclusively by diagnosis_service.py (the single
+        # source of truth — see agent/validation.py). This function must only
+        # COPY ids that already arrived on diagnosis_steps, never invent one
+        # via a fallback default: a silent f"s{i+1}" here would mask a caller
+        # that skipped diagnosis_service.py (or a tampered/malformed client
+        # payload) exactly the way the original step_id bug did. Validate
+        # up front and raise InvalidRepairPlan — a backend defect, not a
+        # mechanical fault — instead of quietly patching it.
+        validate_repair_plan_steps(diagnosis_steps, context=f"machine={machine_type} (session creation)")
+
+        steps = [
+            RepairPlanStep(
+                step_id=s.get("step_id"),
+                action=s.get("action", ""),
+                description=s.get("description", ""),
+                required_part=s.get("required_part", "unknown"),
+                area_hint=s.get("area_hint", "engine_compartment"),
+                step_type=s.get("step_type", "inspection"),
+            )
+            for s in diagnosis_steps
+        ]
+        session.repair_plan = RepairPlan(
+            machine_type=machine_type,
+            steps=steps,
+        )
+        session.current_step_id = steps[0].step_id
     _sessions[session_id] = session
     _last_access[session_id] = datetime.utcnow()
-    logger.info(f"🆕 Session created: {session_id}  machine={machine_type}")
+    logger.info(f"🆕 Session created: {session_id}  machine={machine_type}  steps={len(steps) if diagnosis_steps else 0}")
     return session
-
 
 def get_session(session_id: str) -> Optional[RepairSession]:
     """Return session or None if not found / expired."""

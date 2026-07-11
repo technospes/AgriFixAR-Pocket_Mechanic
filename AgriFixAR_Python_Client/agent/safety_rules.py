@@ -17,6 +17,11 @@ from utils.machine_registry import (
     get_fuel_system_parts,
     is_electric_machine,
 )
+from services.safety_guards import (
+    _guard_emergency_hazard,
+    _guard_electric_hazard,
+    _guard_dangerous_workaround,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -165,5 +170,81 @@ def _escalate_response(reason: str, session: RepairSession) -> AgentNextResponse
         updated_memory=UpdatedMemory(
             verified_parts=dict(session.verified_parts),
             diagnostic_path=session.diagnostic_path + ["escalated"],
+        ),
+    )
+# ─────────────────────────────────────────────────────────────
+# P0-1: Text hazard check — reuses /diagnose guards in agent
+# ─────────────────────────────────────────────────────────────
+
+def text_hazard_check(session: RepairSession):
+    """
+    Run the same deterministic text-pattern hazard guards that protect
+    /diagnose against the agent session's free text. The agent normally
+    bypasses these entirely — this closes that gap without duplicating
+    any regex logic.
+
+    Checks both session.problem (original complaint) and the latest
+    ai_observation text (hazards spotted mid-repair via camera).
+
+    Returns an AgentNextResponse if a hazard blocks the step, or None.
+    """
+    machine_type = session.machine_type
+    machine_label = machine_type  # guards only use this for display text
+
+    # Gather all free text in the session
+    texts = [session.problem]
+    if hasattr(session, 'verified_observations'):
+        texts.extend(session.verified_observations.values())
+
+    for text in texts:
+        if not text or not isinstance(text, str):
+            continue
+
+        # Guard 1: Emergency hazard patterns (fire, arc, entanglement, etc.)
+        hit = _guard_emergency_hazard(text)
+        if hit is not None:
+            return _hazard_dict_to_agent_response(hit, session)
+
+        # Guard 2: Electric shock / flood patterns
+        hit = _guard_electric_hazard(text, machine_type)
+        if hit is not None:
+            return _hazard_dict_to_agent_response(hit, session)
+
+        # Guard 3: Dangerous workaround patterns
+        hit = _guard_dangerous_workaround(text)
+        if hit is not None:
+            return _hazard_dict_to_agent_response(hit, session)
+
+    return None
+
+
+def _hazard_dict_to_agent_response(hazard: dict, session: RepairSession):
+    """Convert a diagnosis-service hazard dict into an AgentNextResponse."""
+    from agent.models import NextStepDetail, UpdatedMemory
+
+    warnings_en = hazard.get("safety_warnings_en", [])
+    warnings_hi = hazard.get("safety_warnings_hi", [])
+    default_en = "Stop. Unsafe condition detected. Do not proceed."
+    default_hi = "रुकें। असुरक्षित स्थिति पाई गई। आगे न बढ़ें।"
+
+    return AgentNextResponse(
+        status="escalate",
+        reasoning_summary=hazard.get(
+            "technical_analysis",
+            "Hazard detected by safety system."
+        ),
+        next_step=NextStepDetail(
+            text=warnings_en[0] if warnings_en else default_en,
+            text_en=warnings_en[0] if warnings_en else default_en,
+            text_hi=warnings_hi[0] if warnings_hi else default_hi,
+            visual_cue="warning",
+            ar_model="none.obj",
+            required_part="none",
+            area_hint="full_machine",
+            safety_warning=warnings_en[0] if warnings_en else default_en,
+        ),
+        updated_memory=UpdatedMemory(
+            verified_parts=dict(session.verified_parts),
+            diagnostic_path=session.diagnostic_path + ["hazard_escalated"],
         ),
     )

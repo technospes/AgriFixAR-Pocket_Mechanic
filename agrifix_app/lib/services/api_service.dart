@@ -40,8 +40,8 @@ class DiagnosisResult {
 // ApiService
 // ─────────────────────────────────────────────────────────────────────────────
 class ApiService {
-  static const String _baseUrl = 'http://192.168.29.116:7860';
-      // 'https://technospes-agrifixar-backend-new.hf.space';
+  static const String _baseUrl =  'https://technospes-agrifixar-backend-new.hf.space';
+                                  //'http://192.168.29.116:7860';
   static const String _appKey = '020b082f133f403abf8694e6144df1a79396b2706dd9de108bc54a05e891fc29';
   static const Duration _uploadTimeout = Duration(seconds: 90);
   static const Duration _streamTimeout = Duration(minutes: 3);

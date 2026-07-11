@@ -3,13 +3,17 @@ import asyncio
 import json
 import logging
 import re
-
+from typing import Optional
 # MIGRATED: Gemini → Groq — google.generativeai removed
-from utils.groq_client import groq_client, TEXT_MODEL, JSON_CONFIG  # MIGRATED: Gemini → Groq
+from utils.groq_client import groq_client, TEXT_MODEL, JSON_CONFIG, groq_chat_completion
 from utils.json_repair import repair_json
-
+from prompts.renderers.repair import render_repair_prompt, REPAIR_PROMPT_VERSION
+from prompts.builder import REPAIR_SYSTEM_BLOCK
+from prompts.context import PromptContext
+from agent.models import Interaction, InteractionOption, RepairPlanStep, VerificationMode, Verification
 from agent.models import RepairSession, AgentNextResponse, NextStepDetail, UpdatedMemory
 from agent import safety_rules
+from agent.validation import InvalidRepairPlan, validate_repair_plan_steps
 from utils.machine_registry import (
     get_profile_or_default,
     get_allowed_area_ids,
@@ -64,79 +68,6 @@ def _tools_prompt_block(machine_type: str) -> str:
     tools = _allowed_tools(machine_type)
     return f"ALLOWED TOOLS (choose required_tool from this list or null): {', '.join(tools)}"
 
-
-# ── Master Agent Prompt ───────────────────────────────────────────────────────
-_MASTER_AGENT_PROMPT = """\
-You are a stateful farm machinery diagnostic agent. Decide ONE safe next step.
-Rules: never re-check verified-OK parts; unclear→retry same step; unsafe→stop immediately.
-Step text rule: text_en must be 3–4 sentences — WHERE part is (colour+shape+landmark), \
-WHAT to do with hands, WHAT to see/hear/feel when done. No jargon. Farmer has zero training.
-
-MACHINE: {machine_type} | STAGE: {current_stage} | ATTEMPTS: {attempt_count}
-TRIAGE ORDER: {triage_hint}
-SAFETY KEYWORDS: {safety_kw}
-{tools_block}
-
-PROBLEM: {problem_description}
-
-VERIFIED PARTS (pass/fail/unclear):
-{verified_parts_json}
-
-WHAT THE CAMERA ACTUALLY SAW (Gemini's visual findings per part):
-{visual_observations}
-
-DIAGNOSIS PLAN — STEPS ALREADY GENERATED (do not repeat or skip any):
-{generated_steps_hint}
-
-LAST CAMERA RESULT:
-{last_verification_json}
-
-SAFETY CONTEXT:
-{safety_context}
-
-ALLOWED area_hint: {allowed_area_hints}
-KNOWN PARTS: {known_parts}
-
-STRUCTURED STEP FORMAT — fill every field with real machine-specific content:
-  • expected_result: what the farmer SEES/HEARS/FEELS when this step goes right.
-    Be physical — "oil drips out" not "check is complete".
-  • if_failed: the SINGLE most likely cause of step failure + one corrective action.
-    Must differ from this step's instruction.
-  • escalate_if: the condition that means STOP and call a mechanic.
-    Must be a concrete observable (not "problem persists").
-  • safety_warning: ONE sentence specific to this step's hazard, or null if no hazard.
-  • required_tool: ONE tool from the ALLOWED TOOLS list that is genuinely needed,
-    or null if the step is visual/observation-only.
-    NEVER invent tools not on the allowed list.
-
-Return ONLY this JSON:
-{{
-  "status": "continue" | "resolved" | "escalate" | "unsafe",
-  "reasoning_summary": "<2-3 sentences — what was found and why this next step>",
-  "next_step": {{
-    "text": "<copy of text_en>",
-    "text_en": "<3–4 sentences: WHERE part is + colour/shape/landmark | WHAT hands do | WHAT to see/hear when correct>",
-    "text_hi": "<same 3–4 sentences in simple village Hindi — NOT formal>",
-    "visual_cue": "<snake_case_part_id>",
-    "ar_model": "<part.obj>",
-    "required_part": "<snake_case_part_id>",
-    "area_hint": "<one of allowed values above>",
-    "safety_warning": "<one plain sentence or null>",
-    "expected_result": "<what farmer sees/hears/feels when step succeeds — physical>",
-    "expected_result_hi": "<same in simple Hindi>",
-    "if_failed": "<most likely cause of failure + one corrective action>",
-    "if_failed_hi": "<same in simple Hindi>",
-    "escalate_if": "<concrete observable condition that means call a mechanic>",
-    "escalate_if_hi": "<same in simple Hindi>",
-    "required_tool": "<one tool from ALLOWED list or null>"
-  }},
-  "updated_memory": {{
-    "verified_parts": {{"<part>": "ok|damaged|unclear"}},
-    "diagnostic_path": ["<step_label>"]
-  }}
-}}"""
-
-
 def _format_observations(session: RepairSession) -> str:
     if not session.verified_observations:
         return "None yet."
@@ -165,52 +96,205 @@ def _format_generated_steps(session: RepairSession) -> str:
 # Public entry point
 # ─────────────────────────────────────────────
 
-async def decide_next_step(
-    session: RepairSession,
-    last_verification: dict,
-) -> AgentNextResponse:
-    """Core agent reasoning — machine-aware, token-optimised."""
+def _get_area_context(machine_type: str, area_hint: str, language: str) -> dict:
+    """Return structured location context from machine registry."""
+    from utils.machine_registry import get_area_farmer_description
+    
+    description = get_area_farmer_description(machine_type, area_hint, language)
+    
+    # Default landmark map per common area — registry can override later
+    _LANDMARKS: dict[str, list[str]] = {
+        "motor_housing": ["power cable entry", "cooling fan cover", "capacitor box"],
+        "control_panel": ["main switch", "MCB breaker", "terminal board cover"],
+        "pump_body": ["suction pipe", "discharge pipe", "priming plug"],
+        "engine_compartment": ["fuel filter", "air filter housing", "oil dipstick"],
+    }
+    
+    return {
+        "name": area_hint.replace("_", " "),
+        "description": description or f"The {area_hint.replace('_', ' ')} area of the machine.",
+        "landmarks": _LANDMARKS.get(area_hint, []),
+    }
 
+async def decide_next_step(session: RepairSession, last_verification: dict) -> AgentNextResponse:
     _apply_verification(session, last_verification)
+
+    # ── Fail-fast structural validation ─────────────────────────────────────
+    # step_id is owned exclusively by diagnosis_service.py, where the repair
+    # plan is first built and validated (single source of truth — see
+    # agent/validation.py). This agent must never invent or repair a broken
+    # plan itself: silently patching it here is exactly what caused the
+    # original bug (agent stuck on step 1 forever with no visible error).
+    # If an invalid plan somehow still reaches this function, that's a
+    # backend defect, not a mechanical fault with the farmer's machine —
+    # raise InvalidRepairPlan and let it propagate. The API layer
+    # (main.py's /agent/next handler) must catch this separately from
+    # normal agent responses and return a generic service-error status,
+    # never an "escalate to mechanic" response.
+    if session.repair_plan and session.repair_plan.steps:
+        try:
+            validate_repair_plan_steps(
+                session.repair_plan.steps,
+                context=f"machine={session.machine_type} session={session.session_id}",
+            )
+        except InvalidRepairPlan as exc:
+            logger.error(
+                "❌ [%s] Structurally invalid repair plan reached the agent "
+                "(session=%s): %s. Fix this in diagnosis_service.py's "
+                "validation, not here.",
+                session.machine_type, session.session_id, exc,
+            )
+            raise
+
+    # O(1) lookup — built once per turn instead of re-scanning the plan
+    # (which was O(n) on every branch below, twice, every single call).
+    step_map: dict[str, object] = (
+        {s.step_id: s for s in session.repair_plan.steps}
+        if session.repair_plan else {}
+    )
+    step_order: list[str] = (
+        [s.step_id for s in session.repair_plan.steps]
+        if session.repair_plan else []
+    )
+
+    # 1. Log BEFORE advancement check
+    logger.info("DEBUG: Current step lookup: %r", session.current_step_id)
+
+    next_state = last_verification.get("selected_next_state")
+    is_bool_done = last_verification.get("answer_bool") is True
+
+    if next_state == "continue" or is_bool_done:
+        current_idx = (
+            step_order.index(session.current_step_id)
+            if session.current_step_id in step_order else -1
+        )
+        logger.info("DEBUG: Found current_idx=%d", current_idx)
+
+        if current_idx >= 0 and current_idx + 1 < len(step_order):
+            session.current_step_id = step_order[current_idx + 1]
+            logger.info("⏩ Advanced to step ID: %r", session.current_step_id)
+        elif current_idx >= 0:
+            return AgentNextResponse(
+                status="resolved",
+                reasoning_summary="All steps completed.",
+                next_step=NextStepDetail(
+                    text="Repair complete.", text_en="All steps done.",
+                    text_hi="सभी चरण पूर्ण।", visual_cue="none",
+                    ar_model="none.obj", required_part="none",
+                    area_hint="engine_compartment",
+                ),
+                updated_memory=UpdatedMemory(
+                    verified_parts=dict(session.verified_parts),
+                    diagnostic_path=session.diagnostic_path + ["complete"],
+                ),
+            )
+
+    # P0-1: Check free text for hazard patterns before any LLM call
+    hazard = safety_rules.text_hazard_check(session)
+    if hazard is not None:
+        logger.info(
+            f"🛡️  Text hazard guard blocked agent step "
+            f"[{session.machine_type}, session={session.session_id}]"
+        )
+        return hazard
 
     forced = safety_rules.pre_check(session)
     if forced:
         logger.info(f"🛡️  Safety pre-check forced response [{session.machine_type}]")
         return forced
 
+    # ── Deterministic step selection from repair plan ──────────────────────
+    if not session.repair_plan or not session.repair_plan.steps:
+        return _fallback_response(session.machine_type, "No diagnosis plan available")
+
+    # Find current step by ID — O(1) via step_map built above.
+    current_step = step_map.get(session.current_step_id)
+
+    if current_step is None:
+        return AgentNextResponse(
+            status="resolved",
+            reasoning_summary="All diagnosis steps completed.",
+            next_step=NextStepDetail(
+                text="Repair sequence complete.",
+                text_en="All diagnosis steps completed. Consult a mechanic if the problem persists.",
+                text_hi="सभी जांच चरण पूरे हो गए। समस्या बनी रहे तो मैकेनिक से संपर्क करें।",
+                visual_cue="none", ar_model="none.obj", required_part="none",
+                area_hint="engine_compartment",
+            ),
+            updated_memory=UpdatedMemory(
+                verified_parts=dict(session.verified_parts),
+                diagnostic_path=session.diagnostic_path + ["complete"],
+            ),
+        )
+
     profile        = get_profile_or_default(session.machine_type)
     allowed_areas  = " | ".join(get_allowed_area_ids(session.machine_type))
     known_parts    = get_compact_parts_list(session.machine_type)
-    triage_hint    = get_compact_diagnostic_hint(session.machine_type)
-    safety_kw      = get_compact_safety_keywords(session.machine_type)
     safety_context = _build_safety_context(session)
     tools_block    = _tools_prompt_block(session.machine_type)
 
-    prompt = _MASTER_AGENT_PROMPT.format(
-        machine_type           = session.machine_type,
-        current_stage          = session.current_stage,
-        attempt_count          = session.attempt_count,
-        triage_hint            = triage_hint,
-        safety_kw              = safety_kw,
-        tools_block            = tools_block,
-        problem_description    = session.problem,
-        verified_parts_json    = json.dumps(session.verified_parts, indent=2),
-        last_verification_json = json.dumps(last_verification, indent=2),
-        safety_context         = safety_context,
-        allowed_area_hints     = allowed_areas,
-        known_parts            = known_parts,
-        visual_observations    = _format_observations(session),
-        generated_steps_hint   = _format_generated_steps(session),
+    area_ctx = _get_area_context(session.machine_type, current_step.area_hint, session.language)
+
+    relevant_parts_list = [current_step.required_part] if current_step.required_part not in (None, "unknown", "") else []
+    for part, status in session.verified_parts.items():
+        if part not in relevant_parts_list and status in ("damaged", "unclear"):
+            relevant_parts_list.append(part)
+
+    verification_cap = {
+        "camera_available": True,
+        "vision_models": ["locate_part", "verify_step", "inspect_part"],
+        "allowed_interactions": ["camera", "boolean", "choice", "number", "none"],
+        "step_mode_hint": current_step.verification.mode if current_step.verification else "confirmation"
+    }
+
+    ctx = PromptContext(
+        machine_type=session.machine_type,
+        action=current_step.action,
+        description=current_step.description,
+        required_part=current_step.required_part or "",
+        area_hint=current_step.area_hint,
+        area_description=area_ctx["description"],
+        area_landmarks=", ".join(area_ctx["landmarks"]) if area_ctx["landmarks"] else "none specified",
+        step_type=current_step.step_type,
+        attempt_count=session.attempt_count,
+        verified_parts_json=json.dumps(session.verified_parts, indent=2),
+        visual_observations=_format_observations(session),
+        last_verification_json=json.dumps(last_verification, indent=2),
+        safety_context=safety_context,
+        relevant_areas=current_step.area_hint,
+        relevant_parts=", ".join(relevant_parts_list) if relevant_parts_list else "none",
+        tools_block=tools_block,
+        verification_capability=json.dumps(verification_cap)
     )
 
+    prompt = render_repair_prompt(ctx)
+    
     raw = await _call_gemini(prompt)
     response = _parse_response(raw, session.machine_type)
     response = safety_rules.post_check(response, session)
+
+    # Backend enforces structural fields
+    response.next_step.required_part = current_step.required_part or "unknown"
+    response.next_step.area_hint = current_step.area_hint
+    response.next_step.visual_cue = current_step.required_part or "unknown"
+    response.next_step.ar_model = f"{current_step.required_part or 'part'}.obj"
+
+    # VALIDATE AND NORMALIZE INTERACTION
+    response.next_step.interaction = _validate_and_normalize_interaction(
+        response.next_step.interaction, 
+        response.next_step.required_part,
+        current_step.step_type,
+    )
+
+    # PREVENT STATUS HALLUCINATION: If we are asking the user a question/action, we MUST be in continue state
+    if response.next_step.interaction.type in ("camera", "choice", "boolean", "number"):
+        response.status = "continue"
 
     session.verified_parts.update(response.updated_memory.verified_parts)
     for step in response.updated_memory.diagnostic_path:
         if step not in session.diagnostic_path:
             session.diagnostic_path.append(step)
+            
     session.current_stage  += 1
     session.attempt_count  += 1
     session.last_verification = last_verification
@@ -218,17 +302,19 @@ async def decide_next_step(
     logger.info(
         f"🤖 Agent [{session.machine_type}] stage={session.current_stage} "
         f"status={response.status} part={response.next_step.required_part} "
-        f"tool={response.next_step.required_tool}"
+        f"interaction_type={response.next_step.interaction.type if response.next_step.interaction else 'none'}"
     )
     return response
 
-
+# Note: Safely delete the `_build_interaction()` helper function and the `_MASTER_AGENT_PROMPT` string entirely.
 # ─────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────
 
 def _apply_verification(session: RepairSession, verification: dict) -> None:
-    """Merge /verify_step result into session.verified_parts and verified_observations."""
+    status = verification.get("status", "")
+    if status in ("initial", "session_start", "manual_advance", ""):
+        return
     part = (
         verification.get("required_part")
         or verification.get("correct_part")
@@ -279,16 +365,17 @@ def _build_safety_context(session: RepairSession) -> str:
     return "\n".join(lines)
 
 
-async def _call_gemini(prompt: str) -> str:  # MIGRATED: Gemini → Groq (function name preserved per RULE 4)
-    response = await asyncio.to_thread(  # MIGRATED: Gemini → Groq
-        lambda: groq_client.chat.completions.create(  # MIGRATED: Gemini → Groq
-            model=TEXT_MODEL,  # MIGRATED: Gemini → Groq
-            messages=[{"role": "user", "content": prompt}],  # MIGRATED: Gemini → Groq
-            **JSON_CONFIG,  # MIGRATED: Gemini → Groq
+async def _call_gemini(prompt: str) -> str:
+    response = await asyncio.to_thread(
+        lambda: groq_chat_completion(
+            messages=[
+                {"role": "system", "content": REPAIR_SYSTEM_BLOCK},
+                {"role": "user", "content": prompt},
+            ],
+            **JSON_CONFIG,
         )
     )
-    return response.choices[0].message.content  # MIGRATED: Gemini → Groq
-
+    return response.choices[0].message.content
 
 def _validate_tool(tool: str | None, machine_type: str) -> str | None:
     """Reject any tool not on the allowed list for this machine. Returns None if invalid."""
@@ -306,6 +393,14 @@ def _validate_tool(tool: str | None, machine_type: str) -> str | None:
     logger.warning(f"⚠️  [{machine_type}] Hallucinated tool rejected: '{tool}'")
     return None
 
+def _parse_interaction(raw: dict | None) -> Interaction | None:
+    """Parse interaction block using Pydantic validation. Returns None on any error."""
+    if not raw or not isinstance(raw, dict):
+        return None
+    try:
+        return Interaction.model_validate(raw)
+    except Exception:
+        return None
 
 def _parse_response(raw: str, machine_type: str) -> AgentNextResponse:
     allowed = get_allowed_area_ids(machine_type)
@@ -319,10 +414,7 @@ def _parse_response(raw: str, machine_type: str) -> AgentNextResponse:
     try:
         ns   = data["next_step"]
         um   = data.get("updated_memory", {})
-        area = ns.get("area_hint", "")
-        if area not in allowed:
-            logger.warning(f"⚠️  [{machine_type}] Invalid area_hint '{area}' → correcting")
-            ns["area_hint"] = allowed[0] if allowed else "engine_compartment"
+        area = ns.get("area_hint") or None  # backend will overwrite anyway
 
         text_en = ns.get("text_en", "")
         if len(text_en.split()) < 25:
@@ -352,7 +444,7 @@ def _parse_response(raw: str, machine_type: str) -> AgentNextResponse:
                 visual_cue       = ns.get("visual_cue", "unknown"),
                 ar_model         = ns.get("ar_model", "part.obj"),
                 required_part    = ns.get("required_part", "unknown"),
-                area_hint        = ns["area_hint"],
+                area_hint        = ns.get("area_hint", "engine_compartment"),
                 safety_warning   = ns.get("safety_warning"),
                 expected_result    = ns.get("expected_result", ""),
                 expected_result_hi = ns.get("expected_result_hi", ""),
@@ -361,6 +453,7 @@ def _parse_response(raw: str, machine_type: str) -> AgentNextResponse:
                 escalate_if        = ns.get("escalate_if", ""),
                 escalate_if_hi     = ns.get("escalate_if_hi", ""),
                 required_tool      = validated_tool,
+                interaction       = _parse_interaction(ns.get("interaction")),
             ),
             updated_memory = UpdatedMemory(
                 verified_parts  = um.get("verified_parts", {}),
@@ -394,3 +487,133 @@ def _fallback_response(machine_type: str, reason: str) -> AgentNextResponse:
         ),
         updated_memory=UpdatedMemory(verified_parts={}, diagnostic_path=["agent_error"]),
     )
+
+def _validate_and_normalize_interaction(
+    interaction: Interaction | None,
+    required_part: str,
+    step_type: str = "inspection",
+) -> Interaction:
+    """Enforces structural rules on LLM interaction schemas.
+
+    Trusts the LLM's own question/options wherever it provided them — per
+    SYSTEM_REPAIR, options must stay dynamic and step-specific, generated
+    fresh per step (e.g. "Cable looks fine" / "Cable is frayed"), never a
+    fixed template. This function only:
+      1. Supplies a step_type-aware default when the LLM returns no
+         interaction block at all — never blanket-defaults to boolean,
+         since that silently erases the camera/choice/number cases too.
+      2. Downgrades a camera interaction that has no part to point the
+         camera at (structurally impossible to render).
+      3. Fills in a GENERIC fallback pair only when the LLM's own
+         choice/boolean options are missing or insufficient — it never
+         overwrites options the LLM did provide.
+    """
+
+    # 1. No interaction block at all — step_type-aware default.
+    #    Inspection steps with a required_part ALWAYS default to camera
+    #    because the diagnosis prompt now guarantees camera-verifiable steps.
+    if not interaction:
+        if step_type in ("inspection", "repair") and required_part not in (None, "", "unknown", "none", "machine_part"):
+            return Interaction(type="camera", question="", options=[])
+        if step_type == "safety":
+            return Interaction(
+                type="boolean",
+                question="Is this safety step complete?",
+                options=[
+                    InteractionOption(id="yes", label="Yes, done", next_state="continue"),
+                    InteractionOption(id="no", label="Not yet", next_state="retry"),
+                ]
+            )
+        if step_type == "verification":
+            return Interaction(
+                type="choice",
+                question="Did the repair fix the problem?",
+                options=[
+                    InteractionOption(id="fixed", label="Yes, working now", next_state="continue"),
+                    InteractionOption(id="not_fixed", label="Still not working", next_state="continue"),
+                ]
+            )
+        return Interaction(
+            type="boolean",
+            question="",
+            options=[InteractionOption(id="yes", label="Done", next_state="continue")],
+        )
+
+    # 2. Camera: verify there's actually a part to scan.
+    if interaction.type == "camera":
+        if not required_part or required_part in ("none", "unknown", ""):
+            if step_type == "inspection":
+                interaction.question = "Point your camera at the part shown in the guide"
+                interaction.options = []
+            else:
+                logger.warning("Downgrading camera interaction to boolean: no required_part")
+                interaction.type = "boolean"
+                interaction.question = interaction.question or "Action complete?"
+                if not interaction.options:
+                    interaction.options = [InteractionOption(id="yes", label="Done", next_state="continue")]
+        else:
+            interaction.question = ""
+            interaction.options = []
+
+    # Override: inspection steps should always be camera, never number or boolean
+    elif interaction.type in ("number", "boolean") and step_type == "inspection" and required_part not in (None, "", "unknown", "none", "machine_part"):
+        logger.warning(f"Overriding {interaction.type}→camera for inspection step (part={required_part})")
+        interaction.type = "camera"
+        interaction.question = ""
+        interaction.options = []
+
+    # 3. Boolean: trust the LLM's own options...
+    elif interaction.type == "boolean":
+        if not interaction.options:
+            logger.warning("Boolean interaction missing options — using dynamic fallback")
+            interaction.options = [
+                InteractionOption(id="done", label="I did it", next_state="continue"),
+                InteractionOption(id="stuck", label="I can't find it", next_state="retry"),
+            ]
+
+    # 4. Choice: needs at least 2 usable options.
+    elif interaction.type == "choice":
+        opts = interaction.options or []
+        if len(opts) < 2:
+            logger.warning(
+                "Downgrading choice interaction: fewer than 2 options (got %d)", len(opts)
+            )
+            interaction.type = "boolean"
+            if len(opts) == 1:
+                interaction.options = opts + [InteractionOption(id="stuck", label="I'm stuck / Not done", next_state="retry")]
+            else:
+                interaction.options = [
+                    InteractionOption(id="done", label="I did it", next_state="continue"),
+                    InteractionOption(id="stuck", label="I can't find it", next_state="retry"),
+                ]
+
+    # 5. Number: FORBIDDEN. Flutter has no numeric input field.
+    elif interaction.type == "number":
+        logger.warning("Downgrading unsupported 'number' interaction to 'choice'")
+        interaction.type = "choice"
+        interaction.question = interaction.question or "What is the measurement?"
+        interaction.options = [
+            InteractionOption(id="opt1", label="Looks correct", next_state="continue"),
+            InteractionOption(id="opt2", label="Needs adjustment", next_state="retry"),
+        ]
+
+    # 6. None: purely informational step — nothing to render or confirm,
+    #    the agent auto-advances once the farmer reads it.
+    elif interaction.type == "none":
+        interaction.question = ""
+        interaction.options = []
+
+    # 7. Text: Interaction.type's Pydantic Literal in models.py permits
+    #    "text", but Flutter's InteractionType has no case for it anywhere
+    #    in ar_controller.dart or scanning_indicator.dart — nothing renders
+    #    it. SYSTEM_REPAIR never instructs the LLM to emit it, so this
+    #    should be unreachable in practice, but downgrade defensively
+    #    rather than ship an interaction the phone can't display.
+    elif interaction.type == "text":
+        logger.warning("Downgrading unsupported 'text' interaction to boolean — no Flutter renderer exists for it")
+        interaction.type = "boolean"
+        interaction.options = interaction.options or [
+            InteractionOption(id="yes", label="Done", next_state="continue")
+        ]
+
+    return interaction

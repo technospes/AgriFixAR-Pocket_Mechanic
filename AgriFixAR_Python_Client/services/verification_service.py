@@ -219,17 +219,22 @@ pass=part_visible+assessable(conf≥0.70); fail=wrong_area; unclear=bad_image; u
         detected_raw = (result.get("detected_part") or "").lower()
         incompatible = _MACHINE_INCOMPATIBLE_PARTS.get(machine_type, set())
         machine_mismatch = any(token in detected_raw for token in incompatible)
+
         if machine_mismatch and raw_status in ("pass", "fail"):
             raw_status = "fail"
             raw_conf   = 0.0
-            result["feedback"] = (
+            ai_feedback = result.get("feedback", "")
+            result["feedback"] = ai_feedback if ai_feedback else (
                 f"Wrong machine or area — detected component does not belong to a {machine_type}.\n"
                 f"Aim camera at the {area_hint.replace('_', ' ')} of your {machine_type}."
             )
-            result["feedback_hi"] = (
+
+            ai_feedback_hi = result.get("feedback_hi", "")
+            result["feedback_hi"] = ai_feedback_hi if ai_feedback_hi else (
                 f"गलत मशीन या क्षेत्र — यह हिस्सा {machine_type} का नहीं है।\n"
                 f"कैमरा अपने {machine_type} के {area_hint.replace('_', ' ')} पर लगाएं।"
             )
+
             logger.warning(
                 f"verify_step: MACHINE_MISMATCH [{machine_type}] detected='{detected_raw[:60]}'"
             )
@@ -249,14 +254,16 @@ pass=part_visible+assessable(conf≥0.70); fail=wrong_area; unclear=bad_image; u
                     and required_sub != detected_sub):
                 raw_status = "fail"
                 raw_conf   = min(raw_conf, 0.45)
+                
+                # Keep Gemini's feedback, just append the subsystem warning
+                ai_feedback = result.get("feedback", f"This is a {detected_sub} component.")
                 result["feedback"] = (
-                    f"Diagnosis needs the {required_part.replace('_', ' ')} "
-                    f"({required_sub} system), but camera shows a {detected_sub} component.\n"
+                    f"{ai_feedback}\n"
                     f"Point camera at the {area_hint.replace('_', ' ')}."
                 )
+                ai_feedback_hi = result.get("feedback_hi", f"यह एक {detected_sub} हिस्सा है।")
                 result["feedback_hi"] = (
-                    f"जांच के लिए {required_part.replace('_', ' ')} ({required_sub} सिस्टम) "
-                    f"चाहिए, लेकिन कैमरे में {detected_sub} हिस्सा दिख रहा है।\n"
+                    f"{ai_feedback_hi}\n"
                     f"कैमरा {area_hint.replace('_', ' ')} की तरफ करें।"
                 )
                 logger.warning(
@@ -271,12 +278,16 @@ pass=part_visible+assessable(conf≥0.70); fail=wrong_area; unclear=bad_image; u
         if raw_status == "pass" and not part_words_match and required_words:
             raw_status = "fail"
             raw_conf   = min(raw_conf, 0.50)
+            
+            # Keep Gemini's smart spatial feedback!
+            ai_feedback = result.get("feedback", f"Wrong component shown.")
             result["feedback"] = (
-                f"Wrong component shown — need the {required_key}.\n"
+                f"{ai_feedback}\n"
                 f"Point camera at {area_hint.replace('_', ' ')}."
             )
+            ai_feedback_hi = result.get("feedback_hi", f"गलत हिस्सा दिखाया।")
             result["feedback_hi"] = (
-                f"गलत हिस्सा दिखाया — {required_key} दिखाएं।\n"
+                f"{ai_feedback_hi}\n"
                 f"{area_hint.replace('_', ' ')} की तरफ कैमरा करें।"
             )
             logger.info(f"verify_step: WRONG_PART [{machine_type}] "

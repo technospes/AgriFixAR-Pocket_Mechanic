@@ -48,6 +48,7 @@ class Interaction {
 class NextStepDetail {
   final String text, textEn, textHi;
   final String visualCue, arModel, requiredPart, areaHint;
+  final String trackingScope;
   final String? safetyWarning;
   final String expectedResult, expectedResultHi;
   final String ifFailed, ifFailedHi;
@@ -58,7 +59,7 @@ class NextStepDetail {
   NextStepDetail({
     required this.text, required this.textEn, required this.textHi,
     required this.visualCue, required this.arModel,
-    required this.requiredPart, required this.areaHint,
+    required this.requiredPart, required this.areaHint, required this.trackingScope,
     this.safetyWarning,
     this.expectedResult = '', this.expectedResultHi = '',
     this.ifFailed = '', this.ifFailedHi = '',
@@ -69,8 +70,9 @@ class NextStepDetail {
 
   factory NextStepDetail.fromJson(Map<String, dynamic> j) => NextStepDetail(
         text: j['text'] ?? '', textEn: j['text_en'] ?? '', textHi: j['text_hi'] ?? '',
-        visualCue: j['visual_cue'] ?? '', arModel: j['ar_model'] ?? '',
+        visualCue: j['visual_cue'] ?? '', arModel: j['ar_model'] ?? 'none',
         requiredPart: j['required_part'] ?? '', areaHint: j['area_hint'] ?? '',
+        trackingScope: j['tracking_scope'] ?? 'component',
         safetyWarning: j['safety_warning'] as String?,
         expectedResult: j['expected_result'] ?? '', expectedResultHi: j['expected_result_hi'] ?? '',
         ifFailed: j['if_failed'] ?? '', ifFailedHi: j['if_failed_hi'] ?? '',

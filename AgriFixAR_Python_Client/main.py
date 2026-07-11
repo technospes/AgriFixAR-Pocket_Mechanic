@@ -2270,19 +2270,19 @@ if __name__ == "__main__":
     import uvicorn
 
     logger.info("=" * 80)
-    logger.info("🚀 AgriFix v4.2 Production Backend Starting...")
+    logger.info("AgriFix v4.2 Production Backend Starting...")
     logger.info("=" * 80)
-    logger.info("🔑 Gemini API: ✅ Configured")
-    logger.info("🔮 Machine Detection: MobileCLIP-S1 + audio keywords + Gemini fallback")
-    logger.info("🧠 Agent: Stateful repair agent (Gemini + safety rules)")
-    logger.info("🛡️  Security: rate limiting + Gemini guard + file validation + auth")
+    logger.info("Gemini API: ✅ Configured")
+    logger.info("Machine Detection: MobileCLIP-S1 + audio keywords + Gemini fallback")
+    logger.info("Agent: Stateful repair agent (Gemini + safety rules)")
+    logger.info("Security: rate limiting + Gemini guard + file validation + auth")
     logger.info(
         f"📐 Limits enforced: video≤{VIDEO_MAX_BYTES//1_048_576}MB/{int(VIDEO_MAX_SECONDS)}s  "
         f"audio≤{AUDIO_MAX_BYTES//1_048_576}MB/{int(AUDIO_MAX_SECONDS)}s  "
         f"gemini≤{GEMINI_HOURLY_LIMIT}/IP/hr"
     )
-    logger.info(f"💾 Cache: {CACHE_DIR}")
-    logger.info(f"📚 Knowledge Base: {KB_DIR}")
+    logger.info(f"Cache: {CACHE_DIR}")
+    logger.info(f"Knowledge Base: {KB_DIR}")
     logger.info("=" * 80)
 
     port = int(os.environ.get("PORT", 7860))

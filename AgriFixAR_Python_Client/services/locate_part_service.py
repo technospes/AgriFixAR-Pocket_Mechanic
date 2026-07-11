@@ -34,21 +34,6 @@ _AREA_DIRECTIONS: dict[str, str] = {
     "underside":        "the bottom of the machine",
 }
 
-_SIMILAR_PARTS_MAP: dict[str, list[str]] = {
-    "suction_pipe_joint":   ["discharge pipe joint", "pressure pipe", "outlet hose",
-                             "return line", "random hose"],
-    "priming_plug":         ["drain plug", "grease nipple", "breather cap",
-                             "oil filler cap"],
-    "foot_valve":           ["check valve", "pressure relief valve", "gate valve"],
-    "capacitor":            ["relay", "contactor", "junction box", "motor terminal"],
-    "fuel_filter":          ["oil filter", "air filter", "hydraulic filter"],
-    "air_filter":           ["oil filter", "fuel filter", "pre-cleaner bowl"],
-    "clutch_pedal":         ["brake pedal", "accelerator pedal", "foot rest"],
-    "battery_terminal":     ["fuse holder", "relay socket", "wire connector"],
-    "shear_bolt":           ["blade bolt", "gearbox bolt", "hex bolt"],
-    "mcb_switch":           ["isolator switch", "contactor", "relay"],
-}
-
 
 async def locate_part_with_gemini(
     image_bytes: bytes,
@@ -69,6 +54,11 @@ async def locate_part_with_gemini(
     """
     Ask Gemini Vision to locate a specific part and return its bounding box.
 
+    Gemini always identifies whatever it actually sees (visible_component) and,
+    when that isn't the target, reasons about the target's position relative to
+    it — so camera_guidance is populated from real per-frame spatial reasoning
+    rather than a generic string, even in the found=False case.
+
     Returns a dict:
       found=True:
         {
@@ -76,7 +66,8 @@ async def locate_part_with_gemini(
           "bbox": [cx, cy, w, h],   # normalised 0.0–1.0, cx/cy = centre
           "confidence": 0.85,
           "part_description": "round red plug on upper-left of pump body",
-          "camera_guidance": null
+          "visible_component": "priming plug",
+          "camera_guidance": ""
         }
 
       found=False:
@@ -85,7 +76,8 @@ async def locate_part_with_gemini(
           "bbox": null,
           "confidence": 0.0,
           "part_description": null,
-          "camera_guidance": "Turn to the back of the machine — priming plug is there"
+          "visible_component": "drain plug",
+          "camera_guidance": "This is the drain plug. The priming plug is above it."
         }
     """
     # ── Server-side bbox cache check ─────────────────────────────────────────
@@ -125,63 +117,50 @@ async def locate_part_with_gemini(
                 f"±{roi_margin:.2f} of that position before searching elsewhere.\n"
             )
 
-        # Build exclusion list — common visually similar parts to reject
-        exclusions = _SIMILAR_PARTS_MAP.get(required_part, [])
-        excl_block = (
-            f'\nDO NOT identify any of these as the target: {", ".join(exclusions)}.\n'
-            if exclusions else ""
-        )
-
         prompt = f"""\
-Machine: {machine_type}. Find ONLY: "{part_readable}" in {area_hint} ({area_desc}).
-{lang_note}{roi_block}{excl_block}
-BBOX RULES (CRITICAL):
-  • bbox = [cx, cy, w, h]
-  • ALL values MUST be normalised strictly between 0.0 and 1.0.
-  • cx = horizontal centre (0.0=left, 1.0=right).
-  • cy = vertical centre (0.0=top, 1.0=bottom).
-  • DO NOT return pixel coordinates (e.g., no values like 545.0).
-  • If the value is > 1.0, it is a calculation error. Divide by image dimensions first.
-  • bbox edges must not touch image boundary (all of cx±w/2, cy±h/2 must be in (0,1)).
-  • part_visibility_pct: integer 0–100 estimating how much of the part is unobstructed.
+Machine: {machine_type}. Camera is searching for: "{part_readable}", expected in \
+{area_hint} ({area_desc}).
+{lang_note}{roi_block}
+STEP 1 — Look honestly. Name the single most prominent identifiable component in \
+frame (shape/colour/position), even if it is NOT the target. Never claim to see the \
+target if what you see is actually something else.
 
-IDENTITY CHECK — before setting found=true, confirm ALL of these:
-  a. The visible part matches "{part_readable}" in shape, position and function.
-  b. It is located in {area_hint} — not in a different section of the machine.
-  c. At least 60% of the part is unobstructed and clearly visible.
-{excl_block}
-REJECT FLAGS — set true if any apply, and force found=false:
-  part_not_visible     — cannot identify "{part_readable}" anywhere in frame
-  wrong_area           — camera shows different machine section than {area_hint}
-  image_too_blurry     — image out of focus, dark, or motion-blurred
-  part_behind_machine  — part is likely on the other side/face of the machine
-  wrong_part_detected  — a SIMILAR but DIFFERENT part is visible (not "{part_readable}")
-  glare_detected       — metal glare / reflection covers >15% of the visible part area
-  part_occluded        — part visibility < 60% (blocked by another component or hand)
+STEP 2 — Decide is_target:
+  true  → the visible component matches "{part_readable}" in shape AND function AND \
+sits in {area_hint} (not merely similar-looking, and not a different port/cap/pipe \
+that shares the same rough shape).
+  false → anything else: nothing identifiable, wrong section, too blurry/dark, \
+likely on another face of the machine, or only part_visibility_pct < 60.
 
-CAMERA GUIDANCE — one short imperative (<12 words) for the farmer:
-  • Wrong area  → "Point camera at {area_direction}"
-  • Too close   → "Move phone back — part fills too much of frame"
-  • Too far     → "Move closer to the {machine_type}"
-  • Behind      → "Turn to the other side of the {machine_type}"
-  • Glare       → "Tilt phone slightly to reduce reflection"
-  • Occluded    → "Remove the obstruction and retry"
+STEP 3 — If is_target=false, use your general mechanical knowledge of a \
+{machine_type}'s layout to reason from whatever IS visible toward the target, then \
+write ONE imperative sentence (<15 words) in camera_guidance:
+  "This is the [visible component]. The {part_readable} is [direction/relation] of it."
+  Nothing recognisable       → "Point camera at {area_direction}."
+  Likely on other face       → "Turn the {machine_type} around — {part_readable} is on the other side."
+  Blurry/dark                → "Hold still and move closer — image unclear."
+  Glare on visible surface   → "Tilt phone slightly to reduce reflection."
+If is_target=true, camera_guidance = "".
+
+BBOX RULES (fill in ONLY when is_target=true):
+  bbox = [cx, cy, w, h], ALL values normalised strictly between 0.0 and 1.0.
+  cx/cy = centre (0=left/top, 1=right/bottom). Never return pixel coordinates.
+  If a computed value is > 1.0, divide by image dimensions first.
+  part_visibility_pct: integer 0–100, how much of the part is unobstructed.
+  If part_visibility_pct < 60, set is_target=false and bbox=null instead.
 
 Return ONLY this JSON (no markdown, no preamble):
 {{
-  "found": true|false,
+  "visible_component": "<what you actually see, honestly>",
+  "is_target": true|false,
   "bbox": [cx, cy, w, h] or null,
   "confidence": 0.0-1.0,
-  "part_description": "<colour, shape, exact location>",
-  "camera_guidance": "<12 words max>",
+  "part_description": "<colour, shape, exact location — only if is_target>",
+  "camera_guidance": "<STEP 3 sentence, or empty string if is_target=true>",
   "part_visibility_pct": 0-100,
-  "part_not_visible": true|false,
-  "wrong_area": true|false,
+  "part_occluded": true|false,
   "image_too_blurry": true|false,
-  "part_behind_machine": true|false,
-  "wrong_part_detected": true|false,
-  "glare_detected": true|false,
-  "part_occluded": true|false
+  "part_behind_machine": true|false
 }}"""
 
         response_text = await vision_call(
@@ -194,27 +173,27 @@ Return ONLY this JSON (no markdown, no preamble):
         raw = repair_json(response_text)
 
         # ── Anti-hallucination gate ───────────────────────────────────────────
-        # If ANY reject flag is true, force found=false regardless of what
-        # Gemini said in the "found" field. This prevents a hallucinated bbox
-        # from ever reaching Flutter.
-        reject_flags = [
-            raw.get("part_not_visible",    False),
-            raw.get("wrong_area",          False),
-            raw.get("image_too_blurry",    False),
-            raw.get("part_behind_machine", False),
-            raw.get("wrong_part_detected", False),  # similar-but-wrong part
-            raw.get("glare_detected",      False),  # metal glare covers part
-            raw.get("part_occluded",       False),  # visibility < 60%
-        ]
-        any_rejected = any(reject_flags)
-
-        # Visibility gate — reject even if flags clean, visibility too low
+        # is_target is Gemini's own honest identity verdict (see STEP 2 of the
+        # prompt). We never trust "is_target" alone for the bbox — visibility,
+        # occlusion and confidence are re-checked independently below — but we
+        # DO trust it to decide whether a bbox may exist at all. Crucially we
+        # no longer collapse "wrong part" into a single boolean that erases
+        # Gemini's reasoning: visible_component + camera_guidance survive
+        # regardless of is_target, so the farmer always gets Gemini's actual
+        # spatial reasoning rather than a generic fallback string.
         vis_pct = int(raw.get("part_visibility_pct", 100))
-        if vis_pct < 60 and raw.get("found", False):
-            any_rejected = True
+
+        any_rejected = (
+            not raw.get("is_target", False)
+            or raw.get("part_occluded",       False)
+            or raw.get("image_too_blurry",    False)
+            or raw.get("part_behind_machine", False)
+            or vis_pct < 60
+        )
+        if vis_pct < 60 and raw.get("is_target", False):
             logger.info(f"locate_part: rejected — visibility={vis_pct}% < 60%")
 
-        raw_found = raw.get("found", False) and not any_rejected
+        raw_found = raw.get("is_target", False) and not any_rejected
         raw_conf  = float(raw.get("confidence") or 0.0)
 
         # Second gate: confidence below threshold → not found
@@ -272,38 +251,42 @@ Return ONLY this JSON (no markdown, no preamble):
                         f"cx={cx:.3f} cy={cy:.3f} w={w:.3f} h={h:.3f}"
                     )
 
-        # Build camera_guidance — always non-null
+        # Camera guidance — Gemini is asked to always fill this in (STEP 3 of the
+        # prompt) whenever is_target=false, using its own spatial reasoning about
+        # whatever IS visible. We only fall back to the generic deterministic
+        # string if Gemini genuinely returned nothing (empty/missing field) —
+        # e.g. a malformed response — never as a routine replacement for its
+        # reasoning.
         guidance = raw.get("camera_guidance") or _default_guidance(
             required_part, area_hint, machine_type,
             raw.get("part_behind_machine", False),
-            raw.get("wrong_area", False),
+            False,  # wrong_area no longer a discrete flag — folded into is_target
             raw.get("image_too_blurry", False),
             language,
         )
 
         result = {
-            "found":              raw_found,
-            "bbox":               bbox,
-            "confidence":         round(raw_conf, 3) if raw_found else 0.0,
-            "part_description":   raw.get("part_description") if raw_found else None,
-            "camera_guidance":    guidance,
+            "found":               raw_found,
+            "bbox":                bbox,
+            "confidence":          round(raw_conf, 3) if raw_found else 0.0,
+            "part_description":    raw.get("part_description") if raw_found else None,
+            "visible_component":   raw.get("visible_component"),  # what Gemini actually saw
+            "camera_guidance":     guidance,
             "part_visibility_pct": vis_pct,
-            "frame_id":           frame_id,  # echoed back so Flutter can discard stale
+            "frame_id":            frame_id,  # echoed back so Flutter can discard stale
             "reject_flags": {
-                "part_not_visible":    raw.get("part_not_visible",    False),
-                "wrong_area":         raw.get("wrong_area",           False),
-                "image_too_blurry":   raw.get("image_too_blurry",     False),
-                "part_behind_machine":raw.get("part_behind_machine",  False),
-                "wrong_part_detected":raw.get("wrong_part_detected",  False),
-                "glare_detected":     raw.get("glare_detected",       False),
-                "part_occluded":      raw.get("part_occluded",        False),
+                "part_not_visible":    not raw.get("is_target", False),
+                "image_too_blurry":    raw.get("image_too_blurry",    False),
+                "part_behind_machine": raw.get("part_behind_machine", False),
+                "part_occluded":       raw.get("part_occluded",       False),
             },
         }
 
         flag_log = [k for k, v in result["reject_flags"].items() if v]
         logger.info(
             f"{'✅' if raw_found else '❌'} locate_part: found={raw_found} "
-            f"conf={raw_conf:.2f} flags={flag_log or 'none'}"
+            f"conf={raw_conf:.2f} flags={flag_log or 'none'} "
+            f"visible='{result['visible_component']}' guidance='{guidance}'"
         )
         # Cache successful detections so subsequent calls within 1.5 s skip Gemini
         if raw_found:
@@ -348,11 +331,12 @@ def _default_guidance(
 
 def _fallback_not_found(part: str, area: str, machine: str, lang: str) -> dict:
     return {
-        "found":            False,
-        "bbox":             None,
-        "confidence":       0.0,
-        "part_description": None,
-        "camera_guidance":  _default_guidance(part, area, machine, False, False, False, lang),
-        "reject_flags":     {"part_not_visible": True, "wrong_area": False,
-                             "image_too_blurry": False, "part_behind_machine": False},
+        "found":             False,
+        "bbox":              None,
+        "confidence":        0.0,
+        "part_description":  None,
+        "visible_component": None,
+        "camera_guidance":   _default_guidance(part, area, machine, False, False, False, lang),
+        "reject_flags":      {"part_not_visible": True, "image_too_blurry": False,
+                              "part_behind_machine": False, "part_occluded": False},
     }

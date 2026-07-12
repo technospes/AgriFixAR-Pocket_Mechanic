@@ -42,6 +42,11 @@ from services.verification_service import verify_step_with_gemini
 # repair_agent.py. See agent/validation.py for the rationale.
 from agent.validation import InvalidRepairPlan, validate_repair_plan_steps
 
+# Deterministic jargon backstop — shared with repair_agent.py. See
+# agent/jargon_guard.py for the rationale (same pattern as the tool /
+# interaction validation already used in this pipeline).
+from agent.jargon_guard import apply_jargon_guard
+
 
 logger = logging.getLogger(__name__)
 # _GEMINI_MODEL removed — TEXT_MODEL from groq_client used instead  # MIGRATED: Gemini → Groq
@@ -94,35 +99,19 @@ _VERIFICATION_CONFIDENCE_THRESHOLD = 0.60
 _VERIFICATION_RISK_LEVELS = {"HIGH", "CRITICAL"}
 
 _GROUNDING_RULE = """\
-GROUNDING RULE (non-negotiable): The retrieved evidence below is your PRIMARY
-knowledge source. Reason over these chunks first. Your DIAGNOSIS — which part
-is at fault, what fixes it, and any spec/interval/measurement — MUST be derived
-exclusively from the KNOWLEDGE BASE CONTEXT below. Never invent a cause, fix,
-spec, or interval that isn't in the context.
-
-Use your general mechanical knowledge ONLY to:
-• Connect evidence across chunks
-• Explain terminology in farmer-friendly language
-• Describe what named parts look like and where they are located
-• Fill obvious procedural gaps (e.g., "tighten the bolt" when the manual says
-  "secure the component")
-
-Never contradict the retrieved evidence. If the evidence is insufficient to
-diagnose the actual fault, state: "This is not covered in the manual — consult
-a certified mechanic." """
+GROUNDING (non-negotiable): retrieved chunks below are your ONLY diagnosis source. Which part is at fault, the fix, and any spec/interval/measurement MUST come exclusively from KNOWLEDGE BASE CONTEXT. Never invent a cause, fix, spec, or interval.
+General mechanical knowledge may ONLY: connect evidence across chunks, phrase things farmer-friendly, describe what a named part looks like/where it sits, or fill trivial procedural gaps.
+Never contradict the retrieved evidence. If evidence can't diagnose the fault: "This is not covered in the manual — consult a certified mechanic." """
 
 _WEAK_CONTEXT_HEADER = """\
- RAG CONTEXT QUALITY: LOW (top relevance score < 0.40)
-The retrieved manual excerpts have LOW relevance to this query.
-STRICT GROUNDING MODE IS ACTIVE:
-  • Only state what the chunks below explicitly say.
-  • Do NOT speculate, generalise, or use outside knowledge to fill gaps.
-  • If a specific fault or procedure is not covered, say so and escalate.
+RAG QUALITY: LOW (top score < 0.40). STRICT MODE:
+- State only what the chunks explicitly say.
+- No speculation, no generalising, no outside-knowledge gap-filling.
+- Fault/procedure not covered → say so and escalate.
 """
 
 _STRONG_CONTEXT_HEADER = """\
-RAG CONTEXT QUALITY: STRONG (top relevance score ≥ 0.40)
-Manual excerpts are highly relevant. Use them as the primary source.
+RAG QUALITY: STRONG (top score ≥ 0.40). Manual excerpts are highly relevant — use as primary source.
 """
 
 _NO_CONTEXT_ESCALATION_EN = "I was unable to find relevant information in the technical manual for this specific situation. Please consult a certified mechanic or your nearest Mahindra service centre for a safe diagnosis."
@@ -136,400 +125,331 @@ def _extract_visual_snippet(problem_text: str) -> str:
     return match.group(1).strip() if match else ""
 
 _SPEC_FIDELITY_RULE = """
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RULE 7 — FLUID SUBSTITUTION & SPEC FIDELITY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If the query involves using a non-OEM fluid (cooking oil, mustard oil,
-engine oil in place of hydraulic oil, petrol in a diesel engine, etc.):
-  1. REJECT the substitute explicitly and state the exact damage it causes.
-  2. COPY the exact OEM specification (grade, viscosity, standard) verbatim
-     from the matched chunk — do NOT paraphrase or approximate it.
-  3. Include this verbatim specification in both technical_analysis AND in
-     a dedicated step.
+## RULE 7 — FLUID SUBSTITUTION & SPEC FIDELITY
+Non-OEM fluid query (cooking/mustard oil, engine oil as hydraulic fluid, petrol in diesel, etc.):
+1. Reject the substitute explicitly + state the exact damage it causes.
+2. Copy the OEM spec (grade/viscosity/standard) VERBATIM from the chunk — never paraphrase or approximate it.
+3. Put that verbatim spec in BOTH technical_analysis AND a dedicated step.
 
-If the query involves suction failure, loss of prime, or priming on a
-water pump:
-  1. The foot valve / suction pipe check is MANDATORY — include it as a
-     named step even if the user only asked about re-priming.
-  2. Use the exact term "foot valve" as written in the manual.
+Water pump suction failure / loss of prime / re-priming query:
+1. Foot valve / suction pipe check is MANDATORY as a named step, even if the farmer only asked about re-priming.
+2. Use the exact term "foot valve" as written in the manual.
 """
 
-def _build_strict_grounding_prompt(machine_type, machine_label, problem_text, rag_context, allowed_areas, parts_list, safety_keywords, language, has_visual_frames, context_quality, top_score, router_symptoms: Optional[List[str]] = None) -> str:
+def _build_strict_grounding_prompt(
+    machine_type, machine_label, problem_text, rag_context, allowed_areas,
+    parts_list, safety_keywords, language, has_visual_frames, context_quality,
+    top_score, router_symptoms: Optional[List[str]] = None,
+) -> str:
     visual_note = ""
     visual_text_present = _has_visual_context_text(problem_text)
     visual_snippet = _extract_visual_snippet(problem_text) if visual_text_present else ""
-
+ 
     if has_visual_frames:
-        visual_note = "Camera images are available for context. Use them to confirm the machine type and general condition, but generate repair steps based on the manual excerpts and symptom description below."
+        visual_note = (
+            "Camera images available — use to confirm machine type/condition, "
+            "but base repair steps on the manual excerpts + symptom text below."
+        )
     elif visual_text_present:
-        visual_note = f"VISUAL PRIORITY OVERRIDE — ACTIVE (embedded visual descriptor detected):\n  • RULE: The visual context (\"{visual_snippet}\") is the PRIMARY symptom.\n  • If the 'Audio:' field contradicts the visual context, TRUST THE VISUAL CONTEXT.\n"
-
-    # from utils.machine_registry import get_shutdown_instruction
-    # shutdown = get_shutdown_instruction(machine_type)
-    
+        visual_note = (
+            f'VISUAL PRIORITY OVERRIDE ACTIVE: visual context ("{visual_snippet}") '
+            f'is the PRIMARY symptom. If \'Audio:\' contradicts it, trust the visual.\n'
+        )
+ 
     electric_note = ""
-    # f"""CRITICAL SAFETY — STEP 1 REQUIREMENT:
-    #                 Your FIRST step MUST be a safety step with these EXACT values:
-    #                 action: "{shutdown['action']}"
-    #                 description: "{shutdown['instruction_en']}"
-    #                 required_part: "{shutdown['required_part']}"
-    #                 area_hint: "{shutdown['area_hint']}"
-    #                 step_type: "safety"
-    #                 Copy these values exactly. Do NOT modify or paraphrase.\n"""
+ 
     quality_banner = _WEAK_CONTEXT_HEADER if context_quality == "weak" else _STRONG_CONTEXT_HEADER
     quality_banner += f"Top chunk relevance: {top_score:.2f} | "
-
+ 
     if rag_context and rag_context.strip():
-        rag_block = f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nMANUAL EXTRACTS (AUTHORITATIVE SOURCE — USE THESE FIRST)\n{quality_banner}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n{rag_context}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        rag_block = (
+            f"## MANUAL EXTRACTS (AUTHORITATIVE — USE FIRST)\n{quality_banner}\n"
+            f"{rag_context}"
+        )
     else:
-        rag_block = f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚠️ NO MANUAL EXTRACTS AVAILABLE — HALLUCINATION TRAP ACTIVE\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nThe RAG retrieval system found NO chunks above the relevance threshold.\nYOU MUST OUTPUT AN ESCALATION RESPONSE. Set steps = [] (empty array).\nDO NOT generate steps, intervals, oil grades, or any procedure from your\nown training knowledge — that is a CRITICAL FAILURE regardless of how\nhelpful it would be to the user.\n\nCASE A — Machine type matches {machine_type} AND query describes a real\nmechanical part or maintenance task:\n  → status = \"escalate\", steps = []\n  → technical_analysis = \"This procedure is not covered in the {machine_label} service manual.\"\n  → safety_warnings_en[0] = \"This specific procedure is not in our repair manual for the {machine_label}. Please consult the manufacturer's user guide or a certified mechanic.\"\n\nCASE B — Out-of-scope or unknown fault:\n  → status = \"escalate\", steps = []\n  → technical_analysis = \"Insufficient knowledge base coverage for this symptom.\"\n  → safety_warnings_en[0] = \"Automatic diagnosis unavailable: symptom outside knowledge base. Consult a certified mechanic.\""
-
+        rag_block = f"""\
+## ⚠️ NO MANUAL EXTRACTS — HALLUCINATION TRAP ACTIVE
+No chunks cleared the relevance threshold. Output an ESCALATION response. \
+steps = [] (empty array). Do NOT generate steps, intervals, oil grades, or \
+any procedure from training knowledge — that is a CRITICAL FAILURE no \
+matter how helpful it would seem.
+ 
+- CASE A (machine matches {machine_type}, query is a real mechanical/\
+maintenance task) → status="escalate", steps=[]
+  technical_analysis = "This procedure is not covered in the {machine_label} service manual."
+  safety_warnings_en[0] = "This specific procedure is not in our repair manual for the {machine_label}. Please consult the manufacturer's user guide or a certified mechanic."
+ 
+- CASE B (out-of-scope / unknown fault) → status="escalate", steps=[]
+  technical_analysis = "Insufficient knowledge base coverage for this symptom."
+  safety_warnings_en[0] = "Automatic diagnosis unavailable: symptom outside knowledge base. Consult a certified mechanic." """
+ 
     target_symptoms = ", ".join(router_symptoms) if router_symptoms else problem_text
     user_query_words = problem_text
+ 
     grounding_rules = f"""
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {_GROUNDING_RULE}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+## STRICT GROUNDING — ZERO-HALLUCINATION PROTOCOL
+ 
+🔵 MANDATORY CHAIN OF THOUGHT — complete all 6 steps in "internal_reasoning" \
+before any other output field.
+ 
+STEP 1 — Visual/Audio check (1 sentence): "The user describes [X symptom] \
+with [visual/audio evidence Y]." Visual context (if present) always \
+overrides audio/text.
+ 
+STEP 2 — RAG chunk search & ranking. User said: "{user_query_words}" \
+| extracted symptoms: {target_symptoms}
+- A chunk matches if its PROBLEM field names the SAME symptom OR the SAME \
+component/system, even with different wording ("clutch is stuck" matches \
+"Clutch fails to work" / "Clutch cable damage" — all clutch faults; don't \
+require literal word-for-word equality).
+- List every matching chunk ID + its PROBLEM field + why it matches. \
+⛔ Quoting the chunk content is mandatory — "a safety chunk applies" alone \
+is a GROUNDING FAILURE.
+- Rank matches by symptom overlap (prefer chunks covering MULTIPLE user \
+symptoms). Highest-overlap chunk = PRIMARY DIAGNOSIS SOURCE. If none \
+overlap at all, state "no chunk covers this symptom".
+ 
+STEP 3 — Action decision. State exactly one of:
+- "ESCALATE — Universal safety hazard (Chunk [ID]) overrides all other rules."
+- "ESCALATE — Dangerous workaround detected (Chunk [ID])."
+- "ESCALATE — ZERO chunks share the same symptom OR same component/system \
+as the problem (RULE 5 zero-overlap test)."
+- "ESCALATE — Routine maintenance, no active fault (Chunk [ID])."
+- "SUCCESS/REASSURE — Chunk [ID] explicitly confirms symptom is normal."
+- "SUCCESS/FIRE_EXT — informational query, ESCALATE_IF says DO NOT escalate."
+- "DIAGNOSE — Chunk [ID] covers the same component/system (RULE 5 \
+component-class match); use its PROBLEM/STEPS as closest applicable fix."
+ 
+STEP 4 — Faithfulness check. For every DIAGNOSTIC claim (faulty part, fix, \
+spec/interval/part number) — is it explicit in the matched chunk? If not, \
+delete or soften it. Does NOT apply to general descriptive language \
+(landmarks, appearance, healthy-vs-faulty) — that's required by the \
+FARMER INSTRUCTION STANDARD below even when the manual is silent on it.
+ 
+STEP 5 — technical_analysis language check (applies even on escalate, \
+where solution.steps is empty and the FARMER INSTRUCTION STANDARD below \
+never runs on any text). technical_analysis and safety_warnings_en are \
+still farmer-facing. Before finalizing: no jargon without a plain-English \
+gloss ("corrosion" alone is banned — "rust/greenish buildup" required), \
+short plain sentences, no hedging chains ("could be indicative of a \
+variety of problems including but not limited to..."). State plainly \
+what was checked and why it's inconclusive, in one or two short \
+sentences a first-time operator can read aloud.
 
-STRICT GROUNDING RULES — ZERO-HALLUCINATION PROTOCOL
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🔵 MANDATORY CHAIN OF THOUGHT — Complete all 4 steps in "internal_reasoning"
-   BEFORE setting any other output field.
-
-   STEP 1 — [Visual/Audio Check]:
-   One sentence: "The user describes [X symptom] with [visual/audio evidence Y]."
-   Visual context (if present) ALWAYS overrides audio/text description.
-
-   STEP 2 — RAG CHUNK SEARCH:
-    The user said: "{user_query_words}"
-    Review each chunk. A chunk matches if:
-    • Its PROBLEM field contains the SAME mechanical symptom OR describes
-      a fault in the SAME component/system, even if the exact wording differs
-      (e.g. "clutch is stuck" matches "Clutch fails to work" / "Clutch cable
-      damage" — these are all clutch malfunctions; do NOT require literal
-      word-for-word symptom equality).
-    • Prefer chunks where MULTIPLE user symptoms or the SAME component appear.
-    • Only state "no chunk covers this symptom" if NO chunk mentions the same
-      component or system at all.
-    List all matching chunk IDs with their PROBLEM fields and explain why each
-    matches.
-   
-   The user's extracted symptoms are: {target_symptoms}
-   
-   After listing ALL chunks, rank them by SYMPTOM OVERLAP:
-   • A chunk matches if its PROBLEM field contains the SAME mechanical symptom.
-   • Prefer chunks where MULTIPLE user symptoms appear in the SAME chunk.
-   • The chunk with the highest symptom overlap is your PRIMARY DIAGNOSIS SOURCE.
-   • State which chunk best matches the symptoms. If NO chunk has any symptom overlap, state "no chunk covers this symptom".
-   
-   ⛔ YOU MUST INCLUDE THE CHUNK CONTENT. "A safety chunk applies" = GROUNDING FAILURE.
-
-   STEP 3 — [Action Decision]:
-   State exactly one of:
-     • "ESCALATE — Universal safety hazard (Chunk [ID]) overrides all other rules."
-     • "ESCALATE — Dangerous workaround detected (Chunk [ID])."
-     • "ESCALATE — No chunk PROBLEM field mentions any component related to this symptom."
-     • "ESCALATE — Routine maintenance, no active fault (Chunk [ID])."
-     • "SUCCESS/REASSURE — Chunk [ID] explicitly confirms symptom is normal."
-     • "SUCCESS/FIRE_EXT — Chunk 3b informational query, ESCALATE_IF says DO NOT escalate."
-     • "DIAGNOSE — Chunk [ID] covers the same component/system as the symptom
-       (component-class match per RULE 5); use its PROBLEM/STEPS as the closest
-       applicable fix."
-
-   STEP 4 — [Faithfulness Verification]:
-   Check only the DIAGNOSTIC claims in your draft — which part is at fault,
-   what fixes it, any spec/interval/part number. Is each one explicitly
-   written in the matched chunk? If not, delete or soften it.
-   
-   Do NOT apply this check to general descriptive language (how to locate
-   a part using visible landmarks, what it looks like, what healthy vs.
-   faulty looks like). That is general mechanical knowledge, not a
-   diagnostic claim, and is REQUIRED by the FARMER INSTRUCTION STANDARD
-   below even when the manual itself doesn't spell it out.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RULE 1 — UNIVERSAL SAFETY MASTER (ABSOLUTE HIGHEST PRIORITY)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If STEP 2 identifies ANY Universal_Safety_Master chunk whose ESCALATE_IF
-field contains an active trigger condition matching the problem:
-  → status = "escalate"
-  → COPY-PASTE MANDATE: Copy the chunk's STEPS field CHARACTER-FOR-CHARACTER
-    into safety_warnings_en[0]. Zero paraphrasing allowed.
-  → technical_analysis = the chunk's PROBLEM field verbatim.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RULE 2 — REASSURANCE (Normal Operation / Readings)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Apply ONLY when:
-  ✅ A chunk EXPLICITLY states this specific symptom or reading is normal.
-  ✅ NO Universal Safety chunk's ESCALATE_IF has been triggered.
-
-  If these are met:
-    → status = "success"
-    → Provide 1-2 steps explaining why it is normal based on the chunk.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RULE 3 — FIRE EXTINGUISHER QUERY (Informational — No Active Fire)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If the matched chunk's ESCALATE_IF says "DO NOT escalate":
-  → status = "success"
-  → COPY-PASTE MANDATE: Copy that chunk's STEPS verbatim.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RULE 4 — ROUTINE MAINTENANCE REDIRECT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If the query is a maintenance schedule with no active fault:
-  → status = "escalate"
-  → You MUST populate "solution.steps" with the maintenance procedure from the chunk. Do NOT leave steps empty.
-
-RULE 5 — HALLUCINATION TRAP (Strict Failsafe)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If STEP 2 result is "no chunk covers this symptom":
-  → status = "escalate", steps = []
-  → DO NOT generate steps, estimates, or procedures from training knowledge.
-
-If the chunks cover the SAME SYSTEM or COMPONENT CLASS as the user's problem, PROCEED TO DIAGNOSE. Match at the COMPONENT/SYSTEM level, taking the chunk with the highest symptom overlap as your single source of truth.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RULE 6 — COPY-PASTE MANDATE (Universal — No Exceptions)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-When any rule instructs you to copy a STEPS field:
-  1. Locate the exact STEPS string in the Manual Extracts above.
-  2. Copy it CHARACTER-FOR-CHARACTER into the target output field.
+STEP 6 — jargon_check. For every step you are about to output, look at \
+the FIRST SENTENCE of "action" and of "description" only. List any \
+technical part name a first-time farmer wouldn't know (e.g. shaft, \
+coupling, bearing, terminal board, capacitor, gland, seal, impeller) \
+that appears there before that part has been visually introduced. If \
+any are found, state the rewrite you will use instead (appearance/\
+shape/size/landmark, no technical name). If none are found, state \
+"clean".
+ 
+## RULE 1 — UNIVERSAL SAFETY MASTER (absolute highest priority)
+STEP 2 finds a Universal_Safety_Master chunk whose ESCALATE_IF is triggered:
+→ status="escalate" | safety_warnings_en[0] = chunk's STEPS field, \
+CHARACTER-FOR-CHARACTER, zero paraphrasing | technical_analysis = chunk's \
+PROBLEM field verbatim.
+ 
+## RULE 2 — REASSURANCE (normal operation/readings)
+Only if a chunk EXPLICITLY calls this symptom/reading normal AND no \
+Universal Safety ESCALATE_IF fired: status="success", 1-2 steps explaining \
+why it's normal per the chunk.
+ 
+## RULE 3 — FIRE EXTINGUISHER QUERY (informational, no active fire)
+Matched chunk's ESCALATE_IF says "DO NOT escalate": status="success", copy \
+that chunk's STEPS verbatim.
+ 
+## RULE 4 — ROUTINE MAINTENANCE REDIRECT
+Maintenance-schedule query, no active fault: status="escalate", but \
+solution.steps MUST be populated from the chunk's maintenance procedure — \
+never leave steps empty here.
+ 
+## RULE 5 — HALLUCINATION TRAP (strict failsafe)
+Binary test, no middle ground: does ANY chunk share the SAME component/\
+system as the problem (per STEP 2's matching rule) — regardless of \
+whether its exact symptom words differ?
+- NO chunk shares that component/system → status="escalate", steps=[]. \
+Never generate steps/estimates/procedures from training knowledge.
+- YES, at least one chunk shares that component/system → you MUST \
+DIAGNOSE using the highest-overlap chunk as sole source of truth. A \
+different symptom WORD ("jammed" vs. "vibration/noise") is NOT grounds \
+to escalate when the component/system matches — escalating here is \
+itself a rule violation, not caution.
+WORKED EXAMPLE: problem="Motor is jammed", chunk PROBLEM="Shaft → \
+Coupling → Motor — vibration, noise, seal leak". Symptom words differ, \
+but component/system (motor) is the same → DIAGNOSE using that chunk. \
+Escalating this case is WRONG.
+ 
+## RULE 6 — COPY-PASTE MANDATE (universal, no exceptions)
+Any rule requiring a copied STEPS field: locate the exact string in Manual \
+Extracts, copy it character-for-character into the target output field.
 {_SPEC_FIDELITY_RULE}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RULE 8 — MISSING / REMOVED PART (Visual Context Override)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If the visual context explicitly states that a part is MISSING, REMOVED, or ABSENT:
-  → Treat this as a confirmed fault — proceed to DIAGNOSE.
-  → Warn about the consequences verbatim in technical_analysis.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RULE 9 — FALSE POSITIVE GUARD
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If the problem mentions "spark plug" cleaning or inspection:
-  → Do NOT escalate for electrical hazard. Proceed to DIAGNOSE.
+## RULE 8 — MISSING/REMOVED PART (visual override)
+Visual context states a part is MISSING/REMOVED/ABSENT → treat as \
+confirmed fault, proceed to DIAGNOSE, warn about consequences verbatim in \
+technical_analysis.
+ 
+## RULE 9 — FALSE POSITIVE GUARD
+"Spark plug" cleaning/inspection mentioned → do NOT escalate for \
+electrical hazard; proceed to DIAGNOSE.
 """
-
+ 
     output_format = f"""
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OUTPUT FORMAT — JSON ONLY, NO MARKDOWN
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
+## OUTPUT FORMAT — JSON ONLY, NO MARKDOWN
+ 
 CRITICAL SCHEMA RULES:
-  1. "internal_reasoning" MUST be the first key and MUST contain all 4 CoT steps.
-  2. "solution" MUST always be present.
-  3. status="escalate" → "solution.steps" MUST be [] (empty array, not null) EXCEPT for Rule 4 (Maintenance) where you must provide steps.
-  4. status="success"  → "solution.steps" MUST contain at least 1 step object.
-  5. "required_part" MUST be a snake_case ID from: {parts_list}
-  6. "area_hint" MUST be one of: {allowed_areas}
+1. "internal_reasoning" is the FIRST key, contains all 6 CoT steps.
+2. "solution" always present.
+3. status="escalate" → solution.steps = [] EXCEPT Rule 4 (Maintenance), \
+which must have steps.
+4. status="success" → solution.steps has ≥1 step object.
+5. Every step has "tracking_scope": "component" (specific, locateable \
+part) or "assembly" (general area, fluid check, whole machine).
+6. "required_part": snake_case ID from {parts_list} if tracking_scope is \
+"component"; null if "assembly".
+7. "area_hint" must be one of: {allowed_areas}
+ 
+## 🌾 FARMER INSTRUCTION STANDARD
+ 
+Teach, don't just list steps. The farmer should feel more confident after \
+each step, never overwhelmed.
+ 
+Assume the operator: has never repaired this machine, cannot name \
+components, knows no mechanical terms, may be anxious about mistakes. \
+Write for confidence without sacrificing accuracy.
+ 
+- "action": short imperative in PLAIN ENGLISH that a first-time farmer \
+immediately understands ("Switch OFF the pump", "Inspect the metal \
+connector"). FORBIDDEN: technical jargon, chunk headers, internal \
+hierarchy labels, or arrows ("→", "->"). Never copy a manual heading. \
+The "action" text MUST NOT contain the technical name of the part \
+being repaired unless it was visually introduced in a previous step. \
+You MUST translate the action target into a visual reference (e.g., \
+write "Inspect the metal connector", NEVER "Inspect the coupling").
+- "description": the teaching. Include, where relevant:
+  • locating the part per COMPONENT INTRODUCTION below
+  • how to visually identify it; what healthy vs. faulty looks like
+  • how to do the action safely
+  • how to confirm the outcome by sight/sound/touch, observations over \
+measurements ("The humming noise should stop.")
+  Include only what helps the CURRENT step — don't force every category \
+into every step.
+- "step_type": one of safety | inspection | repair | verification.
+  • safety — ONLY a NEW mid-repair hazard not covered by the initial \
+safety gate (the app's SafetyGate already handles startup power-off).
+  • inspection — camera-verifiable visual check ONLY. FORBIDDEN: \
+measurement tools, exact numbers (40-45mm). REQUIRED: specific snake_case \
+required_part, visible landmark, healthy-vs-faulty description. Convert \
+any manual measurement to a body-part comparison (finger-width).
+  • repair — replace/tighten/remove/install/adjust; end with a camera \
+verification sub-step ("point camera at [part] to verify it's correctly \
+installed/tightened/replaced").
+  • verification — restore power/start/confirm operation; camera-verifiable \
+where possible ("point camera at [part], confirm [expected outcome]").
+ 
+COMPONENT INTRODUCTION — PROGRESSIVE DISCLOSURE (mandatory order, first \
+interaction with a part only):
+1. VISUAL ANCHOR — opening sentence: colour/shape/size, only if visually \
+certain from manual or camera context; never invent.
+2. RECOGNITION — position vs. ONE permanent landmark: power cable, \
+cooling fan, fuel tank, belt, wheel, air filter, starter motor, cooling \
+fins, pump housing, frame. Forbidden: "near the component", "adjacent to \
+the mechanism", or any other vague positional clue.
+3. FUNCTION — one clause on what it does.
+4. TECHNICAL NAME — last, only once the operator can point to the part. \
+After that, just use the name unless confusable with a similar part.
+JARGON QUARANTINE: The opening half of every description must be purely \
+visual. Do not use the technical name of the target part, or the names \
+of nearby technical parts, until the farmer could realistically point to \
+the correct object. Describe by color, shape, size, and permanent \
+landmarks first. Only after the object has been visually identified may \
+you introduce its technical name. Once introduced, you may use it normally.
+FIRST SENTENCE TEST: If the first sentence contains ANY technical part \
+name a first-time farmer wouldn't know (e.g., shaft, coupling, bearing, \
+terminal board, capacitor, gland, seal, impeller), rewrite it. Use only \
+appearance and location.
+ANTI-CIRCULAR: never define a part using its own name ("the shaft \
+coupling joins the shafts") — describe the connector's shape and the rod \
+it sits on instead.
+HALLUCINATION GUARD: if the manual doesn't support a confident landmark, \
+don't invent one — describe only what's visually certain.
 
-🌾 FARMER INSTRUCTION STANDARD:
-
-  Your job is to TEACH the farmer, not merely list repair steps.
-  The farmer should feel more confident after reading each step, not overwhelmed.
-
-   ═══ USER MENTAL MODEL ═══
-  Assume the operator:
-    • Has never repaired this machine before
-    • Cannot identify components by name
-    • Does not know mechanical terminology
-    • May be anxious about making mistakes
-
-  Write instructions that increase confidence while remaining
-  technically accurate.
-
-  "action":      A short imperative (e.g. "Switch OFF the pump", "Inspect the capacitor").
-                 This is the repair action — what the farmer must do.
-
-  "description": The teaching. This should reduce uncertainty for a first-time
-                 operator. When relevant, include:
-                   • How to locate the component using visible landmarks
-                     (e.g. "where the power cable enters", "beside the fan cover",
-                     "underneath the fuel tank") — prefer landmarks over left/right
-                   • How to visually identify the component
-                   • What healthy looks like and what failure looks like
-                   • How to perform the action safely
-                   • How the operator can confirm the expected outcome
-                     using sight, sound, or touch (only when safe).
-                     Prefer observations over measurements.
-                     Example: "The humming noise should stop."
-                     Example: "Water should begin flowing steadily."
-                 Include only information that helps perform the current step.
-                 Do not force every step to contain every category.
-    "step_type": One of: "safety" | "inspection" | "repair" | "verification".
-                   Classify each step:
-                   - "safety": ONLY for mid-repair safety warnings when a NEW hazard emerges that wasn't covered by the initial safety gate. Do NOT generate safety steps for power-off/shutdown at the start — the app's SafetyGate already handles this before AR begins. Only use "safety" if a step creates a NEW risk (e.g., "Warning: the part you just removed exposes live terminals").
-                   - "inspection": Camera-verifiable visual check ONLY. The farmer points their phone at a specific visible part. FORBIDDEN: measurement tools (tape, gauge), exact numbers (40-45mm), tool-based adjustments. REQUIRED: specific snake_case required_part, visible landmark description, what healthy vs faulty looks like. If the manual specifies a measurement, convert it to a visual observation using body-part comparisons (finger-width, thumb-length).
-                   - "repair": Replace, tighten, remove, install, adjust a part
-                   - "verification": Restore power, start machine, confirm operation
-
-  ═══ COMPONENT INTRODUCTION ═══
-  Introduce a component only if the operator must interact with it.
-  If a component is only mentioned for context, do not interrupt the
-  procedure with a long explanation.
-
-  The first time the operator must interact with a component:
-    1. Describe only the characteristics that are actually visible
-       without disassembly. Do not describe hidden internal components
-       as though they can be seen.
-    2. Then give its technical name.
-
-  When describing locations, use this priority:
-    1. Permanent external landmarks (power cable entry, fan cover,
-       fuel tank, radiator, belt pulley)
-    2. Nearby visible components
-    3. Clock-face directions (e.g. "at the 2 o'clock position
-       relative to the fan cover")
-  Avoid left/right unless orientation is already established.
-
-  Example:
-    "Look for the small rectangular plastic box attached to the outside
-     of the motor where the electrical cable enters. This is called the
-     capacitor box."
-
-  After a component has been introduced, you may simply call it by name.
-  Do not repeat the full identification unless another similar component
-  could reasonably be confused with it.
-
-  ═══ STEP DETAIL BY TYPE ═══
-  Safety steps (e.g. "Switch OFF the main breaker"):
-    Be concise and unambiguous. Do not add unnecessary explanation.
-
-  Inspection steps (CAMERA-VERIFIABLE ONLY):
-    Design EVERY inspection step so the farmer can point their phone
-    camera at a specific part and the AI vision system can verify it.
-    - Include visual identification landmarks, what healthy looks like,
-      and what damage/fault looks like.
-    - NEVER ask the farmer to measure anything with a tool (tape, gauge,
-      multimeter). If the manual specifies a measurement, convert it to
-      a visual observation: "about two finger-widths" not "40-45mm".
-    - Every inspection step MUST have a specific required_part the
-      camera can point at. Use snake_case from the allowed parts list.
-    - The camera IS the verification tool — use it for everything visual.
-
-  Repair/replacement steps:
-    Include physical actions, tool placement, expected outcome.
-    After describing what to do, add a CAMERA VERIFICATION sub-step:
-    "After completing, point camera at [part] to verify it's correctly
-    installed/tightened/replaced."
-
-  Verification steps (e.g. "Start the pump and check for leaks"):
-    Include what to observe and how to confirm success.
-    When possible, make this camera-verifiable: "Point camera at [part]
-    and confirm [expected visual outcome]."
-
-  ═══ SAFETY PREREQUISITES ═══
-  Every repair step must include every safety prerequisite immediately
-  required for that step. Do not assume the operator remembers a warning
-  from several steps earlier.
-
-  Example: If a step involves touching electrical components, repeat
-  "Ensure the main power is OFF" even if mentioned in Step 1.
-
-  ═══ NEVER TELL THE FARMER TO READ THE MANUAL ═══
-  The farmer may be semi-literate or unable to read English/Hindi text.
-  Your job is to BE the manual — translate everything into simple,
-  actionable instructions the farmer can follow immediately.
-
-  BANNED PHRASES — never include these in any step's action or description:
-  • "Refer to the manual" / "Read the user guide"
-  • "Check the manufacturer's instructions" / "See service manual"
-  • "Consult a certified mechanic" / "Bring a technician"
-  • "Contact Mahindra service centre" / "Visit the dealership"
-  • Any measurement with units: "40-45mm", "2cm", "0.5 inches", "measure with tape"
-  • Any tool-based measurement: "use a measuring tape", "check with multimeter", "use a feeler gauge"
-
-  If the repair truly requires a professional (e.g., internal engine work,
-  electrical hazards beyond simple checks), escalate the ENTIRE diagnosis
-  with status="escalate" and steps=[]. Do NOT generate helpful steps and
-  then end with "if problem persists, consult a mechanic."
-
-  ═══ LANGUAGE RULES ═══
-  Words like "inspect", "check", and "verify" are acceptable only when
-  immediately followed by specific guidance on what to look for.
-
-  GOOD: "Inspect the capacitor for bulging, oil leakage, or burn marks."
-  BAD:  "Inspect the capacitor."
-
-  GOOD: "Check whether the terminal screws are loose or burnt."
-  BAD:  "Check the wiring."
-
-  Use cautious language ("typically", "usually", "commonly") only when
-  relying on general engineering knowledge. When information comes directly
-  from the manual, state it confidently. Do not overuse hedging words.
-
-  ═══ QUALITY STANDARD ═══
-  Write only enough information to complete the current step safely.
-  Do not explain future steps early.
-  Do not explain previous steps again.
-  Each step should solve only one immediate problem.
-
-  ═══ LAST STEP MUST BE ACTIONABLE ═══
-  The final step MUST be a verification check the farmer can actually do:
-  "Start the engine and check that the clutch engages smoothly"
-  NOT: "If the problem persists, consult a mechanic"
-  NOT: "Refer to the manual for further guidance"
-  
-  The escalation condition already exists in the escalate_if field.
-  Do not repeat it as a step. Every step must teach the farmer something
-  they can do right now.
-
-  ═══ WORKED EXAMPLE ═══
-  Manual chunk says only: "Clutch — Clutch cable damage."
-
-  BAD (manual-literal, what you must NOT do):
-    "action": "Check the clutch cable for damage"
-    "description": ""
-
-  GOOD (same diagnosis, taught clearly — this is what's required):
-    "action": "Check the clutch cable for fraying or stretching"
-    "description": "The clutch cable runs from the clutch pedal to the
-    clutch fork near the gearbox housing, usually visible as a thick wire
-    cable in a metal sheath. Follow it from the pedal toward the engine.
-    A damaged cable looks frayed, kinked, or stretched, and the clutch
-    pedal will feel loose or won't fully disengage the clutch. The fix —
-    cable replacement — comes from the manual; the description of what
-    the cable looks like and where it runs is general mechanical knowledge
-    used here only to help you find it." 
-
-    ═══ CONSISTENCY RULE ═══
-    Apply the teaching standard above to EVERY step — including the last one.
-    The final step must be as detailed as the first. "Check for other issues"
-    without landmarks or visual guidance is NOT acceptable. If the manual
-    mentions "welding points breaking off, fork pin bent, spring failure",
-    describe WHERE to look for each and WHAT each looks like when damaged.
-
-  The goal is safe completion, not comprehensive education.
+GOLD EXAMPLES (learn the structure, NEVER copy the text onto a real \
+part — these are deliberately unrelated to any machine you'll ever \
+diagnose, so you cannot reuse their wording, only their shape):
+- [Unrelated: Tractor Seat]: "A wide black cushion sits directly above \
+the main rear axle. It supports the driver during operation. This is \
+the operator seat."
+- [Unrelated: Combine Harvester Reel]: "A massive rotating cylinder \
+covered in metal teeth spans the entire front width of the machine. \
+It pulls the crop into the cutting bar. This is the pickup reel."
+- [Unrelated: Fictional Fluid Valve]: "A red star-shaped plastic dial \
+sits on top of the main blue water tank. Turning it controls the flow \
+of liquid. This is the primary pressure valve."
+ 
+SAFETY PREREQUISITES: repeat any prerequisite immediately required for a \
+step, even if stated earlier ("Ensure main power is OFF" again if this \
+step touches electrical parts).
+ 
+NEVER TELL THE FARMER TO READ THE MANUAL — the farmer may be semi-\
+literate. Be the manual. BANNED PHRASES (never in action/description):
+"Refer to the manual" / "Read the user guide" / "Check the manufacturer's \
+instructions" / "See service manual" / "Consult a certified mechanic" / \
+"Bring a technician" / "Contact Mahindra service centre" / "Visit the \
+dealership" / any measurement with units ("40-45mm") / any tool-based \
+measurement / chunk headers / manual hierarchy labels / "→" / "->" / \
+"/" used as hierarchy separators / copied section titles from the manual.
+If a professional is genuinely required (internal engine work, electrical \
+hazard beyond simple checks): escalate the WHOLE diagnosis \
+(status="escalate", steps=[]) — never generate steps and tack on "if \
+problem persists, consult a mechanic."
+ 
+LANGUAGE: "inspect"/"check"/"verify" only when immediately followed by \
+what to look for.
+GOOD: "Inspect the capacitor for bulging, oil leakage, or burn marks."
+BAD: "Inspect the capacitor."
+Hedge ("typically", "usually") only for general engineering knowledge; \
+state manual-sourced facts confidently. Don't overuse hedging.
+ 
+QUALITY: write only enough for the current step. No previewing future \
+steps, no repeating past ones. One problem per step.
+ 
+LAST STEP MUST BE ACTIONABLE — a real verification check ("Start the \
+engine and check the clutch engages smoothly"), never "if problem \
+persists, consult a mechanic" or "refer to the manual." The escalate_if \
+field already owns the escalation condition — don't repeat it as a step.
+ 
+CONSISTENCY: apply this standard to EVERY step including the last. "Check \
+for other issues" with no landmarks/visuals is not acceptable — if the \
+manual lists several failure points ("welding points breaking off, fork \
+pin bent, spring failure"), describe where to look for each and what each \
+looks like damaged.
+ 
+Goal: safe completion, not comprehensive education.
 """
-
+ 
     prompt = f"""
-You are an experienced agricultural mechanic explaining repairs to a
-first-time {machine_label} operator. Your job is to safely guide the
-operator through the repair using the manufacturer's manual.
-Reduce uncertainty. Never assume the operator already knows machinery
-or component names.
+You are an experienced agricultural mechanic explaining repairs to a \
+first-time {machine_label} operator, guided by the manufacturer's manual. \
+Reduce uncertainty. Never assume the operator knows machinery/component \
+names.
 {visual_note}
-""
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PROBLEM DESCRIPTION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+## PROBLEM DESCRIPTION
 Machine: {machine_label}
 Symptoms: {problem_text}
-
+ 
 {rag_block}
-
+ 
 {grounding_rules}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SAFETY WARNINGS & LANGUAGE RULES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+## SAFETY WARNINGS & LANGUAGE RULES
 - Include "⚠️ ESCALATE_IF:" entries verbatim in safety_warnings_en.
-- No jargon. Translate technical concepts to plain English.
-
+- No jargon. Plain English only.
+ 
 {output_format}
 """.strip()
     return prompt
@@ -900,6 +820,16 @@ def _normalize_status(diagnosis: dict) -> dict:
     if status:  # MIGRATED: Groq format normalization
         diagnosis["status"] = status  # MIGRATED: Groq format normalization
 
+    # The top-level status above is the source of truth, but the LLM
+    # writes its own (unnormalized) status into solution.status too, and
+    # nothing previously synced them — so a raw "diagnose" literal (not a
+    # valid value anywhere downstream) could sit right next to a correctly
+    # normalized "success" in the same response. Force solution.status to
+    # match, so there is exactly one status value in this object, not two.
+    solution = diagnosis.get("solution")  # MIGRATED: Groq format normalization
+    if isinstance(solution, dict) and status:  # MIGRATED: Groq format normalization
+        solution["status"] = status  # MIGRATED: Groq format normalization
+
     return diagnosis  # MIGRATED: Groq format normalization
 
 def _contains_actionable_guidance(diagnosis: dict) -> bool:
@@ -911,6 +841,19 @@ def _contains_actionable_guidance(diagnosis: dict) -> bool:
         or solution.get("parts")
         or solution.get("verification_steps")
     )
+
+async def _reword_call_llm(prompt: str) -> str:
+    """Plain-text (non-JSON) LLM call used only by the jargon guard's
+    single-field targeted reword retry. Deliberately not JSON_CONFIG —
+    we want one plain rewritten sentence back, not a structured object.
+    """
+    response = await asyncio.to_thread(
+        lambda: groq_chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+        )
+    )
+    return response.choices[0].message.content
+
 
 async def _post_process_diagnosis(
     diagnosis: dict,
@@ -944,11 +887,37 @@ async def _post_process_diagnosis(
     # field names like "description"/"warning" instead of "text_en"/"safety_warning".
     # Normalize them so Flutter always sees a consistent schema.
     steps = diagnosis["solution"].get("steps", [])
+
+    # ── Readability backstop ────────────────────────────────────────────
+    # The prompt forbids chunk-header arrows ("→"/"->") in action/description,
+    # but LLM compliance on this isn't guaranteed every run (observed: "Tighten
+    # the shaft → coupling → motor connection" slipping through). This is a
+    # deterministic code-level fix, not a prompt request — it always fires,
+    # regardless of what the LLM returns, so a farmer never sees a raw
+    # manual-heading arrow chain. Pure text cleanup only: no rewording, no
+    # semantic changes, nothing that could alter what a step actually says.
+    _ARROW_RE = re.compile(r"\s*(?:\u2192|->)\s*")
+
+    def _strip_arrows(text: str) -> str:
+        if not text:
+            return text
+        return _ARROW_RE.sub(" and ", text).strip()
+
     _normalized_steps = []
     for _s in steps:
         if not isinstance(_s, dict):
             continue
         _ns = dict(_s)
+        for _field in ("action", "description", "text_en", "text_hi"):
+            if _ns.get(_field):
+                _ns[_field] = _strip_arrows(_ns[_field])
+
+        # NOTE: jargon guard intentionally does NOT run here. It runs once,
+        # later, on the truly final step list — see below, after
+        # _deduplicate_steps() and validate_procedure() — because
+        # validate_procedure() can replace diagnosis["solution"]["steps"]
+        # wholesale (its own safe_steps), and any check done here would
+        # miss content introduced or reshaped after this point.
 
         # Build text_en from action + description without destroying original fields.
         # action = short imperative (good for title/speech), description = explanation.
@@ -1071,6 +1040,37 @@ async def _post_process_diagnosis(
             logger.warning("FIX 5: Procedure validation failed (non-fatal): %s", exc)
     # ────────────────────────────────────────────────────────────────────────
 
+    # ── Jargon backstop — runs LAST, on the true final step list ───────────
+    # Deliberately placed after dedup and validate_procedure() (not during
+    # the earlier normalization loop): validate_procedure() can replace
+    # diagnosis["solution"]["steps"] wholesale via its own safe_steps, so
+    # checking any earlier than this would miss content it introduces or
+    # reshapes. Checks only the first sentence of action/description (a
+    # technical name later in the text, once the part is visually
+    # introduced, is fine) and attempts a bounded reword retry — never a
+    # full regeneration — on violation. See agent/jargon_guard.py.
+    for _step in diagnosis["solution"].get("steps", []):
+        if not isinstance(_step, dict):
+            continue
+        _changed = False
+        for _field in ("action", "description"):
+            if _step.get(_field):
+                _fixed = await apply_jargon_guard(_step[_field], _reword_call_llm, label=_field)
+                if _fixed != _step[_field]:
+                    _step[_field] = _fixed
+                    _changed = True
+        if _changed:
+            # Keep text_en in sync with the (possibly reworded) action/
+            # description — it was originally built as "{action}\n{description}"
+            # during normalization and would otherwise go stale.
+            _action = (_step.get("action") or "").strip()
+            _desc = (_step.get("description") or "").strip()
+            if _action and _desc:
+                _step["text_en"] = f"{_action}\n{_desc}"
+            elif _action or _desc:
+                _step["text_en"] = _action or _desc
+    # ────────────────────────────────────────────────────────────────────────
+
     # ── Step ID assignment — SINGLE SOURCE OF TRUTH ─────────────────────────
     # This runs once, here, after every mutation that can add/remove/reorder
     # steps (dedup + procedure_validator's safe_steps injection) has already
@@ -1097,7 +1097,16 @@ async def _post_process_diagnosis(
     # generate_diagnosis_with_gemini() (main.py) must catch InvalidRepairPlan
     # separately from normal escalation handling and return a generic
     # service-error response.
-    validate_repair_plan_steps(_final_steps, context=f"machine={machine_type}")
+    #
+    # EXCEPTION: status="escalate" with an empty step list is a valid,
+    # intentional LLM output (RULE 1/3/5/9 in the prompt all instruct
+    # steps=[] on escalation) — not a defect, so it must not raise here.
+    # If an escalate response DOES carry steps (RULE 4 maintenance case),
+    # those steps still go through full structural validation below.
+    _status_norm = str(diagnosis.get("status", "")).strip().lower()
+    logger.info("STATUS=%s steps=%d", _status_norm, len(_final_steps))
+    if not (_status_norm == "escalate" and len(_final_steps) == 0):
+        validate_repair_plan_steps(_final_steps, context=f"machine={machine_type}")
     # ────────────────────────────────────────────────────────────────────────
 
     # ── C7: Weak-context grounding enforcement ─────────────────────────────

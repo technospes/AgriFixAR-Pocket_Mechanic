@@ -12,6 +12,7 @@ Return:
     "text": "<copy of text_en>",
     "text_en": "string (3-4 sentences)",
     "text_hi": "string",
+    "requires_disassembly": "boolean — true only if this PART is enclosed and no prior VERIFIED entry shows its cover/housing already removed this session (see ACCESS-GATE)",
     "safety_warning": "string|null",
     "expected_result": "string",
     "expected_result_hi": "string",

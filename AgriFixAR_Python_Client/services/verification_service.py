@@ -105,7 +105,7 @@ def _get_subsystem(part_id: str) -> str | None:
 async def verify_step_with_gemini(
     image_bytes: bytes,
     step_text: str,
-    required_part: str,
+    required_part: str | None,
     area_hint: str,
     machine_type: str,
     problem_context: str,
@@ -113,6 +113,7 @@ async def verify_step_with_gemini(
     language: str = "en",
     include_hindi: bool = False,
     previous_steps: str = "[]",
+    tracking_scope: str = "component",
 ) -> dict:
     """Verify a repair step for any supported farm machine — token-optimised."""
     logger.info(
@@ -124,6 +125,7 @@ async def verify_step_with_gemini(
         resized_bytes = await resize_image(image_bytes, max_dim=VERIFY_MAX_IMAGE_DIM)
 
         area_desc   = get_area_farmer_description(machine_type, area_hint, language)
+        req_part_str = required_part or ""
         is_electric = is_electric_machine(machine_type)
         obs_hint    = _MACHINE_OBS_HINT.get(
             getattr(get_profile(machine_type), "machine_id", machine_type),
@@ -151,6 +153,19 @@ async def verify_step_with_gemini(
         except Exception:
             pass
 
+        if tracking_scope == "assembly":
+            identity_check = f"""
+# IDENTITY CHECK — ASSEMBLY MODE:
+# Confirm the camera is pointing directly at the {area_hint} ({area_desc}) of the machine.
+Find: {area_hint} structural area | attempt={attempt_count}
+"""
+        else:
+            identity_check = f"""
+# IDENTITY CHECK — COMPONENT MODE:
+# Confirm the visible component is EXACTLY: "{req_part_str}" located in "{area_hint}" ({area_desc})
+Find: {req_part_str} in {area_hint} ({area_desc}) | attempt={attempt_count}
+"""
+
         prompt = f"""Farm machinery camera verification. Farmer tapped Analyze on their {machine_type}.
 {electric_flag}{lang_note}{history_block}
 Context: problem={problem_context} | step="{step_text}"
@@ -164,12 +179,7 @@ Do NOT say "image unclear" if the part is visible but the action is missing.
 If the correct part is visible but the action is incorrect or incomplete,
 status MUST be "fail".
 
-# IDENTITY CHECK — before pass, confirm the visible component is EXACTLY:
-#   "{required_part}" located in "{area_hint}" ({area_desc})
-# If a SIMILAR but DIFFERENT component is visible (e.g. discharge pipe instead
-# of suction pipe, brake pedal instead of clutch pedal), status MUST be "fail"
-# and feedback must name the correct part the farmer needs to show.
-Find: {required_part} in {area_hint} ({area_desc}) | attempt={attempt_count}
+{identity_check}
 Only report a part if it is clearly visible in the image. Do not guess.
 
 # DIRTY / OBSCURED COMPONENTS:
@@ -220,7 +230,7 @@ pass=part_visible+assessable(conf≥0.70); fail=wrong_area; unclear=bad_image; u
         incompatible = _MACHINE_INCOMPATIBLE_PARTS.get(machine_type, set())
         machine_mismatch = any(token in detected_raw for token in incompatible)
 
-        if machine_mismatch and raw_status in ("pass", "fail"):
+        if machine_mismatch and raw_status in ("pass", "fail") and tracking_scope == "component":
             raw_status = "fail"
             raw_conf   = 0.0
             ai_feedback = result.get("feedback", "")
@@ -239,11 +249,15 @@ pass=part_visible+assessable(conf≥0.70); fail=wrong_area; unclear=bad_image; u
                 f"verify_step: MACHINE_MISMATCH [{machine_type}] detected='{detected_raw[:60]}'"
             )
 
-        # ── GATE 2: Component vs diagnosis subsystem mismatch ─────────────
-        # If the detected part is from a different subsystem than required_part,
-        # the farmer is looking at the wrong component entirely.
-        if not machine_mismatch and raw_status == "pass":
-            required_sub = _get_subsystem(required_part)
+        # ── GATE 2 & 3: Component validation ────────────────────────────────
+        # Only meaningful in component tracking mode with a named part —
+        # assembly-mode steps have no single component to mismatch against.
+        if tracking_scope == "component" and raw_status == "pass" and req_part_str:
+
+            # GATE 2: Component vs diagnosis subsystem mismatch
+            # If the detected part is from a different subsystem than required_part,
+            # the farmer is looking at the wrong component entirely.
+            required_sub = _get_subsystem(req_part_str)
             # Extract subsystem of whatever Gemini detected
             detected_sub = None
             for token, sub in _PART_SUBSYSTEM.items():
@@ -271,42 +285,44 @@ pass=part_visible+assessable(conf≥0.70); fail=wrong_area; unclear=bad_image; u
                     f"required={required_sub} detected={detected_sub}"
                 )
 
-        # ── GATE 3: Wrong-part guard (name-level) ──────────────────────────
-        required_key   = required_part.lower().replace("_", " ")
-        required_words = [w for w in required_key.split() if len(w) > 3]
-        part_words_match = any(w in detected_raw for w in required_words)
-        if raw_status == "pass" and not part_words_match and required_words:
-            raw_status = "fail"
-            raw_conf   = min(raw_conf, 0.50)
-            
-            # Keep Gemini's smart spatial feedback!
-            ai_feedback = result.get("feedback", f"Wrong component shown.")
-            result["feedback"] = (
-                f"{ai_feedback}\n"
-                f"Point camera at {area_hint.replace('_', ' ')}."
-            )
-            ai_feedback_hi = result.get("feedback_hi", f"गलत हिस्सा दिखाया।")
-            result["feedback_hi"] = (
-                f"{ai_feedback_hi}\n"
-                f"{area_hint.replace('_', ' ')} की तरफ कैमरा करें।"
-            )
-            logger.info(f"verify_step: WRONG_PART [{machine_type}] "
-                        f"detected='{detected_raw[:50]}' required='{required_key}'")
+            # GATE 3: Wrong-part guard (name-level)
+            required_key   = req_part_str.lower().replace("_", " ")
+            required_words = [w for w in required_key.split() if len(w) > 3]
+            part_words_match = any(w in detected_raw for w in required_words)
+            if raw_status == "pass" and not part_words_match and required_words:
+                raw_status = "fail"
+                raw_conf   = min(raw_conf, 0.50)
+                
+                # Keep Gemini's smart spatial feedback!
+                ai_feedback = result.get("feedback", f"Wrong component shown.")
+                result["feedback"] = (
+                    f"{ai_feedback}\n"
+                    f"Point camera at {area_hint.replace('_', ' ')}."
+                )
+                ai_feedback_hi = result.get("feedback_hi", f"गलत हिस्सा दिखाया।")
+                result["feedback_hi"] = (
+                    f"{ai_feedback_hi}\n"
+                    f"{area_hint.replace('_', ' ')} की तरफ कैमरा करें।"
+                )
+                logger.info(f"verify_step: WRONG_PART [{machine_type}] "
+                            f"detected='{detected_raw[:50]}' required='{required_key}'")
 
         # ── GATE 4: Confidence threshold enforcement ───────────────────────
         # A "pass" with confidence below CONFIDENCE_THRESHOLD_PASS is returned
         # as "need_verification" rather than silently treating it as verified.
         # This prevents low-signal confirmations from advancing the repair flow.
+        display_target = area_hint.replace("_", " ") if tracking_scope == "assembly" else req_part_str.replace("_", " ")
+
         if raw_status == "pass" and raw_conf < CONFIDENCE_THRESHOLD_PASS:
             result["status"]   = "need_verification"
             result["verified"] = False
             result["feedback"] = (
-                f"Camera is not confident enough to confirm {required_key} "
+                f"Camera cannot verify the {display_target} with sufficient confidence "
                 f"(score: {raw_conf:.0%}).\n"
-                "Move closer, improve lighting, hold the camera steady, then tap Analyze."
+                "Move closer, improve lighting, hold steady, then tap Analyze."
             )
             result["feedback_hi"] = (
-                f"कैमरा {required_key} की पुष्टि करने में असमर्थ (स्कोर: {raw_conf:.0%})।\n"
+                f"कैमरा {display_target} की पुष्टि करने में असमर्थ (स्कोर: {raw_conf:.0%})।\n"
                 "पास जाएं, अच्छी रोशनी करें, स्थिर रखें, फिर विश्लेषण दबाएं।"
             )
             result["confidence"]   = raw_conf

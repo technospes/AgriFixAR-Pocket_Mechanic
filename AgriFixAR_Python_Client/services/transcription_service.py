@@ -27,6 +27,7 @@ _SKIP_GEMINI_MIN_BUCKETS  = 1     # ≥1 symptom bucket detected → maybe skip
 _SKIP_GEMINI_MIN_WORDS    = 4     # raw must have ≥4 words
 _SKIP_GEMINI_MIN_ALPHA    = 0.60  # ≥60% of chars must be alphabetic
 _SKIP_GEMINI_MAX_REPEAT   = 0.30  # <30% repeated words (stutter / junk)
+_EXTRACTION_TIMEOUT       = 12.0
 
 # Quality-gate thresholds
 _SNR_GOOD      = 15.0   # dB — run normal pipeline
@@ -57,6 +58,8 @@ SYMPTOM_BUCKETS: dict[str, list[str]] = {
         # English
         "won't start", "not start", "no start", "dead", "won't crank",
         "doesn't start", "fail to start", "starting problem", "wont start",
+        "jammed", "stuck", "seized", "locked", "not turning", "not rotating",
+        "cannot rotate", "motor jammed", "pump jammed", "shaft jammed",
         # Hindi/mixed — Whisper variants for "self nahi lagta" / "start nahi hota"
         "start nahi", "chal nahi", "start ho nahi", "chalu nahi",
         "self nahi", "self mar", "self lag", "self ghuma", "self ghoom",
@@ -71,6 +74,7 @@ SYMPTOM_BUCKETS: dict[str, list[str]] = {
         "crank", "cranking", "self ghum", "motor ghum",
     ],
     "noise": [
+        "bearing seized", "shaft seized", "metal grinding", "scraping", "binding",
         "awaaz", "awaaz aa", "sound", "noise", "kharkhara", "kharr",
         "ghar ghar", "ghur ghur", "khad khad", "drrr", "vibrat", "hilti",
         "rattle", "knock", "grind", "squeal", "hum", "humming",
@@ -83,6 +87,7 @@ SYMPTOM_BUCKETS: dict[str, list[str]] = {
         "nahi kheench", "pani nahi aa", "paani nahi aa raha",
     ],
     "spinning_not_pumping": [
+        "impeller stuck", "pump jammed",
         "ghoomta hai par", "ghoom raha par", "chal raha par pani nahi",
         "running but no water", "spinning but", "motor chal rahi par",
         "motor chalti hai par", "impeller", "par pani nahi",
@@ -107,6 +112,7 @@ SYMPTOM_BUCKETS: dict[str, list[str]] = {
         "coolant", "pani tapak",
     ],
     "power_loss": [
+        "motor stuck", "motor locked", "shaft not turning", "impeller stuck",
         "power nahi", "dum nahi", "dheema", "slow", "sluggish", "weak",
         "kam power", "load nahi uth", "rpm kam", "speed kam", "bogging",
         "pulling weak",
@@ -564,20 +570,19 @@ def _score_transcript(raw: str) -> TranscriptScore:
             alpha_ratio=alpha_ratio, repeat_ratio=repeat_ratio,
             needs_gemini=needs, reason=reason, confidence=0.0,
         )
-
-    if n_words < _SKIP_GEMINI_MIN_WORDS:
-        return _make(True, f"too_short({n_words} words)")
-
+    
     if alpha_ratio < _SKIP_GEMINI_MIN_ALPHA:
         return _make(True, f"low_alpha({alpha_ratio:.0%})")
 
     if repeat_ratio > _SKIP_GEMINI_MAX_REPEAT:
         return _make(True, f"high_repeat({repeat_ratio:.0%})")
 
+    if n_words < _SKIP_GEMINI_MIN_WORDS and n_b < _SKIP_GEMINI_MIN_BUCKETS:
+        return _make(True, f"too_short_no_signal({n_words} words, {n_b} buckets)")
+
     if n_b < _SKIP_GEMINI_MIN_BUCKETS:
         return _make(True, "no_symptom_buckets")
 
-    # Pass — skip Gemini
     return _make(False, f"clear({n_b} buckets, {n_words} words, alpha={alpha_ratio:.0%})")
 
 
@@ -673,8 +678,11 @@ async def _extract_with_gemini(
 
         prompt   = _build_extraction_prompt(raw_transcript, detected_buckets, machine_hint)
         model    = genai.GenerativeModel(GEMINI_MODEL)
-        response = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: model.generate_content(prompt)
+        response = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, lambda: model.generate_content(prompt)
+            ),
+            timeout=_EXTRACTION_TIMEOUT,
         )
         raw_json = sanitize_json_text(response.text or "")
 
@@ -701,6 +709,13 @@ async def _extract_with_gemini(
             logger.warning(
                 f"⚠️  Gemini returned non-JSON: {raw_json[:80]} — using raw"
             )
+
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"⏱️  Gemini structured extraction exceeded {_EXTRACTION_TIMEOUT}s — "
+            f"using cleaned raw transcript instead of discarding it"
+        )
+        return _light_clean_raw(raw_transcript)
 
     except ImportError:
         # sanitize_json_text not available in test context — use stdlib

@@ -16,6 +16,20 @@ from ood_guard import check_ood
 
 logger = logging.getLogger(__name__)
 
+# RAG confidence bar above which retrieved context is trusted enough to stand
+# on its own even without a confirmed visual read. This was previously only
+# ever mentioned in comments/docstrings (as 0.55 in one place, 0.30 in
+# another) and never actually implemented as code — see the Phase 3 fix below.
+RAG_STRONG_MATCH_THRESHOLD = 0.55
+
+# Visual gate verdicts that mean "the gate could not make a determination"
+# (bad lighting, no frame, ambiguous angle) as opposed to a CONFIDENT negative
+# finding (wrong part/area/machine visible). Confirm this list against the
+# actual verdict enum in visual_gate.py — "UNCLEAR" is the only value we've
+# directly observed in production logs; extend if visual_gate.py defines
+# other inconclusive states (e.g. a "NO_FRAME" or timeout verdict).
+_INCONCLUSIVE_GATE_VERDICTS = {"UNCLEAR"}
+
 # Module-level clarification engine singleton (avoid re-init per request)
 _clarification_engine = ClarificationEngine()
 
@@ -296,12 +310,58 @@ async def run_full_pipeline(
     )
 
     if not gate.gate_passed:
-        # DEV MODE: Log the warning but DO NOT return the blocked PipelineResult
-        logger.warning("Phase 3 FAILED but bypassed for DEV: verdict=%s conf=%.2f", gate.verdict, gate.confidence)
-        # We allow the code to fall through to the success block below
-        logger.info(
-            "Phase 3 PASSED (or bypassed): part=%s fault='%s' conf=%.2f",
-            gate.part_id, gate.fault_description[:60], gate.confidence,
+        verdict = (gate.verdict or "").upper()
+        is_inconclusive = verdict in _INCONCLUSIVE_GATE_VERDICTS
+        rag_is_strong = score >= RAG_STRONG_MATCH_THRESHOLD
+
+        if is_inconclusive and rag_is_strong:
+            # The gate couldn't confirm OR deny what's on camera (blurry frame,
+            # bad angle, no clear part in view) — that is NOT the same signal
+            # as a confident wrong-part/wrong-area detection. When retrieval
+            # already strongly supports this diagnosis, don't withhold repair
+            # steps just because one frame was inconclusive: the AR flow
+            # re-verifies the actual part visually, step by step, once the
+            # farmer starts following the guide (see verification_service.py).
+            # visual_confirmed=False is threaded through so downstream callers
+            # know Phase 3 did not positively confirm the part.
+            logger.info(
+                "Phase 3 INCONCLUSIVE (verdict=%s conf=%.2f) but rag_score=%.3f >= %.2f "
+                "— proceeding to generation without visual confirmation.",
+                gate.verdict, gate.confidence, score, RAG_STRONG_MATCH_THRESHOLD,
+            )
+            return PipelineResult(
+                phase_reached="generation",
+                blocked=False,
+                block_reason="",
+                response={
+                    "status":              "ready_for_generation",
+                    "machine_type":        resolved_machine,
+                    "visual_observation":  gate.fault_description,
+                    "confirmed_part":      gate.part_id,
+                    "gate_confidence":     round(gate.confidence, 3),
+                    "visual_confirmed":    False,
+                    "rag_score":           round(score, 3),
+                    "chunks_used":         n_chunks,
+                    "camera_prompt":       camera_prompt,
+                    "clarification_round": clarification_round,
+                },
+                router=router,
+                lock=lock,
+                gate=gate,
+                rag_context=context_str,
+                machine_type=resolved_machine,
+                language=language,
+                rag_score=score,
+                n_chunks=n_chunks,
+            )
+
+        # Either the gate made a CONFIDENT negative call (wrong part/area/
+        # machine actually visible), or the gate was inconclusive AND
+        # retrieval evidence is too weak to stand on its own. Both are
+        # genuine reasons to block and ask the farmer to re-aim the camera.
+        logger.warning(
+            "Phase 3 BLOCKED: verdict=%s conf=%.2f rag_score=%.3f (strong_threshold=%.2f)",
+            gate.verdict, gate.confidence, score, RAG_STRONG_MATCH_THRESHOLD,
         )
         re_examine = gate.re_examine_response()
         re_examine["camera_prompt"] = camera_prompt
@@ -336,6 +396,7 @@ async def run_full_pipeline(
             "visual_observation": gate.fault_description,
             "confirmed_part":     gate.part_id,
             "gate_confidence":    round(gate.confidence, 3),
+            "visual_confirmed":   True,
             "rag_score":          round(score, 3),
             "chunks_used":        n_chunks,
             "camera_prompt":      camera_prompt,

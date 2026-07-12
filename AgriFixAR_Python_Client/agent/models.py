@@ -47,9 +47,11 @@ class RepairPlanStep(BaseModel):
     action: str
     description: str = ""
     required_part: Optional[str] = None
+    tracking_scope: Literal["component", "assembly"] = "component"
     area_hint: str = "engine_compartment"
     step_type: StepType = StepType.INSPECTION
     verification: Optional[Verification] = None
+    requires_disassembly: bool = False
 
 
 class RepairPlan(BaseModel):
@@ -87,6 +89,29 @@ class RepairSession(BaseModel):
     attempt_count: int = 0
     last_verification: Optional[Dict] = None
     language: str = "en"
+    # Parts/areas whose cover/housing has already been opened this session
+    # (farmer answered the access-confirmation boolean with "opened").
+    # Populated in repair_agent.py's decide_next_step() the moment a
+    # requires_disassembly step resolves with "continue"/answer_bool=True —
+    # same place _apply_verification() records verified_parts.
+    #
+    # Two kinds of entries share this one flat list, disambiguated by prefix:
+    #   - "<part_id>"        e.g. "capacitor"            — that exact part's
+    #                          own access step was confirmed.
+    #   - "area:<area_hint>" e.g. "area:motor_housing"    — the housing/cover
+    #                          for that whole area was confirmed open, so
+    #                          EVERY part located in that area_hint counts
+    #                          as reachable, not just the part named on the
+    #                          access step itself.
+    # The area entry is what actually matters in practice: diagnosis_service
+    # never guarantees the access step's required_part matches every later
+    # inspection step's required_part under the same cover (e.g. access
+    # step names "motor_cover", later steps inspect "capacitor" then
+    # "start_relay") — part-only tracking silently stops working after the
+    # first step. Read by repair_agent.py's decide_next_step() (deterministic
+    # override of requires_disassembly) and by _build_safety_context() (the
+    # ACCESS_OPENED / ACCESS_OPENED_AREA lines the LLM's prompt reads).
+    access_achieved: List[str] = Field(default_factory=list)
 
 
 # ─────────────────────────────────────────────
@@ -110,6 +135,7 @@ class NextStepDetail(BaseModel):
     required_part: Optional[str] = None
     tracking_scope: Literal["component", "assembly"] = Field(default="component")
     area_hint: str
+    requires_disassembly: bool = False
 
     # ── Safety ──────────────────────────────────────────────────────────────
     safety_warning: Optional[str] = None

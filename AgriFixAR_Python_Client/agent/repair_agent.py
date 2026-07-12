@@ -14,6 +14,7 @@ from agent.models import Interaction, InteractionOption, RepairPlanStep, Verific
 from agent.models import RepairSession, AgentNextResponse, NextStepDetail, UpdatedMemory
 from agent import safety_rules
 from agent.validation import InvalidRepairPlan, validate_repair_plan_steps
+from agent.jargon_guard import apply_jargon_guard
 from utils.machine_registry import (
     get_profile_or_default,
     get_allowed_area_ids,
@@ -273,17 +274,34 @@ async def decide_next_step(session: RepairSession, last_verification: dict) -> A
     response = _parse_response(raw, session.machine_type)
     response = safety_rules.post_check(response, session)
 
+    # ── Jargon backstop ──────────────────────────────────────────────────
+    # Deterministic check on the opening sentence of the farmer-facing
+    # instruction text — same rationale as _validate_tool() above: the
+    # prompt (SYSTEM_REPAIR) already instructs the model to avoid
+    # unintroduced jargon, but compliance isn't guaranteed every call.
+    # Single targeted reword retry on violation, never a full re-ask.
+    # See agent/jargon_guard.py.
+    _text_en_before = response.next_step.text_en
+    response.next_step.text_en = await apply_jargon_guard(
+        response.next_step.text_en, _reword_call_llm, label="text_en"
+    )
+    # Keep `text` in sync if it was a straight mirror of text_en (the
+    # normal case, per _parse_response above) so the reword isn't lost.
+    if response.next_step.text == _text_en_before:
+        response.next_step.text = response.next_step.text_en
+
     # Backend enforces structural fields
-    response.next_step.required_part = current_step.required_part or "unknown"
+    response.next_step.required_part = current_step.required_part or ""
+    response.next_step.tracking_scope = getattr(current_step, "tracking_scope", "component")
     response.next_step.area_hint = current_step.area_hint
-    response.next_step.visual_cue = current_step.required_part or "unknown"
-    response.next_step.ar_model = f"{current_step.required_part or 'part'}.obj"
+    response.next_step.ar_model = "none"
 
     # VALIDATE AND NORMALIZE INTERACTION
     response.next_step.interaction = _validate_and_normalize_interaction(
         response.next_step.interaction, 
         response.next_step.required_part,
         current_step.step_type,
+        response.next_step.tracking_scope, # Pass explicit scope
     )
 
     # PREVENT STATUS HALLUCINATION: If we are asking the user a question/action, we MUST be in continue state
@@ -365,6 +383,20 @@ def _build_safety_context(session: RepairSession) -> str:
     return "\n".join(lines)
 
 
+async def _reword_call_llm(prompt: str) -> str:
+    """Plain-text (non-JSON, no system block) LLM call used only by the
+    jargon guard's single-field targeted reword retry. Deliberately
+    lighter than _call_gemini — we want one plain rewritten sentence
+    back, not a structured agent response.
+    """
+    response = await asyncio.to_thread(
+        lambda: groq_chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+        )
+    )
+    return response.choices[0].message.content
+
+
 async def _call_gemini(prompt: str) -> str:
     response = await asyncio.to_thread(
         lambda: groq_chat_completion(
@@ -434,6 +466,18 @@ def _parse_response(raw: str, machine_type: str) -> AgentNextResponse:
             if not ns.get(field):
                 logger.warning(f"⚠️  [{machine_type}] Missing structured field: {field}")
 
+        # Extract fields safely
+        raw_scope = ns.get("tracking_scope", "component")
+        tracking_scope = raw_scope if raw_scope in ("component", "assembly") else "component"
+        req_part = ns.get("required_part")
+
+        # LLM Contradiction Guard
+        if tracking_scope == "assembly":
+            req_part = ""  # Force empty for assemblies
+        elif tracking_scope == "component" and not req_part:
+            # LLM asked for a component but didn't name it. Safely downgrade to assembly inspection.
+            tracking_scope = "assembly"
+
         return AgentNextResponse(
             status             = data.get("status", "continue"),
             reasoning_summary  = data.get("reasoning_summary", ""),
@@ -441,9 +485,10 @@ def _parse_response(raw: str, machine_type: str) -> AgentNextResponse:
                 text             = ns.get("text", ""),
                 text_en          = ns.get("text_en", ""),
                 text_hi          = ns.get("text_hi", ""),
-                visual_cue       = ns.get("visual_cue", "unknown"),
-                ar_model         = ns.get("ar_model", "part.obj"),
-                required_part    = ns.get("required_part", "unknown"),
+                visual_cue       = ns.get("visual_cue", ""), # Preserved!
+                ar_model         = "none",                   # No fabricated .obj files
+                required_part    = req_part,
+                tracking_scope   = tracking_scope,
                 area_hint        = ns.get("area_hint", "engine_compartment"),
                 safety_warning   = ns.get("safety_warning"),
                 expected_result    = ns.get("expected_result", ""),
@@ -490,8 +535,9 @@ def _fallback_response(machine_type: str, reason: str) -> AgentNextResponse:
 
 def _validate_and_normalize_interaction(
     interaction: Interaction | None,
-    required_part: str,
+    required_part: str | None,
     step_type: str = "inspection",
+    tracking_scope: str = "component",
 ) -> Interaction:
     """Enforces structural rules on LLM interaction schemas.
 
@@ -539,28 +585,44 @@ def _validate_and_normalize_interaction(
             options=[InteractionOption(id="yes", label="Done", next_state="continue")],
         )
 
-    # 2. Camera: verify there's actually a part to scan.
-    if interaction.type == "camera":
-        if not required_part or required_part in ("none", "unknown", ""):
-            if step_type == "inspection":
-                interaction.question = "Point your camera at the part shown in the guide"
-                interaction.options = []
-            else:
-                logger.warning("Downgrading camera interaction to boolean: no required_part")
-                interaction.type = "boolean"
-                interaction.question = interaction.question or "Action complete?"
-                if not interaction.options:
-                    interaction.options = [InteractionOption(id="yes", label="Done", next_state="continue")]
-        else:
-            interaction.question = ""
-            interaction.options = []
-
-    # Override: inspection steps should always be camera, never number or boolean
-    elif interaction.type in ("number", "boolean") and step_type == "inspection" and required_part not in (None, "", "unknown", "none", "machine_part"):
-        logger.warning(f"Overriding {interaction.type}→camera for inspection step (part={required_part})")
+    # Override: inspection steps should always be camera, never number,
+    # boolean, or choice — the LLM doesn't always follow the INTERACTION
+    # TYPE priority order in SYSTEM_REPAIR (camera checked first), so this
+    # is the deterministic backstop. Without "choice" included here, an
+    # inspection step with a real required_part could ship as "choice" and
+    # silently skip the entire camera → /verify_step → /inspect_part flow:
+    # Flutter's onCapture() branches purely on interaction.type == camera,
+    # so anything else just opens the choice/inspection panel instead of
+    # running analysis on what the farmer points the camera at.
+    #
+    # Runs as a pre-pass (mutates type, then falls into the dispatch below)
+    # rather than as its own elif branch — a step that DOESN'T qualify for
+    # the override (e.g. a legitimate choice step with no required_part,
+    # like "what do you smell?") must still reach its normal validation
+    # (rule 3/4 below), not silently skip it.
+    if (
+        interaction.type in ("number", "boolean", "choice")
+        and step_type == "inspection"
+        and (tracking_scope == "assembly" or required_part)
+    ):
         interaction.type = "camera"
         interaction.question = ""
         interaction.options = []
+
+    # 2. Camera interaction validation based on explicit scope
+    if interaction.type == "camera":
+        if tracking_scope == "assembly":
+            interaction.question = ""
+            interaction.options = []
+        elif tracking_scope == "component" and not required_part:
+            # Fallback if somehow a component scope made it here without a part
+            interaction.type = "boolean"
+            interaction.question = interaction.question or "Action complete?"
+            if not interaction.options:
+                interaction.options = [InteractionOption(id="yes", label="Done", next_state="continue")]
+        else:
+            interaction.question = ""
+            interaction.options = []
 
     # 3. Boolean: trust the LLM's own options...
     elif interaction.type == "boolean":

@@ -87,11 +87,3 @@ def validate_repair_plan_steps(steps: Sequence[Any], *, context: str = "") -> No
             raise InvalidRepairPlan(
                 f"Missing area_hint for step {step_id!r}{suffix}"
             )
-
-    # NOTE — forward-looking, not yet enforced: once steps can carry
-    # explicit jump targets (e.g. a `jump_to_step` field, distinct from
-    # the current linear index+1 advancement / the "continue"/"retry"
-    # sentinel values used by InteractionOption.next_state), those
-    # references should be validated here too — every jump target must
-    # resolve to a real step_id in this same plan. Not needed today
-    # because the plan is strictly linear.
